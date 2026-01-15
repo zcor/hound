@@ -93,7 +93,7 @@ def get_github_client(installation_id: int) -> Github:
     return Github(token)
 
 
-def verify_webhook_signature(payload_body: bytes, signature_header: str) -> bool:
+def verify_webhook_signature(payload_body: bytes, signature_header: str | None) -> bool:
     """
     Verify that the webhook request came from GitHub.
     
@@ -106,13 +106,21 @@ def verify_webhook_signature(payload_body: bytes, signature_header: str) -> bool
     """
     if not GITHUB_WEBHOOK_SECRET:
         # If no secret is configured, skip verification (not recommended for production)
+        import logging
+        logging.warning("GITHUB_WEBHOOK_SECRET not set - webhook signature verification disabled!")
         return True
     
     if not signature_header:
         return False
     
-    # GitHub sends signature as "sha256=<signature>"
-    hash_algorithm, github_signature = signature_header.split('=')
+    try:
+        # GitHub sends signature as "sha256=<signature>"
+        if '=' not in signature_header:
+            return False
+        hash_algorithm, github_signature = signature_header.split('=', 1)
+    except (ValueError, AttributeError):
+        # Malformed signature header
+        return False
     
     # Create HMAC signature
     expected_signature = hmac.new(
@@ -284,9 +292,13 @@ async def github_webhook(
             # Unsupported event type
             return {"status": "ignored", "event": x_github_event}
     
-    except Exception as e:
+    except Exception:
         db_session.rollback()
-        raise HTTPException(status_code=500, detail=f"Error processing webhook: {str(e)}")
+        # Log the full error internally
+        import logging
+        logging.exception("Error processing webhook")
+        # Return generic error to client without exposing internals
+        raise HTTPException(status_code=500, detail="Internal server error processing webhook")
     
     finally:
         db_session.close()

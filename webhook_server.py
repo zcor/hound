@@ -45,6 +45,13 @@ def main():
         print("\nPlease set these environment variables before running the server.")
         sys.exit(1)
     
+    # Warn about missing webhook secret (security risk)
+    if not os.environ.get("GITHUB_WEBHOOK_SECRET"):
+        print("Warning: GITHUB_WEBHOOK_SECRET is not set!")
+        print("Webhook signature verification will be skipped.")
+        print("This is insecure for production deployments.")
+        print("")
+    
     # Get server configuration
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))

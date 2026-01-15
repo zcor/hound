@@ -34,7 +34,7 @@ def run_audit_task(
     """
     logger.info(
         f"Triggering audit for project {project_name} (ID: {project_id}), "
-        f"commit: {commit_sha[:8]}"
+        f"commit: {commit_sha[:8]}, repo: {repo_url}"
     )
     
     # TODO: Implement the actual audit triggering logic

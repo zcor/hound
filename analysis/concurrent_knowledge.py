@@ -25,15 +25,27 @@ import portalocker
 class ConcurrentFileStore(ABC):
     """Base class for file-based storage with process-safe locking."""
     
-    def __init__(self, file_path: Path, agent_id: str | None = None):
+    def __init__(self, file_path: Path, agent_id: str | None = None, storage_backend: Any | None = None):
         self.file_path = Path(file_path)
         self.agent_id = agent_id or "anonymous"
         self.lock_path = self.file_path.with_suffix('.lock')
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Storage backend support (optional)
+        self.storage_backend = storage_backend
+        
+        # For local filesystem, use Path operations
+        if storage_backend is None:
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            # For blob storage, ensure parent "directory" exists
+            parent_path = str(self.file_path.parent).replace('\\', '/')
+            if parent_path and parent_path != '.':
+                storage_backend.mkdir(parent_path, parents=True, exist_ok=True)
+        
         # Initialize or fetch a per-file thread lock to guard against races within a single process
         self._thread_lock = self._get_thread_lock(self.file_path)
         
-        if not self.file_path.exists():
+        if not self._exists():
             self._save_data(self._get_empty_data())
     
     @abstractmethod
@@ -41,8 +53,21 @@ class ConcurrentFileStore(ABC):
         """Return initial empty data structure."""
         pass
     
+    def _exists(self) -> bool:
+        """Check if the file exists."""
+        if self.storage_backend:
+            return self.storage_backend.exists(str(self.file_path))
+        return self.file_path.exists()
+    
     def _acquire_lock(self, timeout: float = 10.0) -> Any:
         """Acquire exclusive lock on storage file."""
+        # For blob storage, locking is handled differently (e.g., optimistic concurrency)
+        # For now, we only use file locking for local filesystem
+        if self.storage_backend:
+            # For blob storage, return a dummy lock object
+            # Real implementations would use conditional writes or DynamoDB locking
+            return object()
+        
         start_time = time.time()
         lock_file = open(self.lock_path, 'w')
         
@@ -59,6 +84,10 @@ class ConcurrentFileStore(ABC):
     
     def _release_lock(self, lock_file: Any):
         """Release file lock."""
+        # For blob storage, no-op
+        if self.storage_backend:
+            return
+        
         try:
             portalocker.unlock(lock_file)
             lock_file.close()
@@ -70,6 +99,8 @@ class ConcurrentFileStore(ABC):
     def _load_data(self) -> dict:
         """Load data from file."""
         try:
+            if self.storage_backend:
+                return self.storage_backend.read_json(str(self.file_path))
             with open(self.file_path) as f:
                 return json.load(f)
         except Exception:
@@ -77,6 +108,11 @@ class ConcurrentFileStore(ABC):
     
     def _save_data(self, data: dict):
         """Save data atomically using a unique temp file to avoid races."""
+        if self.storage_backend:
+            # For blob storage, write directly (S3 writes are atomic)
+            self.storage_backend.write_json(str(self.file_path), data)
+            return
+        
         import tempfile
         # Create temp file in same directory for atomic replace on same filesystem
         with tempfile.NamedTemporaryFile('w', dir=str(self.file_path.parent), prefix=self.file_path.stem + '.', suffix='.tmp', delete=False) as tf:

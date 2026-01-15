@@ -79,13 +79,25 @@ class AutonomousAgent:
                  agent_id: str,
                  config: dict | None = None,
                  debug: bool = False,
-                 session_id: str | None = None):
-        """Initialize the autonomous agent."""
+                 session_id: str | None = None,
+                 storage_backend: Any | None = None):
+        """Initialize the autonomous agent.
+        
+        Args:
+            graphs_metadata_path: Path to graphs metadata file
+            manifest_path: Path to manifest directory
+            agent_id: Unique identifier for this agent
+            config: Optional configuration dictionary
+            debug: Enable debug mode
+            session_id: Optional session identifier
+            storage_backend: Optional storage backend for graphs (local or S3/MinIO)
+        """
         
         self.agent_id = agent_id
         self.manifest_path = manifest_path
         self.debug = debug
         self.session_id = session_id
+        self.storage_backend = storage_backend
         # Default hypothesis visibility; can be overridden by runner
         self.default_hypothesis_visibility = 'global'
         
@@ -154,7 +166,7 @@ class AutonomousAgent:
         except Exception:
             self.project_dir = Path.cwd()
         hypothesis_path = project_dir / "hypotheses.json"
-        self.hypothesis_store = HypothesisStore(hypothesis_path, agent_id=agent_id)
+        self.hypothesis_store = HypothesisStore(hypothesis_path, agent_id=agent_id, storage_backend=storage_backend)
 
         # Initialize per-project coverage index for persistent coverage tracking
         try:
@@ -1730,7 +1742,7 @@ DO NOT include any text before or after the JSON object."""
                 graph_path = Path(self.available_graphs[graph_name]['path'])
                 
                 # Use GraphStore for atomic save with built-in locking
-                graph_store = GraphStore(graph_path, agent_id=self.agent_id)
+                graph_store = GraphStore(graph_path, agent_id=self.agent_id, storage_backend=self.storage_backend)
                 return graph_store.save_graph(graph_data)
                         
         except Exception as e:
@@ -1744,7 +1756,7 @@ DO NOT include any text before or after the JSON object."""
                 graph_path = Path(self.available_graphs[graph_name]['path'])
                 
                 # Use GraphStore for atomic read with built-in locking
-                graph_store = GraphStore(graph_path, agent_id=self.agent_id)
+                graph_store = GraphStore(graph_path, agent_id=self.agent_id, storage_backend=self.storage_backend)
                 return graph_store.load_graph()
                     
         except Exception as e:

@@ -11,17 +11,14 @@ import hashlib
 import hmac
 import json
 import os
-import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
-import jwt
 from fastapi import FastAPI, Header, HTTPException, Request
 from github import Auth, Github, GithubIntegration
 from sqlalchemy.orm import Session
 
 from database.models import Project, Tenant, create_db_engine, create_db_session
-
 
 # GitHub App configuration
 # These should be set as environment variables
@@ -51,7 +48,7 @@ def get_github_app_integration() -> GithubIntegration:
     if not private_key_path.exists():
         raise ValueError(f"Private key file not found: {private_key_path}")
     
-    with open(private_key_path, "r") as key_file:
+    with open(private_key_path) as key_file:
         private_key = key_file.read()
     
     auth = Auth.AppAuth(int(GITHUB_APP_ID), private_key)
@@ -134,7 +131,7 @@ def get_db_session() -> Session:
     return create_db_session(engine)
 
 
-def handle_installation_created(payload: Dict[str, Any], db_session: Session) -> None:
+def handle_installation_created(payload: dict[str, Any], db_session: Session) -> None:
     """
     Handle the installation.created webhook event.
     
@@ -196,7 +193,7 @@ def handle_installation_created(payload: Dict[str, Any], db_session: Session) ->
     db_session.commit()
 
 
-def handle_push_event(payload: Dict[str, Any], db_session: Session) -> None:
+def handle_push_event(payload: dict[str, Any], db_session: Session) -> None:
     """
     Handle the push webhook event.
     
@@ -209,7 +206,6 @@ def handle_push_event(payload: Dict[str, Any], db_session: Session) -> None:
     """
     repository = payload.get("repository", {})
     repo_id = repository.get("id")
-    repo_name = repository.get("full_name")
     
     # Get the commit SHA
     head_commit = payload.get("head_commit", {})
@@ -248,8 +244,8 @@ app = FastAPI(title="Hound GitHub Webhooks")
 @app.post("/webhooks/github")
 async def github_webhook(
     request: Request,
-    x_hub_signature_256: Optional[str] = Header(None),
-    x_github_event: Optional[str] = Header(None)
+    x_hub_signature_256: str | None = Header(None),
+    x_github_event: str | None = Header(None)
 ):
     """
     Handle GitHub webhook events.

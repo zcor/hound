@@ -4,16 +4,15 @@ Unit tests for GitHub App integration.
 Tests the GitHub App authentication, webhook handling, and audit triggering.
 """
 
-import json
 import os
 import sys
-import tempfile
 import unittest
-from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from fastapi.testclient import TestClient
 
 from database.models import (
     Base,
@@ -23,7 +22,6 @@ from database.models import (
     create_db_session,
     init_database,
 )
-from fastapi.testclient import TestClient
 
 
 class TestGitHubAppIntegration(unittest.TestCase):
@@ -149,7 +147,7 @@ class TestGitHubAppIntegration(unittest.TestCase):
         }
         
         # Mock the audit trigger
-        with patch('integrations.github_app.run_audit_task') as mock_audit:
+        with patch('integrations.audit_trigger.run_audit_task') as mock_audit:
             handle_push_event(payload, self.session)
             
             # Verify audit was triggered
@@ -192,7 +190,7 @@ class TestGitHubAppIntegration(unittest.TestCase):
         }
         
         # Mock the audit trigger
-        with patch('integrations.github_app.run_audit_task') as mock_audit:
+        with patch('integrations.audit_trigger.run_audit_task') as mock_audit:
             handle_push_event(payload, self.session)
             
             # Verify audit was NOT triggered for inactive project

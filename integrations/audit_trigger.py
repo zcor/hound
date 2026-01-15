@@ -5,9 +5,6 @@ This module handles triggering security audits when push events are received.
 """
 
 import logging
-import subprocess
-from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +14,7 @@ def run_audit_task(
     project_name: str,
     commit_sha: str,
     repo_url: str,
-    installation_id: Optional[int] = None
+    installation_id: int | None = None
 ) -> None:
     """
     Trigger a security audit for a specific commit.

@@ -73,6 +73,11 @@ class AutonomousAgent:
     Security analysis agent that works autonomously.
     """
     
+    # Default pricing estimates per 1K tokens (in USD)
+    # These should ideally be loaded from configuration
+    DEFAULT_INPUT_TOKEN_COST = 0.01  # $0.01 per 1K input tokens
+    DEFAULT_OUTPUT_TOKEN_COST = 0.03  # $0.03 per 1K output tokens
+    
     def __init__(self, 
                  graphs_metadata_path: Path,
                  manifest_path: Path,
@@ -80,7 +85,9 @@ class AutonomousAgent:
                  config: dict | None = None,
                  debug: bool = False,
                  session_id: str | None = None,
-                 storage_backend: Any | None = None):
+                 storage_backend: Any | None = None,
+                 budget_limit: float | None = None,
+                 budget_type: str = 'tokens'):
         """Initialize the autonomous agent.
         
         Args:
@@ -91,6 +98,8 @@ class AutonomousAgent:
             debug: Enable debug mode
             session_id: Optional session identifier
             storage_backend: Optional storage backend for graphs (local or S3/MinIO)
+            budget_limit: Optional budget limit (max tokens or dollars)
+            budget_type: Type of budget limit ('tokens' or 'cost')
         """
         
         self.agent_id = agent_id
@@ -98,6 +107,9 @@ class AutonomousAgent:
         self.debug = debug
         self.session_id = session_id
         self.storage_backend = storage_backend
+        self.budget_limit = budget_limit
+        self.budget_type = budget_type
+        self.budget_used = 0.0  # Track usage during investigation
         # Default hypothesis visibility; can be overridden by runner
         self.default_hypothesis_visibility = 'global'
         
@@ -227,6 +239,47 @@ class AutonomousAgent:
         """
         self._abort_requested = True
         self._abort_reason = (reason or "steering_replan").strip() or "steering_replan"
+    
+    def _check_database_status(self):
+        """Check database for abort status flag.
+        
+        If a session_id is set, checks the AuditSession table for status changes
+        that indicate the job should be aborted (e.g., 'aborted', 'cancelled', 'interrupted').
+        """
+        if not self.session_id:
+            return  # No session ID, can't check database
+        
+        try:
+            # Import database models only when needed
+            from database.models import AuditSession, create_db_engine, create_db_session
+            import os
+            
+            # Get database URL from environment
+            db_url = os.environ.get('DATABASE_URL')
+            if not db_url:
+                return  # No database configured
+            
+            # Create database connection
+            engine = create_db_engine(db_url)
+            db_session = create_db_session(engine)
+            
+            try:
+                # Query the audit session
+                audit_session = db_session.query(AuditSession).filter_by(
+                    session_id=self.session_id
+                ).first()
+                
+                if audit_session:
+                    # Check for abort status flags
+                    abort_statuses = {'aborted', 'cancelled', 'interrupted'}
+                    if audit_session.status in abort_statuses:
+                        self.request_abort(f"database_status_{audit_session.status}")
+            finally:
+                db_session.close()
+        except Exception as e:
+            # Don't fail the investigation if database check fails
+            if self.debug:
+                print(f"[!] Failed to check database status: {e}")
 
     def _read_steering_notes(self, limit: int = 12) -> list[str]:
         """Read recent steering notes from project .hound/steering.jsonl (if any)."""
@@ -251,6 +304,104 @@ class AutonomousAgent:
             return lines[-limit:]
         except Exception:
             return []
+    
+    def _update_budget_usage(self):
+        """Update budget usage based on last LLM call.
+        
+        Tracks token usage or cost depending on budget_type setting.
+        """
+        if self.budget_limit is None:
+            return  # No budget limit set
+        
+        try:
+            # Get last token usage from tracker
+            tracker = get_token_tracker()
+            last_usage = tracker.get_last_usage()
+            
+            if not last_usage:
+                return
+            
+            if self.budget_type == 'tokens':
+                # Track total tokens (input + output)
+                input_tokens = last_usage.get('input_tokens', 0)
+                output_tokens = last_usage.get('output_tokens', 0)
+                total_tokens = input_tokens + output_tokens
+                self.budget_used += total_tokens
+            elif self.budget_type == 'cost':
+                # Track estimated cost using class constants
+                input_tokens = last_usage.get('input_tokens', 0)
+                output_tokens = last_usage.get('output_tokens', 0)
+                # Calculate cost per 1K tokens
+                estimated_cost = (
+                    (input_tokens / 1000 * self.DEFAULT_INPUT_TOKEN_COST) +
+                    (output_tokens / 1000 * self.DEFAULT_OUTPUT_TOKEN_COST)
+                )
+                self.budget_used += estimated_cost
+        except Exception as e:
+            if self.debug:
+                print(f"[!] Failed to update budget usage: {e}")
+    
+    def _save_investigation_state(self) -> dict:
+        """Save current investigation state for resumption after rate limit.
+        
+        Returns a serializable dict containing the agent's current state.
+        """
+        try:
+            state = {
+                'agent_id': self.agent_id,
+                'session_id': self.session_id,
+                'investigation_goal': self.investigation_goal,
+                'conversation_history': self.conversation_history,
+                'memory_notes': self.memory_notes,
+                'action_log': self.action_log,
+                'loaded_graphs': list(self.loaded_data.get('graphs', {}).keys()),
+                'loaded_nodes': list(self.loaded_data.get('nodes', {}).keys()),
+                'budget_used': self.budget_used,
+                'timestamp': None
+            }
+            
+            # Add timestamp
+            try:
+                from datetime import datetime
+                state['timestamp'] = datetime.utcnow().isoformat()
+            except Exception:
+                pass
+            
+            return state
+        except Exception as e:
+            if self.debug:
+                print(f"[!] Failed to save investigation state: {e}")
+            return {}
+    
+    def _load_investigation_state(self, state: dict):
+        """Load investigation state for resumption after rate limit.
+        
+        Args:
+            state: Previously saved state dict
+        """
+        try:
+            if not state:
+                return
+            
+            self.investigation_goal = state.get('investigation_goal', '')
+            self.conversation_history = state.get('conversation_history', [])
+            self.memory_notes = state.get('memory_notes', [])
+            self.action_log = state.get('action_log', [])
+            self.budget_used = state.get('budget_used', 0.0)
+            
+            # Reload graphs that were loaded before
+            for graph_name in state.get('loaded_graphs', []):
+                try:
+                    if graph_name not in self.loaded_data.get('graphs', {}):
+                        self._load_graph(graph_name)
+                except Exception:
+                    pass
+            
+            if self.debug:
+                print(f"[*] Restored investigation state from {state.get('timestamp', 'unknown time')}")
+        except Exception as e:
+            if self.debug:
+                print(f"[!] Failed to load investigation state: {e}")
     
     def _load_graphs_metadata(self, metadata_path: Path) -> dict:
         """Load metadata about available graphs."""
@@ -398,6 +549,9 @@ class AutonomousAgent:
         while iterations < max_iterations:
             iterations += 1
             
+            # Check database status flag for abort requests
+            self._check_database_status()
+            
             # Honor external abort signals early in the iteration
             if getattr(self, '_abort_requested', False):
                 if progress_callback:
@@ -410,6 +564,26 @@ class AutonomousAgent:
                     except Exception:
                         pass
                 break
+            
+            # Check budget limit before continuing
+            if self.budget_limit is not None:
+                from .exceptions import BudgetExceededException
+                if self.budget_used >= self.budget_limit:
+                    if progress_callback:
+                        try:
+                            progress_callback({
+                                'status': 'complete',
+                                'iteration': iterations,
+                                'message': f"Budget limit exceeded: {self.budget_used}/{self.budget_limit} {self.budget_type}"
+                            })
+                        except Exception:
+                            pass
+                    raise BudgetExceededException(
+                        f"Budget limit exceeded: {self.budget_used}/{self.budget_limit} {self.budget_type}",
+                        budget_limit=self.budget_limit,
+                        current_usage=self.budget_used,
+                        usage_type=self.budget_type
+                    )
 
             if progress_callback:
                 progress_callback({
@@ -1252,6 +1426,9 @@ DO NOT include any text before or after the JSON object."""
                 user=user_prompt
             )
             
+            # Track budget usage after successful call
+            self._update_budget_usage()
+            
             # Parse the JSON response
             if response:
                 # Clean response - remove markdown code blocks if present
@@ -1272,9 +1449,51 @@ DO NOT include any text before or after the JSON object."""
                 elif data['parameters'] is None:
                     data['parameters'] = {}
                 return AgentDecision(**data)
+        
+        except Exception as e:
+            # Check if this is a rate limit error
+            error_str = str(e).lower()
+            is_rate_limit = any(indicator in error_str for indicator in [
+                'rate limit',
+                'rate_limit',
+                'ratelimit',
+                '429',
+                'too many requests',
+                'quota exceeded',
+                'resource exhausted'
+            ])
+            
+            if is_rate_limit:
+                from .exceptions import RateLimitException
                 
-        except (json.JSONDecodeError, Exception) as e:
-            print(f"[!] JSON parsing failed: {e}")
+                # Extract provider name
+                provider = getattr(self.llm, 'provider_name', 'unknown')
+                
+                # Try to extract retry-after from error
+                retry_after = None
+                try:
+                    import re
+                    # Match variations: 'retry-after', 'retry_after', 'retry after', etc.
+                    match = re.search(r'retry[\s\-_]*after[:\s]+(\d+)', error_str, re.IGNORECASE)
+                    if match:
+                        retry_after = int(match.group(1))
+                except Exception:
+                    pass
+                
+                # Save current state for resumption
+                state = self._save_investigation_state()
+                
+                # Raise RateLimitException with state for resumption
+                raise RateLimitException(
+                    message=f"Rate limit hit: {str(e)}",
+                    provider=provider,
+                    retry_after=retry_after,
+                    state=state
+                )
+            
+            # Not a rate limit error, handle as before
+            print(f"[!] LLM call failed: {e}")
+            # Continue with existing fallback logic
             # Fallback to more robust parsing
             if response:
                 try:

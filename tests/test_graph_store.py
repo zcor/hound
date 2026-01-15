@@ -9,11 +9,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analysis.concurrent_knowledge import ConcurrentFileStore, GraphStore, HypothesisStore
+from storage.blob_storage import LocalStorageBackend
 
 
 class TestConcurrentFileStore(unittest.TestCase):
@@ -486,6 +488,115 @@ class TestHypothesisStore(unittest.TestCase):
         
         data = self.store._load_data()
         self.assertEqual(data["hypotheses"][hyp_id]["status"], "refuted")
+
+
+class TestGraphStoreWithBlobStorage(unittest.TestCase):
+    """Test GraphStore with blob storage backends."""
+    
+    def setUp(self):
+        """Set up test fixtures."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.test_graph_file = Path(self.temp_dir) / "test_graph.json"
+        
+        # Sample graph data
+        self.sample_graph_data = {
+            "name": "TestGraph",
+            "internal_name": "test_graph",
+            "nodes": [
+                {"id": "node1", "label": "Node 1", "type": "function"},
+                {"id": "node2", "label": "Node 2", "type": "function"}
+            ],
+            "edges": [
+                {"source": "node1", "target": "node2", "type": "calls"}
+            ],
+            "metadata": {"version": "1.0"}
+        }
+    
+    def tearDown(self):
+        """Clean up test fixtures."""
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+    
+    def test_graph_store_with_local_backend(self):
+        """Test GraphStore with LocalStorageBackend."""
+        backend = LocalStorageBackend(base_path=self.temp_dir)
+        store = GraphStore(self.test_graph_file, "test_agent", storage_backend=backend)
+        
+        # Save graph
+        success = store.save_graph(self.sample_graph_data)
+        self.assertTrue(success)
+        
+        # Load graph
+        loaded_data = store.load_graph()
+        self.assertIsNotNone(loaded_data)
+        self.assertEqual(loaded_data.get("name"), self.sample_graph_data.get("name"))
+        self.assertEqual(len(loaded_data.get("nodes", [])), len(self.sample_graph_data.get("nodes", [])))
+    
+    def test_graph_store_with_mock_s3_backend(self):
+        """Test GraphStore with mocked S3 backend."""
+        # Create mock S3 backend
+        mock_storage = {}
+        mock_backend = MagicMock()
+        
+        def mock_exists(path):
+            return str(path) in mock_storage
+        
+        def mock_mkdir(path, parents=True, exist_ok=True):
+            pass  # No-op for S3
+        
+        def mock_read_json(path):
+            if str(path) in mock_storage:
+                return json.loads(mock_storage[str(path)])
+            raise FileNotFoundError(f"Not found: {path}")
+        
+        def mock_write_json(path, data, indent=2):
+            mock_storage[str(path)] = json.dumps(data, indent=indent)
+        
+        mock_backend.exists.side_effect = mock_exists
+        mock_backend.mkdir.side_effect = mock_mkdir
+        mock_backend.read_json.side_effect = mock_read_json
+        mock_backend.write_json.side_effect = mock_write_json
+        
+        # Create GraphStore with mock backend
+        store = GraphStore(self.test_graph_file, "test_agent", storage_backend=mock_backend)
+        
+        # Save graph
+        success = store.save_graph(self.sample_graph_data)
+        self.assertTrue(success)
+        
+        # Verify data was written to mock storage
+        self.assertIn(str(self.test_graph_file), mock_storage)
+        
+        # Load graph
+        loaded_data = store.load_graph()
+        self.assertIsNotNone(loaded_data)
+        self.assertEqual(loaded_data.get("name"), self.sample_graph_data.get("name"))
+    
+    def test_hypothesis_store_with_blob_backend(self):
+        """Test HypothesisStore with blob storage backend."""
+        from analysis.concurrent_knowledge import Hypothesis
+        
+        backend = LocalStorageBackend(base_path=self.temp_dir)
+        hyp_file = Path(self.temp_dir) / "hypotheses.json"
+        store = HypothesisStore(hyp_file, "test_agent", storage_backend=backend)
+        
+        # Propose a hypothesis
+        hyp = Hypothesis(
+            title="Test Vulnerability",
+            description="A test vulnerability",
+            vulnerability_type="access_control",
+            severity="high",
+            confidence=0.7,
+            node_refs=["node1"]
+        )
+        
+        success, hyp_id = store.propose(hyp)
+        self.assertTrue(success)
+        self.assertTrue(hyp_id.startswith("hyp_"))
+        
+        # Verify hypothesis was stored
+        data = store._load_data()
+        self.assertIn(hyp_id, data["hypotheses"])
+
 
 
 if __name__ == "__main__":

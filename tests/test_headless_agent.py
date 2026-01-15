@@ -123,6 +123,9 @@ class TestAgentBudgetTracking(unittest.TestCase):
         agent.budget_type = 'cost'
         agent.budget_used = 0.0
         agent.debug = False
+        # Add class constants to mock
+        agent.DEFAULT_INPUT_TOKEN_COST = AutonomousAgent.DEFAULT_INPUT_TOKEN_COST
+        agent.DEFAULT_OUTPUT_TOKEN_COST = AutonomousAgent.DEFAULT_OUTPUT_TOKEN_COST
         
         from types import MethodType
         agent._update_budget_usage = MethodType(AutonomousAgent._update_budget_usage, agent)
@@ -220,31 +223,3 @@ class TestDatabaseAbortMechanism(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-
-
-class TestRateLimitHandling(unittest.TestCase):
-    """Test rate limit exception handling and state persistence."""
-    
-    def setUp(self):
-        """Set up test fixtures."""
-        self.temp_dir = tempfile.mkdtemp()
-        self.graphs_dir = Path(self.temp_dir) / "graphs"
-        self.graphs_dir.mkdir()
-        
-        # Create minimal test graph
-        self.test_graph = {
-            "name": "SystemArchitecture",
-            "internal_name": "SystemArchitecture",
-            "nodes": [
-                {"id": "test_node", "label": "Test Node", "type": "component"}
-            ],
-            "edges": [],
-            "metadata": {"version": "1.0"}
-        }
-        
-        # Write graph file
-        graph_file = self.graphs_dir / "graph_SystemArchitecture.json"
-        with open(graph_file, 'w') as f:
-            json.dump(self.test_graph, f)
-        
-        # Create graphs metadata

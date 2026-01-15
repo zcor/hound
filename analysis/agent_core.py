@@ -73,6 +73,11 @@ class AutonomousAgent:
     Security analysis agent that works autonomously.
     """
     
+    # Default pricing estimates per 1K tokens (in USD)
+    # These should ideally be loaded from configuration
+    DEFAULT_INPUT_TOKEN_COST = 0.01  # $0.01 per 1K input tokens
+    DEFAULT_OUTPUT_TOKEN_COST = 0.03  # $0.03 per 1K output tokens
+    
     def __init__(self, 
                  graphs_metadata_path: Path,
                  manifest_path: Path,
@@ -323,12 +328,14 @@ class AutonomousAgent:
                 total_tokens = input_tokens + output_tokens
                 self.budget_used += total_tokens
             elif self.budget_type == 'cost':
-                # Track estimated cost (simplified: $0.01 per 1K tokens)
-                # In production, use actual provider pricing
+                # Track estimated cost using class constants
                 input_tokens = last_usage.get('input_tokens', 0)
                 output_tokens = last_usage.get('output_tokens', 0)
-                # Rough estimate: input at $0.01/1K, output at $0.03/1K
-                estimated_cost = (input_tokens / 1000 * 0.01) + (output_tokens / 1000 * 0.03)
+                # Calculate cost per 1K tokens
+                estimated_cost = (
+                    (input_tokens / 1000 * self.DEFAULT_INPUT_TOKEN_COST) +
+                    (output_tokens / 1000 * self.DEFAULT_OUTPUT_TOKEN_COST)
+                )
                 self.budget_used += estimated_cost
         except Exception as e:
             if self.debug:
@@ -1466,7 +1473,8 @@ DO NOT include any text before or after the JSON object."""
                 retry_after = None
                 try:
                     import re
-                    match = re.search(r'retry.after[:\s]+(\d+)', error_str)
+                    # Match variations: 'retry-after', 'retry_after', 'retry after', etc.
+                    match = re.search(r'retry[\s\-_]*after[:\s]+(\d+)', error_str, re.IGNORECASE)
                     if match:
                         retry_after = int(match.group(1))
                 except Exception:

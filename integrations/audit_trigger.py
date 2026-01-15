@@ -50,9 +50,12 @@ def run_audit_task(
     # - Store results in the database
     
     # Example of how to call the agent (commented out for safety):
+    # Note: The agent command expects a project_id string (path or name),
+    # not the database numeric ID. You would need to map the database ID
+    # to the project path or use the project_name.
     # from commands.agent import agent
     # agent(
-    #     project_id=project_name,
+    #     project_id=project_name,  # Use project name or resolve to path
     #     iterations=None,
     #     plan_n=5,
     #     time_limit=None,

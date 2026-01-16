@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database configuration
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/hound")
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
 
 # Create engine lazily to avoid connection errors during import
 _engine = None

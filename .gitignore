@@ -18,3 +18,10 @@ poetry.lock
 
 # IDE
 .vscode/
+
+# Frontend
+frontend/node_modules
+frontend/.next
+frontend/out
+frontend/.env*.local
+

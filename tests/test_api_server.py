@@ -3,6 +3,7 @@ Tests for the FastAPI server endpoints.
 """
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -19,7 +20,11 @@ from database.models import (
     Project,
     Tenant,
 )
-from server.api import app, get_db
+
+# Set test database URL before importing app
+os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+
+from server.api import app, get_db, get_engine
 
 
 # Test database setup
@@ -50,10 +55,22 @@ def client(test_db):
         finally:
             pass
 
+    def override_get_engine():
+        # Return the test engine
+        return test_db.get_bind()
+
     app.dependency_overrides[get_db] = override_get_db
+    # Also override the get_engine function to ensure it uses test DB
+    import server.api as api_module
+    original_get_engine = api_module.get_engine
+    api_module.get_engine = override_get_engine
+    
     with TestClient(app) as test_client:
         yield test_client
+    
+    # Restore original
     app.dependency_overrides.clear()
+    api_module.get_engine = original_get_engine
 
 
 @pytest.fixture
@@ -140,7 +157,7 @@ def sample_hypothesis(test_db, sample_project):
         confidence=0.9,
         severity="high",
         node_refs=["node1", "node2"],
-        evidence={"code_snippet": "SELECT * FROM users WHERE id = " + user_input},
+        evidence={"code_snippet": "SELECT * FROM users WHERE id = <user_input>"},
         reported_by_model="gpt-4o",
         junior_model="gpt-4o-mini",
         senior_model="gpt-4o",
@@ -174,7 +191,7 @@ def test_health_check(client):
     assert "timestamp" in data
 
 
-def test_list_projects_empty(client):
+def test_list_projects_empty(client, sample_tenant):
     """Test listing projects when none exist."""
     response = client.get("/projects")
     assert response.status_code == 200
@@ -222,7 +239,7 @@ def test_list_project_sessions_with_data(client, sample_project, sample_session)
     assert data[0]["investigations_count"] == 1
 
 
-def test_list_project_sessions_not_found(client):
+def test_list_project_sessions_not_found(client, sample_tenant):
     """Test listing sessions for a non-existent project."""
     response = client.get("/projects/999/sessions")
     assert response.status_code == 404
@@ -242,7 +259,7 @@ def test_get_session_graph(client, sample_session, sample_graph):
     assert len(data["edges"]) == 1
 
 
-def test_get_session_graph_not_found(client):
+def test_get_session_graph_not_found(client, sample_tenant):
     """Test getting graph for a non-existent session."""
     response = client.get("/sessions/nonexistent_session/graph")
     assert response.status_code == 404
@@ -272,7 +289,7 @@ def test_get_session_findings_with_data(client, sample_session, sample_hypothesi
     assert data[0]["vulnerability_type"] == "SQL Injection"
 
 
-def test_get_session_findings_not_found(client):
+def test_get_session_findings_not_found(client, sample_tenant):
     """Test getting findings for a non-existent session."""
     response = client.get("/sessions/nonexistent_session/findings")
     assert response.status_code == 404

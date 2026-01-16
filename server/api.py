@@ -30,10 +30,20 @@ from database.models import (
 
 # Database configuration
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/hound")
-engine = create_db_engine(DATABASE_URL)
 
-# Initialize database tables
-Base.metadata.create_all(engine)
+# Create engine lazily to avoid connection errors during import
+_engine = None
+
+
+def get_engine():
+    """Get or create database engine."""
+    global _engine
+    if _engine is None:
+        _engine = create_db_engine(DATABASE_URL)
+        # Initialize database tables
+        Base.metadata.create_all(_engine)
+    return _engine
+
 
 # Create FastAPI app
 app = FastAPI(
@@ -55,6 +65,7 @@ app.add_middleware(
 # Dependency for database session
 def get_db():
     """Get database session."""
+    engine = get_engine()
     db = create_db_session(engine)
     try:
         yield db

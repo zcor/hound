@@ -5,9 +5,17 @@ Startup script for Hound Dashboard API Server.
 This script starts the FastAPI server with sensible defaults.
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -23,17 +31,17 @@ def main():
     workers = int(os.environ.get("HOUND_API_WORKERS", "1"))
     reload = os.environ.get("HOUND_API_RELOAD", "false").lower() == "true"
     
-    print(f"🐕 Starting Hound Dashboard API Server")
-    print(f"   Host: {host}")
-    print(f"   Port: {port}")
-    print(f"   Workers: {workers}")
-    print(f"   Reload: {reload}")
-    print(f"   Database: {os.environ.get('DATABASE_URL', 'postgresql://localhost/hound')}")
-    print()
-    print(f"📖 API Documentation:")
-    print(f"   Swagger UI: http://{host if host != '0.0.0.0' else 'localhost'}:{port}/docs")
-    print(f"   ReDoc: http://{host if host != '0.0.0.0' else 'localhost'}:{port}/redoc")
-    print()
+    logger.info("🐕 Starting Hound Dashboard API Server")
+    logger.info(f"   Host: {host}")
+    logger.info(f"   Port: {port}")
+    logger.info(f"   Workers: {workers}")
+    logger.info(f"   Reload: {reload}")
+    logger.info(f"   Database: {os.environ.get('DATABASE_URL', 'postgresql://localhost/hound')}")
+    logger.info("")
+    logger.info("📖 API Documentation:")
+    logger.info(f"   Swagger UI: http://{host if host != '0.0.0.0' else 'localhost'}:{port}/docs")
+    logger.info(f"   ReDoc: http://{host if host != '0.0.0.0' else 'localhost'}:{port}/redoc")
+    logger.info("")
     
     # Start server
     uvicorn.run(

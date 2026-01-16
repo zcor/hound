@@ -5,6 +5,7 @@ Provides REST and WebSocket endpoints to serve data to the React frontend,
 replacing CLI commands with API endpoints.
 """
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -568,7 +569,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 # Health check endpoint
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """
+    Health check endpoint.
+    
+    Returns the current server status and timestamp. Used by load balancers
+    and monitoring systems to verify the server is running and responsive.
+    
+    Returns:
+        dict: Status and UTC timestamp
+    """
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 

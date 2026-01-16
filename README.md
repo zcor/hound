@@ -625,8 +625,10 @@ uvicorn server.api:app --host 0.0.0.0 --port 8000 --workers 4
 
 Environment variables:
 ```bash
-# Database connection (defaults to PostgreSQL)
-export DATABASE_URL="postgresql://user:password@localhost/hound"
+# Database connection (defaults to SQLite for local development)
+export DATABASE_URL="sqlite:///hound.db"
+# For PostgreSQL in production:
+# export DATABASE_URL="postgresql://user:password@localhost/hound"
 
 # CORS configuration (comma-separated origins, defaults to *)
 export HOUND_ALLOWED_ORIGINS="http://localhost:3000,https://dashboard.example.com"
@@ -645,7 +647,8 @@ export HOUND_API_RELOAD="false"  # Set to "true" for development
 3. **GET /projects/{id}/sessions** - List audit sessions for a project
 4. **GET /sessions/{id}/graph** - Get graph visualization data
 5. **GET /sessions/{id}/findings** - Get confirmed hypotheses/findings
-6. **WS /ws/sessions/{id}** - WebSocket for live audit log streaming
+6. **POST /findings/{id}/status** - Update finding status (confirm/reject)
+7. **WS /ws/sessions/{id}** - WebSocket for live audit log streaming
 
 ### API Documentation
 
@@ -654,6 +657,45 @@ Once the server is running, access:
 - **ReDoc**: http://localhost:8000/redoc
 
 For detailed API documentation, examples, and architecture, see [server/README.md](server/README.md).
+
+## React Dashboard
+
+Hound includes a modern React/Next.js dashboard for managing projects and viewing audits through a professional web interface.
+
+### Starting the Dashboard
+
+```bash
+# Navigate to frontend directory
+cd frontend
+
+# Install dependencies (first time only)
+npm install
+
+# Start development server
+npm run dev
+
+# Open browser to http://localhost:3000
+```
+
+### Dashboard Features
+
+- **Project Management**: Browse all security audit projects with statistics
+- **Session Navigation**: View and manage audit sessions for each project
+- **Real-time Audit View**: Three-panel layout for comprehensive analysis
+  - **Activity Panel**: Live activity log with WebSocket updates
+  - **Graph Panel**: Interactive system architecture visualization using ReactFlow
+  - **Findings Panel**: Security findings with confirm/reject actions
+
+### Configuration
+
+Create a `.env.local` file in the `frontend/` directory:
+
+```bash
+# API server URL (defaults to http://localhost:8000)
+NEXT_PUBLIC_API_URL=http://localhost:8000
+```
+
+For detailed setup instructions and troubleshooting, see [frontend/README.md](frontend/README.md).
 
 ## Advanced Features
 

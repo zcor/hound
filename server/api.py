@@ -476,7 +476,7 @@ async def get_session_findings(session_id: str, db: Session = Depends(get_db)):
 class FindingStatusUpdate(BaseModel):
     """Request model for updating finding status."""
 
-    status: str = Field(..., description="New status (confirmed, rejected, proposed, investigating)")
+    status: str = Field(..., description="New status (proposed, investigating, confirmed, rejected, resolved)")
 
 
 @app.post("/findings/{finding_id}/status")

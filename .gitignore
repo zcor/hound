@@ -19,6 +19,9 @@ poetry.lock
 # IDE
 .vscode/
 
+# Database
+*.db
+
 # Frontend
 frontend/node_modules
 frontend/.next

@@ -33,9 +33,11 @@ portalocker>=2.7.0
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.0
 
-# GitHub App Integration
+# GitHub App Integration & API Server
 fastapi>=0.100.0
 uvicorn>=0.23.0
+websockets>=11.0.0
+python-multipart>=0.0.6
 PyGithub>=2.1.0
 PyJWT>=2.8.0
 cryptography>=41.0.0

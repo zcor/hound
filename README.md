@@ -604,6 +604,57 @@ Hypothesis statuses:
 - **rejected**: False positive
 - **resolved**: Fixed in code
 
+## Dashboard API Server
+
+Hound provides a FastAPI server that exposes REST and WebSocket endpoints for integration with React frontends or other clients.
+
+### Starting the API Server
+
+```bash
+# Using the startup script (recommended)
+python server/start.py
+
+# Or with uvicorn directly
+uvicorn server.api:app --host 0.0.0.0 --port 8000
+
+# Production with workers
+uvicorn server.api:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+### Configuration
+
+Environment variables:
+```bash
+# Database connection (defaults to PostgreSQL)
+export DATABASE_URL="postgresql://user:password@localhost/hound"
+
+# CORS configuration (comma-separated origins, defaults to *)
+export HOUND_ALLOWED_ORIGINS="http://localhost:3000,https://dashboard.example.com"
+
+# Server settings
+export HOUND_API_HOST="0.0.0.0"
+export HOUND_API_PORT="8000"
+export HOUND_API_WORKERS="4"
+export HOUND_API_RELOAD="false"  # Set to "true" for development
+```
+
+### Available Endpoints
+
+1. **GET /projects** - List all projects with statistics
+2. **POST /projects** - Create a new project
+3. **GET /projects/{id}/sessions** - List audit sessions for a project
+4. **GET /sessions/{id}/graph** - Get graph visualization data
+5. **GET /sessions/{id}/findings** - Get confirmed hypotheses/findings
+6. **WS /ws/sessions/{id}** - WebSocket for live audit log streaming
+
+### API Documentation
+
+Once the server is running, access:
+- **Swagger UI**: http://localhost:8000/docs
+- **ReDoc**: http://localhost:8000/redoc
+
+For detailed API documentation, examples, and architecture, see [server/README.md](server/README.md).
+
 ## Advanced Features
 
 ### Model Selection

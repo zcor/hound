@@ -6,10 +6,8 @@ with a PostgreSQL relational database for better scalability and multi-tenancy s
 """
 
 from datetime import datetime
-from typing import Optional
 
 from sqlalchemy import (
-    ARRAY,
     JSON,
     BigInteger,
     Column,
@@ -75,6 +73,7 @@ class Tenant(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(255), nullable=False, unique=True)
+    installation_id = Column(BigInteger, nullable=True, unique=True, index=True)  # GitHub App installation ID (one tenant per installation)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -102,6 +101,8 @@ class Project(Base):
     name = Column(String(255), nullable=False, unique=True, index=True)
     source_path = Column(String(1024), nullable=True)  # Local path
     git_url = Column(String(1024), nullable=True)  # Git repository URL
+    github_repo_id = Column(BigInteger, nullable=True, index=True)  # GitHub repository ID
+    installation_id = Column(BigInteger, nullable=True, index=True)  # GitHub App installation ID
     description = Column(Text, nullable=True)
     status = Column(String(50), nullable=False, default="active")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

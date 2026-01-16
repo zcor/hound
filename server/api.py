@@ -5,9 +5,9 @@ Provides REST and WebSocket endpoints to serve data to the React frontend,
 replacing CLI commands with API endpoints.
 """
 
-import json
+import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +27,10 @@ from database.models import (
     create_db_engine,
     create_db_session,
 )
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Database configuration
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/hound")
@@ -53,9 +57,11 @@ app = FastAPI(
 )
 
 # Configure CORS
+# In production, configure with specific allowed origins via environment variable
+allowed_origins = os.environ.get("HOUND_ALLOWED_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -229,6 +235,10 @@ async def create_project(project_data: ProjectCreate, db: Session = Depends(get_
 
     Accepts either git_url or source_path. Creates the project using
     the ProjectManager and stores it in the database.
+    
+    Note: If git_url is provided without source_path, the repository
+    should be cloned first. This is currently a placeholder for future
+    git clone functionality.
     """
     # Validate that at least one source is provided
     if not project_data.git_url and not project_data.source_path:
@@ -240,12 +250,15 @@ async def create_project(project_data: ProjectCreate, db: Session = Depends(get_
     manager = ProjectManager()
 
     try:
-        # For now, use source_path if provided, otherwise use git_url
-        # In the future, this could clone the git repo first
-        source = project_data.source_path or project_data.git_url
-
+        # For now, require source_path for actual project creation
+        # TODO: Add git clone functionality for git_url
+        source = project_data.source_path
         if not source:
-            raise HTTPException(status_code=400, detail="No valid source provided")
+            # Placeholder: git_url should trigger clone to temp directory
+            raise HTTPException(
+                status_code=400, 
+                detail="source_path is required. Git URL cloning not yet implemented."
+            )
 
         # Create project using ProjectManager
         project_config = manager.create_project(
@@ -263,7 +276,16 @@ async def create_project(project_data: ProjectCreate, db: Session = Depends(get_
             db.commit()
             db.refresh(tenant)
 
-        # Create database project entry
+        # Create database project entry with error handling for datetime parsing
+        try:
+            created_at = datetime.fromisoformat(project_config["created_at"])
+            last_accessed = datetime.fromisoformat(project_config["last_accessed"])
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Failed to parse datetime from project config: {e}")
+            # Fallback to current time
+            created_at = datetime.now(timezone.utc)
+            last_accessed = datetime.now(timezone.utc)
+        
         db_project = Project(
             tenant_id=tenant.id,
             name=project_data.name,
@@ -271,8 +293,8 @@ async def create_project(project_data: ProjectCreate, db: Session = Depends(get_
             git_url=project_data.git_url,
             description=project_data.description or project_config.get("description"),
             status="active",
-            created_at=datetime.fromisoformat(project_config["created_at"]),
-            last_accessed=datetime.fromisoformat(project_config["last_accessed"]),
+            created_at=created_at,
+            last_accessed=last_accessed,
         )
         db.add(db_project)
         db.commit()
@@ -513,7 +535,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 "type": "connected",
                 "session_id": session_id,
                 "message": "WebSocket connection established",
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
 
@@ -532,14 +554,14 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 {
                     "type": "echo",
                     "data": data,
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
             )
 
     except WebSocketDisconnect:
         manager_ws.disconnect(websocket, session_id)
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error for session {session_id}: {e}")
         manager_ws.disconnect(websocket, session_id)
 
 
@@ -547,7 +569,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 if __name__ == "__main__":

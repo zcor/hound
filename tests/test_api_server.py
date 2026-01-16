@@ -4,7 +4,7 @@ Tests for the FastAPI server endpoints.
 
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -93,8 +93,8 @@ def sample_project(test_db, sample_tenant):
         git_url="https://github.com/test/repo",
         description="Test project",
         status="active",
-        created_at=datetime.utcnow(),
-        last_accessed=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
+        last_accessed=datetime.now(timezone.utc),
     )
     test_db.add(project)
     test_db.commit()
@@ -109,8 +109,8 @@ def sample_session(test_db, sample_project):
         project_id=sample_project.id,
         session_id="sess_20250116_120000_abc123",
         status="completed",
-        start_time=datetime.utcnow(),
-        end_time=datetime.utcnow(),
+        start_time=datetime.now(timezone.utc),
+        end_time=datetime.now(timezone.utc),
         models={"scout": "gpt-4o", "strategist": "gpt-4o-mini"},
         token_usage={"total_tokens": 1000, "input_tokens": 500, "output_tokens": 500},
         coverage={"nodes": {"visited": 10, "total": 100}, "cards": {"visited": 5, "total": 50}},

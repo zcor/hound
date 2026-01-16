@@ -5,12 +5,8 @@ Tests the GitHubPRReporter class that posts security findings to GitHub PRs.
 """
 
 import os
-import sys
 import unittest
 from unittest.mock import MagicMock, Mock, patch
-
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from analysis.reporters.github_pr import GitHubPRReporter
 

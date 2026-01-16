@@ -34,7 +34,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database configuration
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/hound")
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
 
 # Create engine lazily to avoid connection errors during import
 _engine = None
@@ -471,6 +471,50 @@ async def get_session_findings(session_id: str, db: Session = Depends(get_db)):
         )
 
     return response
+
+
+class FindingStatusUpdate(BaseModel):
+    """Request model for updating finding status."""
+
+    status: str = Field(..., description="New status (proposed, investigating, confirmed, rejected, resolved)")
+
+
+@app.post("/findings/{finding_id}/status")
+async def update_finding_status(
+    finding_id: int, status_update: FindingStatusUpdate, db: Session = Depends(get_db)
+):
+    """
+    Update the status of a finding (hypothesis).
+
+    This endpoint allows users to confirm or reject findings from the UI.
+    Valid statuses are: proposed, investigating, confirmed, rejected, resolved.
+    """
+    # Validate status
+    valid_statuses = ["proposed", "investigating", "confirmed", "rejected", "resolved"]
+    if status_update.status not in valid_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}",
+        )
+
+    # Get the finding
+    finding = db.query(Hypothesis).filter(Hypothesis.id == finding_id).first()
+
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding not found")
+
+    # Update status
+    finding.status = status_update.status
+    finding.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(finding)
+
+    return {
+        "id": finding.id,
+        "hypothesis_id": finding.hypothesis_id,
+        "status": finding.status,
+        "updated_at": finding.updated_at.isoformat(),
+    }
 
 
 # WebSocket endpoint for live audit logs

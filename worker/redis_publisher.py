@@ -291,13 +291,15 @@ class RedisPublisher:
             hypotheses_count: Number of hypotheses formed
             graphs_loaded: Number of graphs loaded
         """
+        # Guard against division by zero
+        safe_max = max(max_iterations, 1)
         self._publish(self.channel_updates, {
             "type": "progress",
             "iteration": iteration,
             "data": {
                 "iteration": iteration,
                 "max_iterations": max_iterations,
-                "progress_percent": round(iteration / max_iterations * 100, 1),
+                "progress_percent": round(iteration / safe_max * 100, 1),
                 "nodes_visited": nodes_visited,
                 "hypotheses_count": hypotheses_count,
                 "graphs_loaded": graphs_loaded

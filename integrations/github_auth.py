@@ -275,7 +275,10 @@ def get_clone_url_with_token(repo_url: str, installation_id: int) -> str:
     # Normalize URL to HTTPS format
     if repo_url.startswith("git@github.com:"):
         # Convert SSH URL to HTTPS
-        repo_path = repo_url.replace("git@github.com:", "").rstrip(".git")
+        repo_path = repo_url.replace("git@github.com:", "")
+        # Use removesuffix instead of rstrip to avoid stripping individual chars
+        if repo_path.endswith(".git"):
+            repo_path = repo_path[:-4]
         repo_url = f"https://github.com/{repo_path}"
     
     # Ensure .git suffix

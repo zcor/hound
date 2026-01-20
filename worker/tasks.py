@@ -200,7 +200,7 @@ def execute_audit_task(
             if result.returncode != 0:
                 raise RuntimeError(f"Git clone failed: {result.stderr}")
         else:
-            repo_path = Path(repo_url)
+            repo_path = Path(repo_url).expanduser().resolve()
             if not repo_path.exists():
                 raise FileNotFoundError(f"Repository path not found: {repo_url}")
         

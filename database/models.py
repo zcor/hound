@@ -18,6 +18,7 @@ from sqlalchemy import (
     String,
     Text,
     TypeDecorator,
+    UniqueConstraint,
     create_engine,
 )
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, JSONB
@@ -99,7 +100,12 @@ class Project(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
-    name = Column(String(255), nullable=False, unique=True, index=True)
+    name = Column(String(255), nullable=False, index=True)
+
+    # Project names must be unique within a tenant, not globally
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'name', name='uq_project_tenant_name'),
+    )
     source_path = Column(String(1024), nullable=True)  # Local path
     git_url = Column(String(1024), nullable=True)  # Git repository URL
     github_repo_id = Column(BigInteger, nullable=True, index=True)  # GitHub repository ID

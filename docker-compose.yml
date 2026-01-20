@@ -1,0 +1,121 @@
+# Hound SaaS Stack - Docker Compose Configuration
+# Usage: docker-compose up -d
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15
+    container_name: hound-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hound}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hound_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-hound}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - hound-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hound}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis Message Broker & Pub/Sub
+  redis:
+    image: redis:7
+    container_name: hound-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - hound-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # FastAPI Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hound-api
+    command: uvicorn server.api:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'
+    ports:
+      - "8000:8000"
+    environment:
+      # Database & Redis
+      DATABASE_URL: postgresql://${POSTGRES_USER:-hound}:${POSTGRES_PASSWORD:-hound_secret}@db:5432/${POSTGRES_DB:-hound}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      # GitHub Integration
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - hound-net
+    restart: unless-stopped
+
+  # Celery Worker
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hound-worker
+    command: celery -A worker.tasks worker --loglevel=info -Q default,audits,scans
+    environment:
+      # Python path for project imports
+      PYTHONPATH: /app
+      # Database & Redis
+      DATABASE_URL: postgresql://${POSTGRES_USER:-hound}:${POSTGRES_PASSWORD:-hound_secret}@db:5432/${POSTGRES_DB:-hound}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      # LLM API Keys
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      # GitHub Integration
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # S3/MinIO Storage (optional)
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      # Hound Config
+      HOUND_CONFIG: ${HOUND_CONFIG:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - hound-net
+    restart: unless-stopped
+
+networks:
+  hound-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:

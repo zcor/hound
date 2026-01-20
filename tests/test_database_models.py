@@ -20,6 +20,7 @@ from database.models import (
     Graph,
     Hypothesis,
     Project,
+    ScanExecution,
     Tenant,
     create_db_engine,
     create_db_session,
@@ -338,6 +339,154 @@ class TestDatabaseModels(unittest.TestCase):
         
         with self.assertRaises(Exception):  # Should raise IntegrityError
             self.session.commit()
+
+    def test_create_scan_execution(self):
+        """Test creating a scan execution."""
+        # Create tenant first
+        tenant = Tenant(name="test_org")
+        self.session.add(tenant)
+        self.session.commit()
+
+        # Create scan execution (without project - allowed for surface scans)
+        findings = [
+            {
+                "pattern_id": "REENTRANCY-001",
+                "title": "Reentrancy vulnerability",
+                "severity": "critical",
+                "confidence": 0.85,
+                "location": "src/Vault.sol:42"
+            }
+        ]
+        quality_metrics = {
+            "solidity_version": "0.8.20",
+            "has_tests": True,
+            "test_count": 15,
+            "total_loc": 1200
+        }
+        
+        scan = ScanExecution(
+            tenant_id=tenant.id,
+            execution_id="scan_20250119_123456",
+            repo_url="https://github.com/org/repo",
+            repo_name="test-repo",
+            status="completed",
+            risk_score=74,
+            risk_level="critical",
+            findings=findings,
+            quality_metrics=quality_metrics,
+            summary="Critical security issues detected",
+            scan_config={"llm_budget": 5, "model": "gpt-4o-mini"},
+            llm_calls_made=3,
+            contracts_scanned=5,
+            contracts_total=5,
+            artifacts_path="s3://bucket/scans/scan_20250119_123456/"
+        )
+        self.session.add(scan)
+        self.session.commit()
+        
+        # Verify scan execution was created
+        retrieved = self.session.query(ScanExecution).filter_by(execution_id="scan_20250119_123456").first()
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.repo_name, "test-repo")
+        self.assertEqual(retrieved.risk_score, 74)
+        self.assertEqual(retrieved.risk_level, "critical")
+        self.assertEqual(len(retrieved.findings), 1)
+        self.assertEqual(retrieved.findings[0]["pattern_id"], "REENTRANCY-001")
+        self.assertEqual(retrieved.quality_metrics["solidity_version"], "0.8.20")
+        self.assertEqual(retrieved.tenant_id, tenant.id)
+
+    def test_scan_execution_with_project(self):
+        """Test scan execution linked to a project."""
+        # Create tenant and project
+        tenant = Tenant(name="test_org")
+        self.session.add(tenant)
+        self.session.commit()
+        
+        project = Project(
+            tenant_id=tenant.id,
+            name="test_project",
+            source_path="/path/to/source"
+        )
+        self.session.add(project)
+        self.session.commit()
+        
+        # Create scan execution linked to project
+        scan = ScanExecution(
+            tenant_id=tenant.id,
+            project_id=project.id,
+            execution_id="scan_with_project",
+            repo_name="test-repo",
+            status="completed",
+            risk_score=30,
+            risk_level="low"
+        )
+        self.session.add(scan)
+        self.session.commit()
+        
+        # Verify relationship
+        retrieved = self.session.query(ScanExecution).filter_by(execution_id="scan_with_project").first()
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.project.name, "test_project")
+        self.assertEqual(retrieved.tenant.name, "test_org")
+        
+        # Verify project can access its scans
+        retrieved_project = self.session.query(Project).filter_by(name="test_project").first()
+        self.assertEqual(len(retrieved_project.scan_executions), 1)
+
+    def test_scan_execution_statuses(self):
+        """Test scan execution status transitions."""
+        tenant = Tenant(name="test_org")
+        self.session.add(tenant)
+        self.session.commit()
+        
+        # Create pending scan
+        scan = ScanExecution(
+            tenant_id=tenant.id,
+            execution_id="scan_status_test",
+            repo_name="test-repo",
+            status="pending"
+        )
+        self.session.add(scan)
+        self.session.commit()
+        
+        # Update to running
+        scan.status = "running"
+        self.session.commit()
+        
+        retrieved = self.session.query(ScanExecution).filter_by(execution_id="scan_status_test").first()
+        self.assertEqual(retrieved.status, "running")
+        
+        # Update to completed with results
+        scan.status = "completed"
+        scan.risk_score = 45
+        scan.risk_level = "medium"
+        self.session.commit()
+        
+        retrieved = self.session.query(ScanExecution).filter_by(execution_id="scan_status_test").first()
+        self.assertEqual(retrieved.status, "completed")
+        self.assertEqual(retrieved.risk_score, 45)
+
+    def test_scan_execution_error_handling(self):
+        """Test scan execution error state."""
+        tenant = Tenant(name="test_org")
+        self.session.add(tenant)
+        self.session.commit()
+        
+        # Create failed scan
+        scan = ScanExecution(
+            tenant_id=tenant.id,
+            execution_id="scan_error_test",
+            repo_name="broken-repo",
+            status="failed",
+            error_message="Failed to clone repository: access denied"
+        )
+        self.session.add(scan)
+        self.session.commit()
+        
+        retrieved = self.session.query(ScanExecution).filter_by(execution_id="scan_error_test").first()
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.status, "failed")
+        self.assertIn("access denied", retrieved.error_message)
 
 
 if __name__ == "__main__":

@@ -52,6 +52,38 @@ Hound is a Language-agnostic AI auditor that autonomously builds and refines ada
 pip install -r requirements.txt
 ```
 
+## Docker Quickstart (SaaS Mode)
+
+Run Hound as a full SaaS stack with PostgreSQL, Redis, API server, and background workers:
+
+```bash
+# 1. Copy and configure environment
+cp .env.example .env
+# Edit .env with your API keys and settings
+
+# 2. Start the stack
+docker compose up -d
+
+# 3. Check status
+docker compose ps
+
+# 4. View logs
+docker compose logs -f
+
+# 5. Test the API
+curl http://localhost:8000/health
+```
+
+**Services:**
+| Service | Port | Description |
+|---------|------|-------------|
+| `hound-api` | 8000 | FastAPI server + WebSocket |
+| `hound-worker` | - | Celery background worker |
+| `hound-db` | 5432 | PostgreSQL 15 |
+| `hound-redis` | 6379 | Redis 7 (broker + pub/sub) |
+
+See [docs/architecture/saas_architecture.md](docs/architecture/saas_architecture.md) for detailed architecture documentation.
+
 ## Configuration
 
 Set up your API keys for the LLM provider you want to use:
@@ -636,27 +668,100 @@ export HOUND_ALLOWED_ORIGINS="http://localhost:3000,https://dashboard.example.co
 # Server settings
 export HOUND_API_HOST="0.0.0.0"
 export HOUND_API_PORT="8000"
-export HOUND_API_WORKERS="4"
-export HOUND_API_RELOAD="false"  # Set to "true" for development
 ```
 
-### Available Endpoints
+For detailed API documentation, see [server/README.md](server/README.md).
 
-1. **GET /projects** - List all projects with statistics
-2. **POST /projects** - Create a new project
-3. **GET /projects/{id}/sessions** - List audit sessions for a project
-4. **GET /sessions/{id}/graph** - Get graph visualization data
-5. **GET /sessions/{id}/findings** - Get confirmed hypotheses/findings
-6. **POST /findings/{id}/status** - Update finding status (confirm/reject)
-7. **WS /ws/sessions/{id}** - WebSocket for live audit log streaming
+## SaaS Worker Infrastructure
 
-### API Documentation
+Hound includes a production-ready worker infrastructure for running audits as background tasks.
 
-Once the server is running, access:
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
+### Components
 
-For detailed API documentation, examples, and architecture, see [server/README.md](server/README.md).
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| Celery App | `worker/celery_app.py` | Task queue configuration |
+| Tasks | `worker/tasks.py` | Audit and scan task definitions |
+| Redis Publisher | `worker/redis_publisher.py` | Live progress streaming |
+| GitHub Auth | `integrations/github_auth.py` | GitHub App authentication |
+| PR Bot | `integrations/pr_bot.py` | Post findings to PRs |
+| Storage | `storage/blob_storage.py` | S3/Local file storage |
+
+### Starting Workers
+
+```bash
+# Start Redis (required for task queue and pub/sub)
+docker run -d -p 6379:6379 redis:7-alpine
+
+# Start Celery worker
+celery -A worker.celery_app worker --loglevel=info
+
+# Optional: Start with concurrency
+celery -A worker.celery_app worker --loglevel=info --concurrency=4
+```
+
+### Environment Variables
+
+```bash
+# Required
+export CELERY_BROKER_URL="redis://localhost:6379/0"
+export DATABASE_URL="postgresql://user:password@localhost/hound"
+
+# GitHub App (for private repos and PR comments)
+export GITHUB_APP_ID="123456"
+export GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----..."
+# Or use a file path:
+export GITHUB_APP_PRIVATE_KEY_PATH="/path/to/private-key.pem"
+
+# Cloud Storage (optional, for S3/MinIO)
+export AWS_ACCESS_KEY_ID="your-key"
+export AWS_SECRET_ACCESS_KEY="your-secret"
+export S3_BUCKET="hound-artifacts"
+export S3_ENDPOINT_URL="https://s3.amazonaws.com"  # Or MinIO URL
+```
+
+### Submitting Tasks
+
+```python
+from worker.tasks import execute_audit_task, execute_scan_task
+
+# Full audit with GitHub App authentication
+result = execute_audit_task.delay(
+    repo_url="https://github.com/owner/repo",
+    scan_id="scan_abc123",
+    tenant_id=1,
+    installation_id=12345678,  # GitHub App installation
+    pr_number=42,              # Post findings to PR
+    repo_full_name="owner/repo",
+)
+
+# Lightweight surface scan
+result = execute_scan_task.delay(
+    repo_url="https://github.com/owner/repo",
+    scan_id="scan_xyz789",
+    tenant_id=1,
+    llm_budget=5,
+)
+```
+
+### Live Progress Streaming
+
+Workers publish real-time updates via Redis Pub/Sub:
+
+```python
+import redis
+
+r = redis.Redis()
+pubsub = r.pubsub()
+pubsub.subscribe("audit:updates:scan_abc123")
+
+for message in pubsub.listen():
+    if message["type"] == "message":
+        update = json.loads(message["data"])
+        print(f"[{update['type']}] {update.get('message', '')}")
+```
+
+For detailed architecture documentation, see [docs/architecture/](docs/architecture/).
 
 ## React Dashboard
 

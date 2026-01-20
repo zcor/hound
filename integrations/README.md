@@ -1,195 +1,124 @@
-# GitHub App Integration
+# Integrations Module
 
-This module provides GitHub App authentication and webhook handling for Hound.
+This module provides external service integrations for Hound SaaS.
+
+## Modules
+
+### GitHub App Authentication (`github_auth.py`)
+
+Secure authentication for GitHub App installations to clone private repos and access API.
+
+```python
+from integrations import get_installation_token, get_clone_url_with_token, get_authenticated_github_client
+
+# Get an installation access token (cached automatically)
+token = get_installation_token(installation_id=12345678)
+
+# Get authenticated clone URL for private repos
+clone_url = get_clone_url_with_token(
+    "https://github.com/owner/private-repo",
+    installation_id=12345678
+)
+# Returns: https://x-access-token:TOKEN@github.com/owner/private-repo.git
+
+# Get PyGithub client for API calls
+github = get_authenticated_github_client(installation_id=12345678)
+repo = github.get_repo("owner/repo")
+```
+
+### PR Comment Bot (`pr_bot.py`)
+
+Posts security findings as inline comments and summary on GitHub Pull Requests.
+
+```python
+from integrations import post_findings_to_pr, PRCommentBot
+
+# Quick posting with convenience function
+result = post_findings_to_pr(
+    installation_id=12345678,
+    repo_full_name="owner/repo",
+    pr_number=42,
+    findings=[
+        {
+            "title": "Reentrancy Vulnerability",
+            "severity": "high",
+            "type": "reentrancy",
+            "confidence": 0.85,
+            "description": "External call before state update",
+            "affected": ["contracts/Vault.sol:142"],
+        }
+    ],
+    scan_id="scan_abc123",
+)
+
+# Or use the bot class for more control
+bot = PRCommentBot(
+    installation_id=12345678,
+    repo_full_name="owner/repo",
+    pr_number=42,
+)
+
+# Delete previous Hound comments
+bot.delete_previous_comments()
+
+# Post inline comments on specific diff lines
+bot.post_findings(findings, include_inline=True, include_summary=True)
+```
+
+### GitHub App Webhooks (`github_app.py`)
+
+Handles GitHub webhook events for app installation and push events.
+
+### Audit Trigger (`audit_trigger.py`)
+
+Triggers audits from external events (webhooks, API calls).
+
+## Environment Variables
+
+```bash
+# GitHub App credentials (required for GitHub integration)
+GITHUB_APP_ID="123456"
+GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----..."
+# Or use file path:
+GITHUB_APP_PRIVATE_KEY_PATH="/path/to/private-key.pem"
+
+# Webhook secret (for webhook signature verification)
+GITHUB_WEBHOOK_SECRET="your-webhook-secret"
+```
+
+## Setting Up a GitHub App
+
+1. Go to **GitHub Settings → Developer settings → GitHub Apps → New GitHub App**
+
+2. Configure permissions:
+   - **Repository permissions:**
+     - Contents: Read (to clone repos)
+     - Pull requests: Write (to post comments)
+     - Metadata: Read
+   - **Subscribe to events:**
+     - Installation
+     - Push
+     - Pull request
+
+3. Generate and download a private key (`.pem` file)
+
+4. Note your **App ID** from the app settings page
+
+5. Set environment variables with your credentials
 
 ## Features
 
-- **GitHub App Authentication**: Authenticate as a GitHub App and generate installation tokens
-- **Webhook Handler**: Process GitHub webhook events
-- **Automatic Project Creation**: Create project entries when the app is installed on repositories
-- **Push Event Audits**: Trigger security audits when code is pushed to monitored repositories
+### Token Caching
+Installation tokens are automatically cached with 5-minute buffer before expiry. No need to manage token refresh manually.
 
-## Setup
+### Inline PR Comments
+Findings are mapped to specific lines in the PR diff. If a finding's location isn't in the diff, it appears in the summary comment instead.
 
-### 1. Create a GitHub App
+### Severity Emoji Mapping
+- 🔴 Critical
+- 🟠 High  
+- 🟡 Medium
+- 🟢 Low
 
-1. Go to GitHub Settings → Developer settings → GitHub Apps → New GitHub App
-2. Configure the app:
-   - **Homepage URL**: Your application URL
-   - **Webhook URL**: `https://your-domain.com/webhooks/github`
-   - **Webhook secret**: Generate a random secret
-   - **Permissions**:
-     - Repository permissions:
-       - Contents: Read
-       - Metadata: Read
-   - **Subscribe to events**:
-     - Installation
-     - Push
-3. Generate a private key and download the `.pem` file
-4. Note your App ID
-
-### 2. Configure Environment Variables
-
-Set the following environment variables:
-
-```bash
-export GITHUB_APP_ID="123456"                              # Your GitHub App ID
-export GITHUB_APP_PRIVATE_KEY_PATH="/path/to/private.pem"  # Path to private key
-export GITHUB_WEBHOOK_SECRET="your-webhook-secret"         # Webhook secret
-export DATABASE_URL="postgresql://user:pass@localhost/hound"  # Database connection
-```
-
-### 3. Run the Webhook Server
-
-Start the webhook server to receive GitHub events:
-
-```bash
-python webhook_server.py
-```
-
-Or with custom host/port:
-
-```bash
-export HOST="0.0.0.0"
-export PORT="8000"
-python webhook_server.py
-```
-
-The server will be available at:
-- Webhook endpoint: `http://localhost:8000/webhooks/github`
-- Health check: `http://localhost:8000/health`
-
-### 4. Install the GitHub App
-
-1. Go to your GitHub App settings
-2. Click "Install App"
-3. Select the repositories you want to monitor
-4. The app will create Project entries in the database for each repository
-
-## Usage
-
-### Get Repository Token
-
-```python
-from integrations.github_app import get_repo_token
-
-# Get an installation token for accessing repositories
-token = get_repo_token(installation_id=12345)
-```
-
-### Get Authenticated GitHub Client
-
-```python
-from integrations.github_app import get_github_client
-
-# Get an authenticated GitHub client
-client = get_github_client(installation_id=12345)
-
-# Use the client to access repositories
-repo = client.get_repo("owner/repo")
-```
-
-## Webhook Events
-
-### installation.created
-
-When the app is installed on repositories, this event:
-1. Creates a Tenant entry (or uses existing) with the installation_id
-2. Creates Project entries for each repository
-3. Stores the installation_id on both Tenant and Project
-
-### push
-
-When code is pushed to a monitored repository, this event:
-1. Checks if the repository is active in the database
-2. Triggers a security audit for the specific commit
-3. The audit is handled by the `run_audit_task` function
-
-## Database Schema
-
-The integration adds the following fields to the database models:
-
-**Tenant**:
-- `installation_id` (BigInteger): GitHub App installation ID
-
-**Project**:
-- `github_repo_id` (BigInteger): GitHub repository ID
-- `installation_id` (BigInteger): GitHub App installation ID
-
-## Testing
-
-Run the tests with:
-
-```bash
-python -m pytest tests/test_github_integration.py -v
-```
-
-Or run all tests:
-
-```bash
-python -m pytest tests/ -v
-```
-
-## Security
-
-- Webhook signatures are verified using HMAC-SHA256
-- Private keys should be stored securely and never committed to version control
-- Use environment variables for sensitive configuration
-- In production, always set `GITHUB_WEBHOOK_SECRET` for signature verification
-
-## Deployment
-
-### Docker
-
-```dockerfile
-FROM python:3.10
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-
-ENV HOST=0.0.0.0
-ENV PORT=8000
-
-CMD ["python", "webhook_server.py"]
-```
-
-### systemd Service
-
-```ini
-[Unit]
-Description=Hound GitHub Webhook Server
-After=network.target
-
-[Service]
-Type=simple
-User=hound
-WorkingDirectory=/opt/hound
-Environment="GITHUB_APP_ID=123456"
-Environment="GITHUB_APP_PRIVATE_KEY_PATH=/opt/hound/private.pem"
-Environment="GITHUB_WEBHOOK_SECRET=your-secret"
-Environment="DATABASE_URL=postgresql://localhost/hound"
-ExecStart=/usr/bin/python3 /opt/hound/webhook_server.py
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## Troubleshooting
-
-### "Private key file not found"
-Make sure the `GITHUB_APP_PRIVATE_KEY_PATH` points to a valid `.pem` file.
-
-### "Invalid signature"
-Verify that the `GITHUB_WEBHOOK_SECRET` matches the secret configured in your GitHub App settings.
-
-### Events not being received
-1. Check that the webhook URL is publicly accessible
-2. Verify the webhook is configured in your GitHub App settings
-3. Check the webhook delivery logs in GitHub App settings
-
-### Database connection errors
-Ensure the `DATABASE_URL` is correct and the database is accessible.
+### Comment Identification
+All Hound comments include `<!-- hound-security-bot -->` marker for easy identification and cleanup.

@@ -79,6 +79,7 @@ class Tenant(Base):
     
     # Relationships
     projects = relationship("Project", back_populates="tenant", cascade="all, delete-orphan")
+    scan_executions = relationship("ScanExecution", back_populates="tenant", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Tenant(id={self.id}, name='{self.name}')>"
@@ -113,6 +114,7 @@ class Project(Base):
     audit_sessions = relationship("AuditSession", back_populates="project", cascade="all, delete-orphan")
     graphs = relationship("Graph", back_populates="project", cascade="all, delete-orphan")
     hypotheses = relationship("Hypothesis", back_populates="project", cascade="all, delete-orphan")
+    scan_executions = relationship("ScanExecution", back_populates="project", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Project(id={self.id}, name='{self.name}', status='{self.status}')>"
@@ -134,7 +136,7 @@ class AuditSession(Base):
     __tablename__ = "audit_sessions"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)  # Optional - can be set later
     session_id = Column(String(255), nullable=False, unique=True, index=True)
     status = Column(String(50), nullable=False, default="active")
     start_time = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -221,6 +223,66 @@ class Hypothesis(Base):
     
     def __repr__(self):
         return f"<Hypothesis(id={self.id}, hypothesis_id='{self.hypothesis_id}', title='{self.title}', status='{self.status}')>"
+
+
+class ScanExecution(Base):
+    """
+    ScanExecution table for Surface Scan results.
+    
+    Stores lightweight surface scan execution data for lead generation:
+    - execution_id: Unique identifier for the scan execution
+    - repo_url/repo_name: Repository identification
+    - risk_score/risk_level: Calculated risk assessment
+    - findings: Detected vulnerabilities and quality issues (stored as JSONB)
+    - quality_metrics: Code quality indicators (stored as JSONB)
+    - scan_config: Configuration used for the scan (stored as JSONB)
+    - artifacts_path: S3/blob path to full scan artifacts
+    """
+    __tablename__ = "scan_executions"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)  # Optional link to full project
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    
+    # Scan identification
+    execution_id = Column(String(255), nullable=False, unique=True, index=True)
+    repo_url = Column(String(1024), nullable=True)  # GitHub URL if applicable
+    repo_name = Column(String(255), nullable=False, index=True)
+    
+    # Scan results
+    status = Column(String(50), nullable=False, default="pending")  # pending, running, completed, failed
+    risk_score = Column(Integer, nullable=True)  # 0-100 risk score
+    risk_level = Column(String(50), nullable=True)  # critical, high, medium, low
+    
+    # Detailed findings and metrics (JSONB for flexibility)
+    findings = Column(JSONType, nullable=True)  # List of Finding objects
+    quality_metrics = Column(JSONType, nullable=True)  # QualityMetrics object
+    summary = Column(Text, nullable=True)  # Human-readable summary
+    
+    # Scan configuration and metadata
+    scan_config = Column(JSONType, nullable=True)  # llm_budget, model, patterns enabled, etc.
+    llm_calls_made = Column(Integer, nullable=False, default=0)
+    contracts_scanned = Column(Integer, nullable=False, default=0)
+    contracts_total = Column(Integer, nullable=False, default=0)
+    
+    # Artifact storage reference (S3/MinIO path for full reports, code snippets, etc.)
+    artifacts_path = Column(String(1024), nullable=True)
+    
+    # Error handling
+    error_message = Column(Text, nullable=True)
+    
+    # Timing
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    project = relationship("Project", back_populates="scan_executions")
+    tenant = relationship("Tenant", back_populates="scan_executions")
+    
+    def __repr__(self):
+        return f"<ScanExecution(id={self.id}, execution_id='{self.execution_id}', repo='{self.repo_name}', status='{self.status}')>"
 
 
 # Database connection helper

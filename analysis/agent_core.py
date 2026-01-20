@@ -87,7 +87,8 @@ class AutonomousAgent:
                  session_id: str | None = None,
                  storage_backend: Any | None = None,
                  budget_limit: float | None = None,
-                 budget_type: str = 'tokens'):
+                 budget_type: str = 'tokens',
+                 redis_publisher: Any | None = None):
         """Initialize the autonomous agent.
         
         Args:
@@ -100,6 +101,7 @@ class AutonomousAgent:
             storage_backend: Optional storage backend for graphs (local or S3/MinIO)
             budget_limit: Optional budget limit (max tokens or dollars)
             budget_type: Type of budget limit ('tokens' or 'cost')
+            redis_publisher: Optional RedisPublisher for live updates to SaaS frontend
         """
         
         self.agent_id = agent_id
@@ -112,6 +114,9 @@ class AutonomousAgent:
         self.budget_used = 0.0  # Track usage during investigation
         # Default hypothesis visibility; can be overridden by runner
         self.default_hypothesis_visibility = 'global'
+        
+        # Redis publisher for SaaS live updates (optional)
+        self.redis_publisher = redis_publisher
         
         # Initialize debug logger if needed
         self.debug_logger = None
@@ -232,6 +237,79 @@ class AutonomousAgent:
         # Abort flag (set by runner on steering replan)
         self._abort_requested: bool = False
         self._abort_reason: str | None = None
+
+    def _publish_to_redis(self, msg_type: str, iteration: int = 0, data: dict | None = None):
+        """Publish an update to Redis Pub/Sub for SaaS frontend.
+        
+        This method is a no-op if no redis_publisher was configured.
+        
+        Args:
+            msg_type: Type of message (thought, decision, action_start, action_result, progress, status, error)
+            iteration: Current iteration number
+            data: Message data dictionary
+        """
+        if not self.redis_publisher:
+            return
+        
+        try:
+            data = data or {}
+            
+            if msg_type == 'thought':
+                self.redis_publisher.publish_thought(
+                    data.get('thought', ''),
+                    iteration=iteration,
+                    context=data.get('context')
+                )
+            elif msg_type == 'decision':
+                self.redis_publisher.publish_decision(
+                    action=data.get('action', ''),
+                    reasoning=data.get('reasoning', ''),
+                    parameters=data.get('parameters', {}),
+                    iteration=iteration
+                )
+            elif msg_type == 'action_start':
+                self.redis_publisher.publish_action_start(
+                    data.get('action', ''),
+                    iteration=iteration
+                )
+            elif msg_type == 'action_result':
+                self.redis_publisher.publish_action_result(
+                    action=data.get('action', ''),
+                    result=data.get('result', {}),
+                    iteration=iteration
+                )
+            elif msg_type == 'progress':
+                self.redis_publisher.publish_progress(
+                    iteration=iteration,
+                    max_iterations=data.get('max_iterations', 50),
+                    nodes_visited=data.get('nodes_visited', 0),
+                    hypotheses_count=data.get('hypotheses_count', 0),
+                    graphs_loaded=data.get('graphs_loaded', 0)
+                )
+            elif msg_type == 'hypothesis':
+                self.redis_publisher.publish_hypothesis(
+                    hypothesis_id=data.get('hypothesis_id', ''),
+                    title=data.get('title', ''),
+                    confidence=data.get('confidence', 0.5),
+                    severity=data.get('severity', 'medium'),
+                    iteration=iteration
+                )
+            elif msg_type == 'status':
+                self.redis_publisher.publish_status(
+                    status=data.get('status', ''),
+                    message=data.get('message', ''),
+                    details=data
+                )
+            elif msg_type == 'error':
+                self.redis_publisher.publish_error(
+                    error=data.get('error', ''),
+                    error_type=data.get('error_type', 'general'),
+                    iteration=iteration
+                )
+        except Exception as e:
+            # Don't fail the investigation if Redis publishing fails
+            if self.debug:
+                print(f"[!] Failed to publish to Redis: {e}")
 
     def request_abort(self, reason: str | None = None):
         """Signal the agent loop to abort the current investigation ASAP.
@@ -546,14 +624,31 @@ class AutonomousAgent:
         
         iterations = 0
         
+        print(f"[DEBUG] Starting investigation loop with max_iterations={max_iterations}")
+        
         while iterations < max_iterations:
             iterations += 1
+            
+            print(f"[DEBUG] === Iteration {iterations}/{max_iterations} started ===")
+            
+            # Publish progress to Redis if publisher is available
+            self._publish_to_redis('progress', iteration=iterations, data={
+                'iteration': iterations,
+                'max_iterations': max_iterations,
+                'nodes_visited': len(self.loaded_data.get('nodes', {})),
+                'hypotheses_count': len(self.loaded_data.get('hypotheses', [])),
+                'graphs_loaded': len(self.loaded_data.get('graphs', {})),
+            })
             
             # Check database status flag for abort requests
             self._check_database_status()
             
             # Honor external abort signals early in the iteration
             if getattr(self, '_abort_requested', False):
+                self._publish_to_redis('status', data={
+                    'status': 'aborted',
+                    'reason': getattr(self, '_abort_reason', 'steering_replan')
+                })
                 if progress_callback:
                     try:
                         progress_callback({
@@ -569,6 +664,12 @@ class AutonomousAgent:
             if self.budget_limit is not None:
                 from .exceptions import BudgetExceededException
                 if self.budget_used >= self.budget_limit:
+                    self._publish_to_redis('status', data={
+                        'status': 'budget_exceeded',
+                        'budget_used': self.budget_used,
+                        'budget_limit': self.budget_limit,
+                        'budget_type': self.budget_type
+                    })
                     if progress_callback:
                         try:
                             progress_callback({
@@ -585,6 +686,11 @@ class AutonomousAgent:
                         usage_type=self.budget_type
                     )
 
+            # Publish thinking status
+            self._publish_to_redis('thought', iteration=iterations, data={
+                'thought': 'Analyzing context and deciding next action...'
+            })
+            
             if progress_callback:
                 progress_callback({
                     'status': 'analyzing',
@@ -598,6 +704,14 @@ class AutonomousAgent:
                 
                 # Get agent's decision using structured output
                 decision = self._get_agent_decision(context)
+                
+                # Publish decision to Redis
+                self._publish_to_redis('decision', iteration=iterations, data={
+                    'action': decision.action,
+                    'reasoning': decision.reasoning,
+                    'parameters': decision.parameters
+                })
+                
                 # Surface the agent's decision and reasoning to UI
                 if progress_callback:
                     try:
@@ -630,6 +744,11 @@ class AutonomousAgent:
                     'content': f"Action: {decision.action}\nReasoning: {decision.reasoning}"
                 })
                 
+                # Publish action start
+                self._publish_to_redis('action_start', iteration=iterations, data={
+                    'action': decision.action
+                })
+                
                 if progress_callback:
                     progress_callback({
                         'status': 'executing',
@@ -639,6 +758,14 @@ class AutonomousAgent:
                 
                 # Execute the decision
                 result = self._execute_action(decision)
+                
+                # Publish action result
+                safe_result = result if isinstance(result, dict) else {'status': 'error', 'error': 'No result'}
+                self._publish_to_redis('action_result', iteration=iterations, data={
+                    'action': decision.action,
+                    'result': safe_result
+                })
+                
                 # Surface result to UI (generic) with defensive guards
                 if progress_callback:
                     try:
@@ -710,6 +837,7 @@ class AutonomousAgent:
                 
                 # Check if complete
                 if decision.action == 'complete':
+                    print(f"[DEBUG] Agent decided to COMPLETE - exiting loop")
                     if progress_callback:
                         progress_callback({
                             'status': 'complete',
@@ -750,6 +878,8 @@ class AutonomousAgent:
             except Exception as e:
                 error_msg = f"Error in iteration {iterations}: {str(e)}"
                 print(f"[!] {error_msg}")
+                import traceback as tb
+                tb.print_exc()  # Always print traceback for debugging
                 if self.debug:
                     traceback.print_exc()
                 
@@ -757,6 +887,10 @@ class AutonomousAgent:
                     'role': 'system',
                     'content': f"ERROR: {error_msg}"
                 })
+            
+            print(f"[DEBUG] === Iteration {iterations} complete, looping back ===")
+        
+        print(f"[DEBUG] Loop exited after {iterations} iterations (max was {max_iterations})")
         
         # Generate final report
         if progress_callback:
@@ -920,6 +1054,31 @@ class AutonomousAgent:
                     line = []
             if line:
                 context_parts.append('  ' + ','.join(line))
+            context_parts.append("")
+        
+        # Add a nudge for deep_think when enough context is loaded
+        loaded_nodes_count = len(self.loaded_data.get('nodes', {}))
+        loaded_graphs_count = len(self.loaded_data.get('graphs', {}))
+        has_system_graph = bool(self.loaded_data.get('system_graph'))
+        total_graphs = 1 + loaded_graphs_count if has_system_graph else loaded_graphs_count
+        hypotheses_count = len(self.loaded_data.get('hypotheses', []))
+        action_count = len(self.action_log)
+        
+        # Check if agent has been exploring without analyzing
+        load_actions = sum(1 for a in self.action_log[-10:] if a.get('action') in ['load_nodes', 'load_graph'])
+        deep_think_calls = sum(1 for a in self.action_log if a.get('action') == 'deep_think')
+        
+        if loaded_nodes_count >= 5 and deep_think_calls == 0:
+            context_parts.append("=== ⚠️  ANALYSIS REMINDER ===")
+            context_parts.append(f"You have loaded {loaded_nodes_count} nodes and {total_graphs} graph(s).")
+            context_parts.append(f"You have NOT called deep_think yet to analyze for vulnerabilities!")
+            context_parts.append("Consider calling deep_think NOW to get vulnerability analysis from the strategist.")
+            context_parts.append("The strategist can only find vulnerabilities if you call deep_think.")
+            context_parts.append("")
+        elif loaded_nodes_count >= 3 and action_count >= 5 and load_actions >= 4 and hypotheses_count == 0:
+            context_parts.append("=== ⚠️  ANALYSIS REMINDER ===")
+            context_parts.append(f"You've performed {action_count} actions with {load_actions} recent load actions.")
+            context_parts.append(f"No vulnerabilities found yet. Consider calling deep_think to analyze the loaded code.")
             context_parts.append("")
         
         # Actions performed (recent) - summary only since full data is in RECENT ACTIONS
@@ -2474,14 +2633,19 @@ DO NOT include any text before or after the JSON object."""
             },
             'detailed_hypotheses': [
                 {
+                    'id': h.get('id', f"hyp_{i}"),  # Include hypothesis ID
                     'description': h['description'],
-                    'type': h['vulnerability_type'],
+                    'vulnerability_type': h['vulnerability_type'],  # Use correct field name
+                    'type': h['vulnerability_type'],  # Keep for compatibility
                     'confidence': h['confidence'],
+                    'severity': h.get('severity', 'medium'),  # Include severity
                     'status': 'confirmed' if h['confidence'] >= 0.8 
                              else 'rejected' if h['confidence'] <= 0.2 
                              else 'uncertain',
-                    'evidence': h.get('evidence', [])
+                    'evidence': h.get('evidence', []),
+                    'evidence_summary': ', '.join(h.get('evidence', [])) if h.get('evidence') else '',  # String for DB
+                    'node_ids': h.get('node_ids', [])  # Include node IDs
                 }
-                for h in self.loaded_data['hypotheses']
+                for i, h in enumerate(self.loaded_data['hypotheses'])
             ]
         }

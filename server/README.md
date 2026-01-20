@@ -1,11 +1,43 @@
 # Hound Dashboard API Server
 
-This FastAPI server provides REST and WebSocket endpoints to serve data to the React frontend, replacing CLI commands with API endpoints.
+This FastAPI server provides REST and WebSocket endpoints to serve data to the React frontend and handles the SaaS orchestration layer.
+
+## Quick Start with Docker
+
+```bash
+# From repository root
+docker compose up -d
+
+# API available at http://localhost:8000
+curl http://localhost:8000/health
+curl http://localhost:8000/docs   # OpenAPI docs
+```
+
+## Architecture
+
+```
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│  GitHub App     │     │  Web Server     │     │  Celery Worker  │
+│  (Webhooks)     │────▶│  (FastAPI)      │────▶│  (Background)   │
+└─────────────────┘     └────────┬────────┘     └────────┬────────┘
+                                 │                       │
+                        ┌────────▼────────┐     ┌────────▼────────┐
+                        │  PostgreSQL     │     │  Redis Pub/Sub  │
+                        │  (Database)     │     │  (Live Updates) │
+                        └─────────────────┘     └────────┬────────┘
+                                                         │
+                                                ┌────────▼────────┐
+                                                │  WebSocket      │
+                                                │  (Browser)      │
+                                                └─────────────────┘
+```
 
 ## Features
 
 - **REST API Endpoints**: CRUD operations for projects, sessions, graphs, and findings
-- **WebSocket Support**: Real-time audit log streaming (ready for Redis integration)
+- **Audit Control**: Start audits via API, track progress, get results
+- **GitHub Webhooks**: Auto-trigger audits on PR open/push events
+- **WebSocket Support**: Real-time audit log streaming via Redis Pub/Sub
 - **Database Integration**: Uses PostgreSQL/SQLite with SQLAlchemy ORM
 - **CORS Support**: Configured for cross-origin requests from frontend
 - **API Documentation**: Auto-generated Swagger/OpenAPI docs at `/docs`
@@ -113,18 +145,96 @@ Return the list of confirmed hypotheses (findings).
 ]
 ```
 
-### 6. WS /ws/sessions/{id}
+### 6. POST /audits/start ⭐ NEW
+Start a new security audit (async, returns immediately).
+
+**Request:**
+```json
+{
+  "repo_url": "https://github.com/owner/repo",
+  "tenant_id": 1,
+  "max_iterations": 50,
+  "installation_id": 12345,
+  "pr_number": 42,
+  "repo_full_name": "owner/repo"
+}
+```
+
+**Response:**
+```json
+{
+  "session_id": "audit_abc123def456_1737331200",
+  "status": "queued",
+  "message": "Audit queued successfully. Task ID: celery-task-id",
+  "websocket_url": "/ws/sessions/audit_abc123def456_1737331200"
+}
+```
+
+### 7. GET /audits/{session_id}/status ⭐ NEW
+Get the current status of an audit.
+
+**Response:**
+```json
+{
+  "session_id": "audit_abc123def456_1737331200",
+  "status": "running",
+  "progress": {"iteration": 15, "hypotheses_formed": 3},
+  "findings_count": 2,
+  "started_at": "2025-01-19T12:00:00",
+  "completed_at": null
+}
+```
+
+### 8. POST /webhooks/github ⭐ NEW
+Handle GitHub App webhook events.
+
+Automatically triggers audits on:
+- `pull_request` events (opened, synchronize, reopened)
+- `installation` events (app installed/uninstalled)
+- `push` events (to default branch - configurable)
+
+**Headers Required:**
+- `X-GitHub-Event`: Event type (e.g., "pull_request")
+- `X-Hub-Signature-256`: HMAC signature for verification
+
+**Response (PR event):**
+```json
+{
+  "status": "ok",
+  "event": "pull_request",
+  "action": "opened",
+  "session_id": "pr_owner_repo_42_abc123",
+  "task_id": "celery-task-id"
+}
+```
+
+### 9. WS /ws/sessions/{session_id}
 WebSocket endpoint for streaming live audit logs.
 
-Establishes a WebSocket connection for real-time updates during an audit session. Ready for Redis pub/sub integration.
+Establishes a WebSocket connection and subscribes to Redis Pub/Sub channels for real-time updates during an audit session.
+
+**Channels Subscribed:**
+- `audit:updates:{session_id}` - Live progress updates
+- `audit:status:{session_id}` - Status changes
 
 **Connection Message:**
 ```json
 {
   "type": "connected",
-  "session_id": "sess_20250116_120000_abc123",
-  "message": "WebSocket connection established",
-  "timestamp": "2025-01-16T12:00:00"
+  "session_id": "audit_abc123def456_1737331200",
+  "message": "WebSocket connection established. Subscribing to audit updates...",
+  "timestamp": "2025-01-19T12:00:00"
+}
+```
+
+**Progress Messages (from worker):**
+```json
+{
+  "type": "thought",
+  "scan_id": "audit_abc123def456_1737331200",
+  "iteration": 5,
+  "data": {"thought": "Analyzing authentication flow..."},
+  "timestamp": "2025-01-19T12:05:00"
 }
 ```
 
@@ -185,16 +295,36 @@ pytest tests/test_api_server.py -v
 
 ### Environment Variables
 
-- `DATABASE_URL`: PostgreSQL connection string (default: `postgresql://localhost/hound`)
-- For testing, set to `sqlite:///:memory:` or `sqlite:///test.db`
+| Variable | Description | Default |
+|----------|-------------|----------|
+| `DATABASE_URL` | PostgreSQL/SQLite connection string | `sqlite:///hound.db` |
+| `REDIS_URL` | Redis connection for Celery & Pub/Sub | `redis://localhost:6379/0` |
+| `GITHUB_WEBHOOK_SECRET` | Secret for verifying GitHub webhooks | (none - dev mode skips verification) |
+| `HOUND_ALLOWED_ORIGINS` | Comma-separated CORS origins | `*` |
+
+## Running with Celery Workers
+
+For production SaaS deployment, run both the API server and Celery workers:
+
+```bash
+# Terminal 1: API Server
+uvicorn server.api:app --host 0.0.0.0 --port 8000
+
+# Terminal 2: Celery Worker
+celery -A worker.celery_app worker --loglevel=info
+
+# Terminal 3: Redis (if not using managed Redis)
+redis-server
+```
 
 ## Future Enhancements
 
-1. **Redis Integration**: The WebSocket endpoint is prepared for Redis pub/sub to stream live audit logs
+1. ~~Redis Integration~~: ✅ Implemented - WebSocket now subscribes to Redis Pub/Sub
 2. **Authentication**: Add JWT or OAuth2 authentication
 3. **Rate Limiting**: Implement rate limiting for API endpoints
 4. **Caching**: Add Redis caching for frequently accessed data
 5. **Pagination**: Implement cursor-based pagination for large result sets
+6. **Multi-tenancy**: Add tenant isolation and billing integration
 
 ## Architecture
 
@@ -216,9 +346,10 @@ commands/
 ## Testing
 
 The test suite includes:
-- Unit tests for all endpoints
-- Integration tests with in-memory SQLite database
+- Unit tests for all endpoints (including new audit control endpoints)
+- Integration tests with file-based SQLite database
 - WebSocket connection tests
+- GitHub webhook handling tests
 - Request/response validation tests
 
-All 16 tests pass successfully.
+All 24 tests pass successfully.

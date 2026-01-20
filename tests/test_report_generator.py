@@ -70,7 +70,7 @@ class TestReportGenerator(unittest.TestCase):
             self.assertIn('Remediation', html)
             # Verify badge section is included
             self.assertIn('README Badge', html)
-            self.assertIn('Audited by Hound', html)
+            self.assertIn('Audited_by-Hound', html)  # Badge URL format uses underscores
     
     def test_remediation_advice_generation(self):
         """Test that remediation advice is generated for findings."""

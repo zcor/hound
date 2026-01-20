@@ -9,7 +9,7 @@ graph_results
 config.yaml
 htmlcov/
 chatbot/.active_project 
-
+.env 
 *.egg-info/
 *.egg
 

@@ -29,9 +29,12 @@ from server.api import app, get_db, get_engine
 
 # Test database setup
 @pytest.fixture(scope="function")
-def test_db():
-    """Create a test database using SQLite in-memory."""
-    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+def test_db(tmp_path):
+    """Create a test database using SQLite in a temp file."""
+    # Use file-based SQLite to avoid in-memory connection issues
+    db_path = tmp_path / "test.db"
+    db_url = f"sqlite:///{db_path}"
+    engine = create_engine(db_url, connect_args={"check_same_thread": False})
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
     # Create tables
@@ -63,6 +66,10 @@ def client(test_db):
     # Also override the get_engine function to ensure it uses test DB
     import server.api as api_module
     original_get_engine = api_module.get_engine
+    original_engine = api_module._engine
+    
+    # Reset the global engine and override the function
+    api_module._engine = test_db.get_bind()
     api_module.get_engine = override_get_engine
     
     with TestClient(app) as test_client:
@@ -71,6 +78,7 @@ def client(test_db):
     # Restore original
     app.dependency_overrides.clear()
     api_module.get_engine = original_get_engine
+    api_module._engine = original_engine
 
 
 @pytest.fixture
@@ -303,14 +311,15 @@ def test_websocket_connection(client, sample_session):
         assert data["type"] == "connected"
         assert data["session_id"] == sample_session.session_id
         assert "timestamp" in data
+        assert "Subscribing to audit updates" in data["message"]
 
-        # Send a test message
-        websocket.send_text("test message")
+        # Send a ping message
+        websocket.send_text("ping")
 
-        # Should receive echo (placeholder implementation)
+        # Should receive pong (or keepalive if Redis not available)
         response = websocket.receive_json()
-        assert response["type"] == "echo"
-        assert response["data"] == "test message"
+        assert response["type"] in ("pong", "keepalive")
+        assert "timestamp" in response
 
 
 @pytest.mark.parametrize(
@@ -347,3 +356,134 @@ def test_projects_with_stats(client, sample_project, sample_graph, sample_sessio
     assert project["sessions_count"] == 1
     assert project["hypotheses_count"] == 1
     assert project["confirmed_count"] == 1
+
+
+# ============================================================================
+# Tests for new SaaS endpoints
+# ============================================================================
+
+def test_audit_start_endpoint_validation(client, sample_tenant):
+    """Test that /audits/start requires repo_url."""
+    # Missing repo_url should fail validation
+    response = client.post("/audits/start", json={})
+    assert response.status_code == 422  # Validation error
+
+
+def test_audit_start_worker_import(client, sample_tenant, monkeypatch):
+    """Test /audits/start handles worker import gracefully."""
+    # Mock the Celery task to avoid actual execution
+    from unittest.mock import MagicMock, patch
+    
+    mock_task = MagicMock()
+    mock_task.id = "mock_task_id_12345"
+    
+    with patch("worker.tasks.execute_audit_task") as mock_execute:
+        mock_execute.delay.return_value = mock_task
+        
+        response = client.post(
+            "/audits/start",
+            json={
+                "repo_url": "https://github.com/test/repo",
+                "tenant_id": sample_tenant.id,
+            },
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert "session_id" in data
+        assert data["status"] == "queued"
+        assert "websocket_url" in data
+        assert "mock_task_id" in data["message"]
+        
+        # Verify the task was called with correct args
+        mock_execute.delay.assert_called_once()
+        call_kwargs = mock_execute.delay.call_args.kwargs
+        assert call_kwargs["repo_url"] == "https://github.com/test/repo"
+        assert call_kwargs["tenant_id"] == sample_tenant.id
+
+
+def test_audit_status_not_found(client, sample_tenant):
+    """Test audit status for non-existent session."""
+    response = client.get("/audits/nonexistent_session/status")
+    assert response.status_code == 404
+
+
+def test_audit_status_found(client, sample_session):
+    """Test audit status for existing session."""
+    response = client.get(f"/audits/{sample_session.session_id}/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["session_id"] == sample_session.session_id
+    assert data["status"] == sample_session.status
+
+
+def test_github_webhook_invalid_json(client):
+    """Test GitHub webhook with invalid JSON."""
+    response = client.post(
+        "/webhooks/github",
+        content=b"not json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+
+
+def test_github_webhook_installation_event(client):
+    """Test GitHub webhook handles installation events."""
+    payload = {
+        "action": "created",
+        "installation": {"id": 12345},
+    }
+    response = client.post(
+        "/webhooks/github",
+        json=payload,
+        headers={
+            "X-GitHub-Event": "installation",
+            "X-Hub-Signature-256": "",  # No signature verification in dev mode
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["event"] == "installation"
+    assert data["action"] == "created"
+
+
+def test_github_webhook_pr_event_skipped(client):
+    """Test GitHub webhook skips non-actionable PR events."""
+    payload = {
+        "action": "closed",  # Not opened/synchronize
+        "pull_request": {"number": 42},
+        "repository": {"full_name": "test/repo"},
+        "installation": {"id": 12345},
+    }
+    response = client.post(
+        "/webhooks/github",
+        json=payload,
+        headers={
+            "X-GitHub-Event": "pull_request",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["skipped"] is True
+
+
+def test_github_webhook_push_event(client):
+    """Test GitHub webhook handles push events."""
+    payload = {
+        "ref": "refs/heads/feature-branch",  # Not default branch
+        "repository": {
+            "full_name": "test/repo",
+            "default_branch": "main",
+        },
+    }
+    response = client.post(
+        "/webhooks/github",
+        json=payload,
+        headers={
+            "X-GitHub-Event": "push",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["skipped"] is True
+    assert "Not default branch" in data.get("reason", "")

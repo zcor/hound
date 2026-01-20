@@ -35,14 +35,14 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import redis.asyncio as aioredis
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
 from commands.project import ProjectManager
@@ -3014,6 +3014,1427 @@ async def update_finding_status_by_hyp_id(
         "confidence": finding.confidence,
         "updated_at": finding.updated_at.isoformat(),
     }
+
+
+# ============================================================================
+# QA Finalization Endpoint - LLM-based hypothesis review
+# ============================================================================
+
+class QAFinalizeRequest(BaseModel):
+    """Request model for QA finalization."""
+    threshold: float = Field(default=0.5, description="Confidence threshold (0.0-1.0)")
+    include_below_threshold: bool = Field(default=False, description="Include pending hypotheses below threshold")
+    max_hypotheses: int = Field(default=10, description="Maximum hypotheses to review in one call")
+
+
+class QAReviewResult(BaseModel):
+    """Result of reviewing a single hypothesis."""
+    hypothesis_id: str
+    title: str
+    original_confidence: float
+    verdict: str  # confirmed, rejected, uncertain
+    reasoning: str
+    new_confidence: float
+
+
+class QAFinalizeResponse(BaseModel):
+    """Response from QA finalization."""
+    session_id: str
+    total_reviewed: int
+    confirmed: int
+    rejected: int
+    uncertain: int
+    results: List[QAReviewResult]
+
+
+@app.post("/sessions/{session_id}/finalize", response_model=QAFinalizeResponse)
+async def finalize_session_hypotheses(
+    session_id: str,
+    request: QAFinalizeRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Run QA finalization on hypotheses from a session.
+    
+    Uses an LLM to review hypotheses above the confidence threshold
+    and confirm/reject them based on source code analysis.
+    """
+    # Get the session
+    session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Get the project
+    project = db.query(Project).filter(Project.id == session.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Get hypotheses for this project
+    query = db.query(Hypothesis).filter(
+        Hypothesis.project_id == session.project_id,
+        Hypothesis.status.notin_(["confirmed", "rejected"])  # Only pending
+    )
+    
+    if not request.include_below_threshold:
+        query = query.filter(Hypothesis.confidence >= request.threshold)
+    
+    hypotheses = query.order_by(Hypothesis.confidence.desc()).limit(request.max_hypotheses).all()
+    
+    if not hypotheses:
+        return QAFinalizeResponse(
+            session_id=session_id,
+            total_reviewed=0,
+            confirmed=0,
+            rejected=0,
+            uncertain=0,
+            results=[]
+        )
+    
+    # Load config for LLM
+    config_path = Path(__file__).parent.parent / "config.yaml"
+    config = {}
+    if config_path.exists():
+        import yaml
+        with open(config_path) as f:
+            config = yaml.safe_load(f) or {}
+    
+    # Initialize LLM for finalization - handle missing API keys
+    try:
+        from llm.unified_client import UnifiedLLMClient
+        llm = UnifiedLLMClient(cfg=config, profile="finalize")
+    except ValueError as e:
+        if "API key not found" in str(e):
+            raise HTTPException(
+                status_code=503,
+                detail=f"LLM not configured: {str(e)}. Set the required API key environment variable."
+            )
+        raise
+    
+    # Get repo path for source code access - check multiple sources
+    repo_root = None
+    
+    # Try 1: project.source_path
+    if project.source_path:
+        candidate = Path(project.source_path)
+        if candidate.exists():
+            repo_root = candidate
+    
+    # Try 2: Look for cloned repo in /tmp based on git_url
+    if not repo_root and project.git_url:
+        # Extract repo name from URL
+        repo_name = project.git_url.rstrip('/').split('/')[-1].replace('.git', '')
+        for tmp_dir in [Path('/tmp'), Path('/workspaces')]:
+            candidate = tmp_dir / repo_name
+            if candidate.exists() and (candidate / '.git').exists():
+                repo_root = candidate
+                break
+            # Also check with owner prefix
+            if '/' in project.git_url:
+                parts = project.git_url.rstrip('/').split('/')
+                if len(parts) >= 2:
+                    owner_repo = f"{parts[-2]}_{parts[-1].replace('.git', '')}"
+                    candidate = tmp_dir / owner_repo
+                    if candidate.exists():
+                        repo_root = candidate
+                        break
+    
+    # Try 3: Check audit session for repo path in metadata
+    if not repo_root:
+        # The audit task clones to /tmp/{repo_name}
+        if project.git_url:
+            repo_name = project.git_url.rstrip('/').split('/')[-1].replace('.git', '')
+            candidate = Path(f'/tmp/{repo_name}')
+            if candidate.exists():
+                repo_root = candidate
+    
+    # Try 4: Clone the repo if we have a git_url but no local copy
+    temp_clone_dir = None
+    if not repo_root and project.git_url:
+        import subprocess
+        import tempfile
+        try:
+            temp_clone_dir = tempfile.mkdtemp(prefix="hound_qa_")
+            repo_path = Path(temp_clone_dir) / "repo"
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", project.git_url, str(repo_path)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0 and repo_path.exists():
+                repo_root = repo_path
+        except Exception:
+            pass  # Continue without source code if clone fails
+    
+    # Review each hypothesis
+    results = []
+    confirmed_count = 0
+    rejected_count = 0
+    uncertain_count = 0
+    
+    for hypothesis in hypotheses:
+        try:
+            # Load source code - use guess_relpaths like CLI does
+            source_code = {}
+            source_files = []
+            
+            # Get source files from node_refs
+            if hypothesis.node_refs:
+                for node_ref in hypothesis.node_refs:
+                    if isinstance(node_ref, str):
+                        source_files.append(node_ref)
+            
+            # Use guess_relpaths to find file paths from hypothesis text
+            if repo_root:
+                try:
+                    from analysis.path_utils import guess_relpaths
+                    extra_texts = [
+                        hypothesis.title or '',
+                        hypothesis.description or '',
+                    ]
+                    # Add evidence items
+                    evidence = hypothesis.evidence or {}
+                    for item in evidence.get('items', []):
+                        if isinstance(item, str):
+                            extra_texts.append(item)
+                        elif isinstance(item, dict):
+                            extra_texts.append(item.get('description', ''))
+                    
+                    guessed = guess_relpaths(
+                        "\n".join([t for t in extra_texts if t]), 
+                        repo_root
+                    )
+                    for rel in guessed:
+                        if rel not in source_files:
+                            source_files.append(rel)
+                except Exception:
+                    pass
+            
+            # Load actual source code files
+            if source_files and repo_root:
+                for file_path in source_files[:10]:  # Limit to 10 files
+                    try:
+                        full_path = repo_root / file_path
+                        if full_path.exists() and full_path.is_file():
+                            with open(full_path) as f:
+                                content = f.read()
+                                # Limit file size to avoid huge prompts
+                                if len(content) < 50000:
+                                    source_code[file_path] = content
+                    except Exception:
+                        pass
+            
+            # Build review prompt
+            review_prompt = f"""You are a security expert performing final review of a vulnerability hypothesis.
+
+=== HYPOTHESIS UNDER REVIEW ===
+Title: {hypothesis.title}
+Type: {hypothesis.vulnerability_type}
+Severity: {hypothesis.severity}
+Confidence: {hypothesis.confidence:.0%}
+Description: {hypothesis.description}
+
+=== SOURCE CODE ===
+"""
+            if source_code:
+                for file_path, code in source_code.items():
+                    review_prompt += f"\n--- File: {file_path} ---\n{code}\n"
+            else:
+                # Include evidence if no source code
+                evidence = hypothesis.evidence or {}
+                if evidence.get("items"):
+                    review_prompt += "\n--- Evidence ---\n"
+                    for item in evidence["items"][:5]:
+                        review_prompt += f"• {item}\n"
+                else:
+                    review_prompt += "No source code or evidence available.\n"
+            
+            review_prompt += """
+=== YOUR TASK ===
+Review the available information to determine if this hypothesis represents a REAL vulnerability.
+
+Provide your determination in this EXACT JSON format:
+{
+    "verdict": "confirmed" or "rejected" or "uncertain",
+    "reasoning": "A detailed one-paragraph explanation (50-150 words) explaining your verdict.",
+    "confidence": 0.0 to 1.0
+}
+
+Rules:
+- "confirmed" = Vulnerability clearly exists with exploitable path
+- "rejected" = This is a false positive or mitigated
+- "uncertain" = Need more context to determine
+
+Be conservative - only confirm if evidence clearly shows the vulnerability.
+"""
+            
+            # Get LLM verdict
+            try:
+                response_text = llm.raw(
+                    system="You are a security expert. Respond only with valid JSON.",
+                    user=review_prompt
+                )
+                from utils.json_utils import extract_json_object
+                response = extract_json_object(response_text)
+                
+                if isinstance(response, dict):
+                    verdict = response.get('verdict', 'uncertain')
+                    reasoning = response.get('reasoning', 'No reasoning provided')
+                    new_confidence = float(response.get('confidence', hypothesis.confidence))
+                else:
+                    verdict = 'uncertain'
+                    reasoning = 'Failed to parse LLM response'
+                    new_confidence = hypothesis.confidence
+            except Exception as e:
+                verdict = 'uncertain'
+                reasoning = f'LLM error: {str(e)}'
+                new_confidence = hypothesis.confidence
+            
+            # Update hypothesis in database
+            original_confidence = hypothesis.confidence
+            
+            if verdict == "confirmed":
+                hypothesis.status = "confirmed"
+                hypothesis.confidence = 1.0
+                confirmed_count += 1
+            elif verdict == "rejected":
+                hypothesis.status = "rejected"
+                hypothesis.confidence = 0.0
+                rejected_count += 1
+            else:
+                uncertain_count += 1
+                # Update confidence if LLM provided one
+                if new_confidence != hypothesis.confidence:
+                    hypothesis.confidence = new_confidence
+            
+            # Store reasoning in evidence
+            if hypothesis.evidence is None:
+                hypothesis.evidence = {}
+            # Create a new dict to ensure SQLAlchemy detects the change
+            new_evidence = dict(hypothesis.evidence)
+            new_evidence["qa_reasoning"] = reasoning
+            new_evidence["qa_verdict"] = verdict
+            hypothesis.evidence = new_evidence
+            hypothesis.updated_at = datetime.now(timezone.utc)
+            
+            # Mark the JSON field as modified for SQLAlchemy
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(hypothesis, "evidence")
+            
+            results.append(QAReviewResult(
+                hypothesis_id=hypothesis.hypothesis_id,
+                title=hypothesis.title,
+                original_confidence=original_confidence,
+                verdict=verdict,
+                reasoning=reasoning,
+                new_confidence=hypothesis.confidence
+            ))
+            
+        except Exception as e:
+            uncertain_count += 1
+            results.append(QAReviewResult(
+                hypothesis_id=hypothesis.hypothesis_id,
+                title=hypothesis.title,
+                original_confidence=hypothesis.confidence,
+                verdict="uncertain",
+                reasoning=f"Error during review: {str(e)}",
+                new_confidence=hypothesis.confidence
+            ))
+    
+    # Commit all changes
+    db.commit()
+    
+    # Cleanup temp clone directory if we created one
+    if temp_clone_dir:
+        import shutil
+        try:
+            shutil.rmtree(temp_clone_dir, ignore_errors=True)
+        except Exception:
+            pass
+    
+    return QAFinalizeResponse(
+        session_id=session_id,
+        total_reviewed=len(hypotheses),
+        confirmed=confirmed_count,
+        rejected=rejected_count,
+        uncertain=uncertain_count,
+        results=results
+    )
+
+
+# ============================================================================
+# PoC Generation Endpoint - Generate proof-of-concept prompts
+# ============================================================================
+
+class PoCGenerateRequest(BaseModel):
+    """Request model for PoC prompt generation."""
+    hypothesis_id: Optional[str] = Field(None, description="Specific hypothesis ID to generate PoC for")
+    max_hypotheses: int = Field(default=10, description="Maximum hypotheses to process")
+    min_confidence: float = Field(default=0.7, description="Minimum confidence threshold")
+
+
+class PoCPromptResult(BaseModel):
+    """Result of generating a PoC prompt for a hypothesis."""
+    hypothesis_id: str
+    title: str
+    vulnerability_type: str
+    severity: str
+    affected_files: List[str]
+    prompt: str
+    output_path: str
+
+
+class PoCGenerateResponse(BaseModel):
+    """Response from PoC generation."""
+    session_id: str
+    project_name: str
+    total_generated: int
+    results: List[PoCPromptResult]
+
+
+@app.post("/sessions/{session_id}/poc", response_model=PoCGenerateResponse)
+async def generate_poc_prompts(
+    session_id: str,
+    request: PoCGenerateRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Generate proof-of-concept prompts for hypotheses from a session.
+    
+    Uses an LLM strategist to generate detailed PoC prompts that can be
+    given to a coding agent to create actual exploit code.
+    """
+    # Get the session
+    session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Get the project
+    project = db.query(Project).filter(Project.id == session.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Get hypotheses for this project
+    query = db.query(Hypothesis).filter(
+        Hypothesis.project_id == session.project_id,
+    )
+    
+    # Filter by specific hypothesis or by confidence/status
+    if request.hypothesis_id:
+        query = query.filter(Hypothesis.hypothesis_id == request.hypothesis_id)
+    else:
+        query = query.filter(
+            (Hypothesis.status == "confirmed") | 
+            (Hypothesis.confidence >= request.min_confidence)
+        )
+    
+    hypotheses = query.order_by(Hypothesis.confidence.desc()).limit(request.max_hypotheses).all()
+    
+    if not hypotheses:
+        return PoCGenerateResponse(
+            session_id=session_id,
+            project_name=project.name,
+            total_generated=0,
+            results=[]
+        )
+    
+    # Load config for LLM
+    config_path = Path(__file__).parent.parent / "config.yaml"
+    config = {}
+    if config_path.exists():
+        import yaml
+        with open(config_path) as f:
+            config = yaml.safe_load(f) or {}
+    
+    # Initialize LLM for strategist - handle missing API keys
+    try:
+        from llm.unified_client import UnifiedLLMClient
+        llm = UnifiedLLMClient(cfg=config, profile="strategist")
+    except ValueError as e:
+        if "API key not found" in str(e):
+            raise HTTPException(
+                status_code=503,
+                detail=f"LLM not configured: {str(e)}. Set the required API key environment variable."
+            )
+        raise
+    
+    # Get repo path for source code access
+    repo_root = None
+    temp_clone_dir = None
+    
+    # Try to find or clone the repo
+    if project.source_path:
+        candidate = Path(project.source_path)
+        if candidate.exists():
+            repo_root = candidate
+    
+    if not repo_root and project.git_url:
+        # Extract repo name from URL
+        repo_name = project.git_url.rstrip('/').split('/')[-1].replace('.git', '')
+        
+        # Check common locations
+        for base in [Path('/tmp'), Path('/workspaces')]:
+            candidate = base / repo_name
+            if candidate.exists():
+                repo_root = candidate
+                break
+        
+        # Clone if not found
+        if not repo_root:
+            import subprocess
+            import tempfile
+            try:
+                temp_clone_dir = tempfile.mkdtemp(prefix="hound_poc_")
+                repo_path = Path(temp_clone_dir) / "repo"
+                result = subprocess.run(
+                    ["git", "clone", "--depth", "1", project.git_url, str(repo_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if result.returncode == 0 and repo_path.exists():
+                    repo_root = repo_path
+            except Exception:
+                pass
+    
+    # Import PoC generation utilities
+    from commands.poc import load_affected_files, generate_poc_with_strategist, PoCContext
+    
+    # Create output directory
+    output_dir = Path.home() / f".hound/poc_prompts/{project.name}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate prompts for each hypothesis
+    results = []
+    
+    for hypothesis in hypotheses:
+        try:
+            # Convert DB hypothesis to dict format expected by load_affected_files
+            hyp_dict = {
+                'title': hypothesis.title,
+                'description': hypothesis.description,
+                'vulnerability_type': hypothesis.vulnerability_type,
+                'severity': hypothesis.severity,
+                'confidence': hypothesis.confidence,
+                'node_refs': hypothesis.node_refs or [],
+                'evidence': hypothesis.evidence or {},
+                'annotations': [],
+                'locations': [],
+                'reasoning': hypothesis.description,  # Use description as reasoning
+            }
+            
+            # Convert node_refs to annotations format
+            if hypothesis.node_refs:
+                for ref in hypothesis.node_refs:
+                    if isinstance(ref, str) and ':' in ref:
+                        parts = ref.split(':')
+                        file_path = parts[0]
+                        line = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                        hyp_dict['annotations'].append({'file_path': file_path, 'line': line})
+                    elif isinstance(ref, str):
+                        hyp_dict['annotations'].append({'file_path': ref})
+            
+            # Load affected files
+            affected_files = load_affected_files(hyp_dict, {}, repo_root)
+            
+            # Create context
+            context = PoCContext(
+                project_name=project.name,
+                hypothesis=hyp_dict,
+                affected_files=affected_files,
+                manifest_data={},
+                repo_root=repo_root
+            )
+            
+            # Generate prompt using strategist
+            prompt = generate_poc_with_strategist(context, config)
+            
+            # Save prompt to file
+            output_file = output_dir / f"{hypothesis.hypothesis_id}_poc_prompt.md"
+            with open(output_file, 'w') as f:
+                f.write(f"# PoC Generation Prompt for {hypothesis.hypothesis_id}\n\n")
+                f.write(f"**Project:** {project.name}\n")
+                f.write(f"**Vulnerability:** {hypothesis.title}\n")
+                f.write(f"**Type:** {hypothesis.vulnerability_type}\n")
+                f.write(f"**Severity:** {hypothesis.severity}\n\n")
+                f.write("---\n\n")
+                f.write(prompt)
+            
+            results.append(PoCPromptResult(
+                hypothesis_id=hypothesis.hypothesis_id,
+                title=hypothesis.title,
+                vulnerability_type=hypothesis.vulnerability_type or "unknown",
+                severity=hypothesis.severity or "unknown",
+                affected_files=list(affected_files.keys()),
+                prompt=prompt,
+                output_path=str(output_file)
+            ))
+            
+        except Exception as e:
+            # Log error but continue with other hypotheses
+            logger.error(f"Error generating PoC for {hypothesis.hypothesis_id}: {e}")
+            results.append(PoCPromptResult(
+                hypothesis_id=hypothesis.hypothesis_id,
+                title=hypothesis.title,
+                vulnerability_type=hypothesis.vulnerability_type or "unknown",
+                severity=hypothesis.severity or "unknown",
+                affected_files=[],
+                prompt=f"Error generating PoC: {str(e)}",
+                output_path=""
+            ))
+    
+    # Cleanup temp clone directory if we created one
+    if temp_clone_dir:
+        import shutil
+        try:
+            shutil.rmtree(temp_clone_dir, ignore_errors=True)
+        except Exception:
+            pass
+    
+    return PoCGenerateResponse(
+        session_id=session_id,
+        project_name=project.name,
+        total_generated=len([r for r in results if r.output_path]),
+        results=results
+    )
+
+
+# ============================================================================
+# Report Generation Endpoint - Generate security audit reports
+# ============================================================================
+
+class ReportGenerateRequest(BaseModel):
+    """Request model for report generation."""
+    format: str = Field(default="html", description="Report format: html, markdown, or pdf")
+    title: Optional[str] = Field(None, description="Custom report title")
+    auditors: str = Field(default="Security Team", description="Comma-separated auditor names")
+    include_all: bool = Field(default=False, description="Include all hypotheses, not just confirmed")
+
+
+class ReportGenerateResponse(BaseModel):
+    """Response from report generation."""
+    session_id: str
+    project_name: str
+    format: str
+    total_findings: int
+    output_path: str
+    report_url: Optional[str] = None
+
+
+@app.post("/sessions/{session_id}/report", response_model=ReportGenerateResponse)
+async def generate_report(
+    session_id: str,
+    request: ReportGenerateRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Generate a security audit report for a session's findings.
+    
+    Creates a professional HTML or Markdown report with:
+    - Executive summary
+    - Vulnerability findings with severity ratings
+    - Code snippets and remediation advice
+    - Testing methodology
+    """
+    import re
+    import tempfile
+    import subprocess
+    from datetime import datetime
+    
+    # Get the session
+    session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Get the project
+    project = db.query(Project).filter(Project.id == session.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Determine repo root
+    repo_root = None
+    temp_clone_dir = None
+    
+    if project.source_path:
+        candidate = Path(project.source_path)
+        if candidate.exists():
+            repo_root = candidate
+    
+    if not repo_root and project.git_url:
+        repo_name = project.git_url.rstrip('/').split('/')[-1].replace('.git', '')
+        for base in [Path('/tmp'), Path('/workspaces')]:
+            candidate = base / repo_name
+            if candidate.exists():
+                repo_root = candidate
+                break
+        
+        if not repo_root:
+            try:
+                temp_clone_dir = tempfile.mkdtemp(prefix="hound_report_clone_")
+                repo_path = Path(temp_clone_dir) / "repo"
+                result = subprocess.run(
+                    ["git", "clone", "--depth", "1", project.git_url, str(repo_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if result.returncode == 0 and repo_path.exists():
+                    repo_root = repo_path
+            except Exception:
+                pass
+    
+    # Helper function to extract file paths from hypothesis text
+    def _extract_source_files(title: str, description: str) -> list[str]:
+        if not repo_root:
+            return []
+        
+        source_files = []
+        combined = f"{title} {description}".lower()
+        
+        identifiers = set(re.findall(
+            r'\b([A-Za-z][a-zA-Z0-9]*(?:[A-Z][a-zA-Z0-9]*)+)\b', 
+            f"{title} {description}"
+        ))
+        
+        keywords = set()
+        for word in re.findall(r'\b([a-zA-Z]{4,20})\b', combined):
+            if word not in {'this', 'that', 'with', 'from', 'allows', 'which', 'could', 
+                          'would', 'should', 'using', 'funds', 'tokens', 'called', 'function',
+                          'contract', 'address', 'operator', 'manager', 'admin', 'oracle'}:
+                keywords.add(word)
+        
+        contracts_dir = repo_root / 'contracts'
+        if contracts_dir.exists():
+            for sol_file in contracts_dir.glob('**/*.sol'):
+                file_lower = sol_file.stem.lower()
+                for kw in keywords | {i.lower() for i in identifiers}:
+                    if kw in file_lower or file_lower in kw:
+                        rel_path = str(sol_file.relative_to(repo_root))
+                        if rel_path not in source_files:
+                            source_files.append(rel_path)
+                        break
+        
+        return source_files
+    
+    # Get hypotheses
+    query = db.query(Hypothesis).filter(Hypothesis.project_id == session.project_id)
+    
+    if not request.include_all:
+        query = query.filter(
+            (Hypothesis.status == "confirmed") | 
+            (Hypothesis.confidence >= 0.7)
+        )
+    
+    hypotheses = query.order_by(Hypothesis.confidence.desc()).all()
+    
+    # Create temporary project directory for ReportGenerator
+    temp_project_dir = Path(tempfile.mkdtemp(prefix="hound_report_"))
+    
+    try:
+        # Create graphs directory
+        graphs_dir = temp_project_dir / "graphs"
+        graphs_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create knowledge_graphs.json with repo root
+        import json
+        kg_data = {
+            "manifest": {"repo_path": str(repo_root) if repo_root else None},
+            "card_store_path": None
+        }
+        with open(graphs_dir / "knowledge_graphs.json", "w") as f:
+            json.dump(kg_data, f)
+        
+        # Create minimal graph file
+        with open(graphs_dir / "graph_analysis.json", "w") as f:
+            json.dump({"nodes": [], "edges": []}, f)
+        
+        # Build hypotheses dict with source files
+        hyp_dict = {}
+        for h in hypotheses:
+            source_files = _extract_source_files(h.title, h.description)
+            effective_node_refs = h.node_refs or []
+            if not effective_node_refs and source_files:
+                effective_node_refs = source_files
+            
+            hyp_dict[h.hypothesis_id] = {
+                'title': h.title,
+                'description': h.description,
+                'vulnerability_type': h.vulnerability_type,
+                'status': h.status,
+                'confidence': h.confidence,
+                'severity': h.severity,
+                'node_refs': effective_node_refs,
+                'evidence': h.evidence or {},
+                'annotations': [],
+                'reasoning': h.description,
+                'properties': {'source_files': source_files}
+            }
+            
+            for ref in effective_node_refs:
+                if isinstance(ref, str) and ':' in ref:
+                    parts = ref.split(':')
+                    hyp_dict[h.hypothesis_id]['annotations'].append({
+                        'file_path': parts[0],
+                        'line': int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                    })
+                elif isinstance(ref, str):
+                    hyp_dict[h.hypothesis_id]['annotations'].append({'file_path': ref})
+        
+        # Create hypotheses.json
+        hyp_data = {
+            "hypotheses": hyp_dict,
+            "metadata": {"source": "database", "project_name": project.name}
+        }
+        with open(temp_project_dir / "hypotheses.json", "w") as f:
+            json.dump(hyp_data, f)
+        
+        # Create reports directory
+        (temp_project_dir / "reports").mkdir(exist_ok=True)
+        
+        # Load config for LLM
+        config_path = Path(__file__).parent.parent / "config.yaml"
+        config = {}
+        if config_path.exists():
+            import yaml
+            with open(config_path) as f:
+                config = yaml.safe_load(f) or {}
+        
+        # Initialize report generator
+        from analysis.report_generator import ReportGenerator
+        
+        generator = ReportGenerator(
+            project_dir=temp_project_dir,
+            config=config,
+            debug=False,
+            include_all=request.include_all
+        )
+        
+        # Generate report
+        report_data = generator.generate(
+            project_name=project.name,
+            project_source=str(repo_root) if repo_root else None,
+            title=request.title or f"Security Audit: {project.name}",
+            auditors=request.auditors.split(','),
+            format=request.format,
+            progress_callback=None
+        )
+        
+        # Save report to user's home directory
+        user_reports_dir = Path.home() / f".hound/reports/{project.name}"
+        user_reports_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext = "html" if request.format == "pdf" else request.format
+        output_path = user_reports_dir / f"audit_report_{timestamp}.{ext}"
+        
+        with open(output_path, 'w') as f:
+            f.write(report_data)
+        
+        # Count confirmed findings
+        confirmed_count = len([h for h in hypotheses if h.status == "confirmed"])
+        
+        return ReportGenerateResponse(
+            session_id=session_id,
+            project_name=project.name,
+            format=request.format,
+            total_findings=confirmed_count if not request.include_all else len(hypotheses),
+            output_path=str(output_path),
+            report_url=None  # Could be a served URL if we add static file serving
+        )
+        
+    finally:
+        # Cleanup temp directories
+        import shutil
+        try:
+            shutil.rmtree(temp_project_dir, ignore_errors=True)
+        except Exception:
+            pass
+        
+        if temp_clone_dir:
+            try:
+                shutil.rmtree(temp_clone_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+# ============================================================================
+# Surface Scan Endpoints - Lightweight security analysis for lead generation
+# ============================================================================
+
+class SurfaceScanRequest(BaseModel):
+    """Request model for surface scan."""
+    target: str = Field(default=None, description="GitHub URL or repository path to scan")
+    repo_url: str = Field(default=None, description="Alias for target - GitHub URL to scan")
+    llm_budget: int = Field(default=5, description="Maximum LLM calls per scan (0 to disable)")
+    model: Optional[str] = Field(default=None, description="Override LLM model")
+    
+    @model_validator(mode='after')
+    def validate_target_or_repo_url(self):
+        """Ensure either target or repo_url is provided."""
+        if not self.target and not self.repo_url:
+            raise ValueError("Either 'target' or 'repo_url' must be provided")
+        # Use repo_url if target not provided
+        if not self.target and self.repo_url:
+            self.target = self.repo_url
+        return self
+
+
+class SurfaceFinding(BaseModel):
+    """A vulnerability or quality finding from surface scan."""
+    pattern_id: str
+    title: str
+    severity: str
+    category: str
+    confidence: float
+    location: str
+    code_snippet: str
+    description: str
+    llm_verified: bool = False
+    llm_notes: Optional[str] = None
+
+
+class SurfaceQualityMetrics(BaseModel):
+    """Code quality metrics from surface scan."""
+    solidity_version: Optional[str] = None
+    vyper_version: Optional[str] = None
+    has_tests: bool = False
+    test_count: int = 0
+    has_natspec: bool = False
+    contract_count: int = 0
+    total_loc: int = 0
+    has_events: bool = False
+    uses_safemath: bool = False
+    has_access_control: bool = False
+
+
+class SurfaceScanResponse(BaseModel):
+    """Response from surface scan."""
+    execution_id: str
+    repo_url: Optional[str] = None
+    repo_name: str
+    risk_score: int
+    risk_level: str
+    findings: List[SurfaceFinding]
+    quality_metrics: SurfaceQualityMetrics
+    contracts_scanned: int
+    llm_calls_used: int
+    scan_duration_seconds: float
+    summary: str
+    error: Optional[str] = None
+
+
+class SurfaceScanListItem(BaseModel):
+    """Summary item for scan listing."""
+    execution_id: str
+    repo_name: str
+    repo_url: Optional[str] = None
+    risk_score: int
+    risk_level: str
+    finding_count: int
+    contracts_scanned: int
+    status: str
+    created_at: datetime
+    summary: Optional[str] = None
+
+
+class SurfaceScanListResponse(BaseModel):
+    """Response for listing surface scans."""
+    scans: List[SurfaceScanListItem]
+    total: int
+    page: int
+    page_size: int
+
+
+@app.post("/surface/scan", response_model=SurfaceScanResponse)
+async def run_surface_scan(
+    request: SurfaceScanRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Run a lightweight surface scan on a repository.
+    
+    This is designed for lead generation - quickly identifying potential
+    security issues that warrant a full audit. Results are saved to the
+    database for the admin panel.
+    
+    Cost: ~$0.05 per scan with LLM verification
+    Time: ~2-10 seconds depending on repo size
+    """
+    from analysis.surface import SurfaceScanner
+    from utils.config_loader import load_config
+    
+    # Load config
+    try:
+        config = load_config()
+    except Exception:
+        config = {}
+    
+    # Initialize scanner
+    scanner = SurfaceScanner(
+        config=config,
+        llm_budget=request.llm_budget,
+        model=request.model,
+        quiet=True,
+    )
+    
+    # Run scan
+    result = scanner.scan(request.target)
+    
+    # Generate unique execution ID
+    execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
+    
+    # Save to database
+    try:
+        # Get or create default tenant
+        tenant = db.query(Tenant).first()
+        if not tenant:
+            tenant = Tenant(name="Default", slug="default")
+            db.add(tenant)
+            db.commit()
+            db.refresh(tenant)
+        
+        scan_exec = ScanExecution(
+            execution_id=execution_id,
+            tenant_id=tenant.id,
+            repo_url=result.repo_url,
+            repo_name=result.repo_name,
+            status="completed" if not result.error else "failed",
+            risk_score=result.risk_score,
+            risk_level=result.risk_level,
+            findings=[f.model_dump() for f in result.findings],
+            quality_metrics=result.quality_metrics.model_dump(),
+            summary=result.summary,
+            scan_config={
+                "llm_budget": request.llm_budget,
+                "model": request.model,
+            },
+            llm_calls_made=result.llm_calls_used,
+            contracts_scanned=result.contracts_scanned,
+            contracts_total=result.contracts_total,
+            error_message=result.error,
+            started_at=result.scan_timestamp,
+            completed_at=datetime.now(),
+        )
+        
+        db.add(scan_exec)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to save scan to database: {e}")
+    
+    # Build response
+    return SurfaceScanResponse(
+        execution_id=execution_id,
+        repo_url=result.repo_url,
+        repo_name=result.repo_name,
+        risk_score=result.risk_score,
+        risk_level=result.risk_level,
+        findings=[
+            SurfaceFinding(
+                pattern_id=f.pattern_id,
+                title=f.title,
+                severity=f.severity,
+                category=f.category,
+                confidence=f.confidence,
+                location=f.location,
+                code_snippet=f.code_snippet,
+                description=f.description,
+                llm_verified=f.llm_verified,
+                llm_notes=f.llm_notes,
+            )
+            for f in result.findings
+        ],
+        quality_metrics=SurfaceQualityMetrics(
+            solidity_version=result.quality_metrics.solidity_version,
+            vyper_version=result.quality_metrics.vyper_version,
+            has_tests=result.quality_metrics.has_tests,
+            test_count=result.quality_metrics.test_count,
+            has_natspec=result.quality_metrics.has_natspec,
+            contract_count=result.quality_metrics.contract_count,
+            total_loc=result.quality_metrics.total_loc,
+            has_events=result.quality_metrics.has_events,
+            uses_safemath=result.quality_metrics.uses_safemath,
+            has_access_control=result.quality_metrics.has_access_control,
+        ),
+        contracts_scanned=result.contracts_scanned,
+        llm_calls_used=result.llm_calls_used,
+        scan_duration_seconds=result.scan_duration_seconds,
+        summary=result.summary,
+        error=result.error,
+    )
+
+
+@app.get("/surface/scans", response_model=SurfaceScanListResponse)
+async def list_surface_scans(
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    risk_level: Optional[str] = Query(None, description="Filter by risk level"),
+    status: Optional[str] = Query(None, description="Filter by status"),
+    search: Optional[str] = Query(None, description="Search repo name"),
+    db: Session = Depends(get_db)
+):
+    """
+    List all surface scans for the admin panel.
+    
+    Supports pagination and filtering by risk level, status, and repo name.
+    """
+    query = db.query(ScanExecution)
+    
+    # Apply filters
+    if risk_level:
+        query = query.filter(ScanExecution.risk_level == risk_level)
+    if status:
+        query = query.filter(ScanExecution.status == status)
+    if search:
+        query = query.filter(ScanExecution.repo_name.ilike(f"%{search}%"))
+    
+    # Get total count
+    total = query.count()
+    
+    # Apply pagination
+    offset = (page - 1) * page_size
+    scans = query.order_by(ScanExecution.created_at.desc()).offset(offset).limit(page_size).all()
+    
+    # Build response
+    return SurfaceScanListResponse(
+        scans=[
+            SurfaceScanListItem(
+                execution_id=s.execution_id,
+                repo_name=s.repo_name,
+                repo_url=s.repo_url,
+                risk_score=s.risk_score or 0,
+                risk_level=s.risk_level or "unknown",
+                finding_count=len(s.findings) if s.findings else 0,
+                contracts_scanned=s.contracts_scanned,
+                status=s.status,
+                created_at=s.created_at,
+                summary=s.summary[:200] if s.summary else None,
+            )
+            for s in scans
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/surface/scans/{execution_id}", response_model=SurfaceScanResponse)
+async def get_surface_scan(
+    execution_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Get details of a specific surface scan.
+    
+    Returns full scan results including all findings and quality metrics.
+    """
+    scan = db.query(ScanExecution).filter(ScanExecution.execution_id == execution_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    
+    # Parse findings from JSON
+    findings = []
+    if scan.findings:
+        for f in scan.findings:
+            findings.append(SurfaceFinding(
+                pattern_id=f.get("pattern_id", ""),
+                title=f.get("title", ""),
+                severity=f.get("severity", "medium"),
+                category=f.get("category", "vulnerability"),
+                confidence=f.get("confidence", 0.5),
+                location=f.get("location", ""),
+                code_snippet=f.get("code_snippet", ""),
+                description=f.get("description", ""),
+                llm_verified=f.get("llm_verified", False),
+                llm_notes=f.get("llm_notes"),
+            ))
+    
+    # Parse quality metrics
+    qm = scan.quality_metrics or {}
+    quality_metrics = SurfaceQualityMetrics(
+        solidity_version=qm.get("solidity_version"),
+        vyper_version=qm.get("vyper_version"),
+        has_tests=qm.get("has_tests", False),
+        test_count=qm.get("test_count", 0),
+        has_natspec=qm.get("has_natspec", False),
+        contract_count=qm.get("contract_count", 0),
+        total_loc=qm.get("total_loc", 0),
+        has_events=qm.get("has_events", False),
+        uses_safemath=qm.get("uses_safemath", False),
+        has_access_control=qm.get("has_access_control", False),
+    )
+    
+    # Calculate scan duration
+    duration = 0.0
+    if scan.started_at and scan.completed_at:
+        duration = (scan.completed_at - scan.started_at).total_seconds()
+    
+    return SurfaceScanResponse(
+        execution_id=scan.execution_id,
+        repo_url=scan.repo_url,
+        repo_name=scan.repo_name,
+        risk_score=scan.risk_score or 0,
+        risk_level=scan.risk_level or "unknown",
+        findings=findings,
+        quality_metrics=quality_metrics,
+        contracts_scanned=scan.contracts_scanned,
+        llm_calls_used=scan.llm_calls_made,
+        scan_duration_seconds=duration,
+        summary=scan.summary or "",
+        error=scan.error_message,
+    )
+
+
+@app.delete("/surface/scans/{execution_id}")
+async def delete_surface_scan(
+    execution_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Delete a surface scan from the database.
+    """
+    scan = db.query(ScanExecution).filter(ScanExecution.execution_id == execution_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    
+    db.delete(scan)
+    db.commit()
+    
+    return {"status": "deleted", "execution_id": execution_id}
+
+
+@app.get("/surface/stats")
+async def get_surface_scan_stats(
+    db: Session = Depends(get_db)
+):
+    """
+    Get statistics for surface scans - useful for admin dashboard.
+    
+    Returns counts by risk level, status, and recent activity.
+    """
+    from sqlalchemy import func
+    
+    # Count by risk level
+    risk_counts = db.query(
+        ScanExecution.risk_level,
+        func.count(ScanExecution.id)
+    ).group_by(ScanExecution.risk_level).all()
+    
+    # Count by status
+    status_counts = db.query(
+        ScanExecution.status,
+        func.count(ScanExecution.id)
+    ).group_by(ScanExecution.status).all()
+    
+    # Total scans
+    total = db.query(func.count(ScanExecution.id)).scalar()
+    
+    # Recent scans (last 7 days)
+    week_ago = datetime.now() - timedelta(days=7)
+    recent_count = db.query(func.count(ScanExecution.id)).filter(
+        ScanExecution.created_at >= week_ago
+    ).scalar()
+    
+    # Average risk score
+    avg_risk = db.query(func.avg(ScanExecution.risk_score)).filter(
+        ScanExecution.risk_score.isnot(None)
+    ).scalar()
+    
+    return {
+        "total_scans": total or 0,
+        "recent_scans_7d": recent_count or 0,
+        "average_risk_score": round(avg_risk or 0, 1),
+        "by_risk_level": {r[0]: r[1] for r in risk_counts if r[0]},
+        "by_status": {s[0]: s[1] for s in status_counts if s[0]},
+    }
+
+
+@app.get("/admin/scan-findings/{scan_id}", response_class=HTMLResponse)
+def view_scan_findings(scan_id: int, db: Session = Depends(get_db)):
+    """
+    View scan findings in a detailed HTML page.
+    
+    This is linked from the admin panel to show full finding details.
+    """
+    scan = db.query(ScanExecution).filter(ScanExecution.id == scan_id).first()
+    if not scan:
+        return HTMLResponse(content="<h1>Scan not found</h1>", status_code=404)
+    
+    # Build HTML for findings
+    findings_html = ""
+    for i, finding in enumerate(scan.findings or [], 1):
+        severity = finding.get("severity", "info")
+        severity_color = {
+            "critical": "#dc3545",
+            "high": "#fd7e14",
+            "medium": "#ffc107", 
+            "low": "#17a2b8",
+            "info": "#6c757d",
+        }.get(severity, "#6c757d")
+        
+        findings_html += f"""
+        <div style="border: 1px solid #ddd; border-left: 4px solid {severity_color}; 
+                    border-radius: 4px; padding: 16px; margin: 12px 0;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3 style="margin: 0; color: #333;">{i}. {finding.get('title', 'Untitled')}</h3>
+                <span style="background: {severity_color}; color: white; padding: 4px 12px; 
+                            border-radius: 4px; font-weight: bold; text-transform: uppercase;">
+                    {severity}
+                </span>
+            </div>
+            <p style="margin: 12px 0; color: #666;">{finding.get('description', '')}</p>
+            <div style="background: #f8f9fa; padding: 12px; border-radius: 4px; margin: 8px 0;">
+                <strong>Location:</strong> <code>{finding.get('location', 'N/A')}</code>
+            </div>
+            <div style="margin-top: 8px;">
+                <strong>Impact:</strong> {finding.get('impact', 'N/A')}
+            </div>
+            <div style="margin-top: 8px;">
+                <strong>Category:</strong> {finding.get('category', 'general')}
+            </div>
+            <div style="margin-top: 8px;">
+                <strong>Confidence:</strong> {finding.get('confidence', 0) * 100:.0f}%
+            </div>
+        </div>
+        """
+    
+    if not findings_html:
+        findings_html = "<p style='color: #666; font-style: italic;'>No findings recorded for this scan.</p>"
+    
+    # Quality metrics
+    qm = scan.quality_metrics or {}
+    quality_html = ""
+    if qm:
+        quality_html = f"""
+        <div style="background: #e9ecef; padding: 16px; border-radius: 8px; margin: 20px 0;">
+            <h3 style="margin: 0 0 12px 0;">Quality Metrics</h3>
+            <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px;">
+                <div><strong>Contracts Analyzed:</strong> {qm.get('contracts_analyzed', 0)}</div>
+                <div><strong>Functions Analyzed:</strong> {qm.get('functions_analyzed', 0)}</div>
+                <div><strong>Total Lines:</strong> {qm.get('total_lines', 0)}</div>
+                <div><strong>Has Tests:</strong> {'✅' if qm.get('has_tests') else '❌'}</div>
+                <div><strong>Has Docs:</strong> {'✅' if qm.get('has_documentation') else '❌'}</div>
+                <div><strong>Language:</strong> {qm.get('primary_language', 'Unknown')}</div>
+            </div>
+        </div>
+        """
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Scan Findings - {scan.repo_name}</title>
+        <style>
+            body {{ 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                max-width: 1200px; 
+                margin: 0 auto; 
+                padding: 20px;
+                background: #f5f5f5;
+            }}
+            .header {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 30px;
+                border-radius: 12px;
+                margin-bottom: 20px;
+            }}
+            .back-link {{
+                color: white;
+                text-decoration: none;
+                opacity: 0.8;
+            }}
+            .back-link:hover {{ opacity: 1; }}
+            .card {{
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                margin-bottom: 20px;
+            }}
+            .stats {{
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+                gap: 16px;
+                margin: 20px 0;
+            }}
+            .stat-box {{
+                background: white;
+                padding: 20px;
+                border-radius: 8px;
+                text-align: center;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            .stat-value {{ font-size: 32px; font-weight: bold; color: #333; }}
+            .stat-label {{ color: #666; margin-top: 4px; }}
+            code {{ background: #e9ecef; padding: 2px 6px; border-radius: 3px; }}
+            .action-btn {{
+                display: inline-block;
+                padding: 10px 20px;
+                background: #667eea;
+                color: white;
+                text-decoration: none;
+                border-radius: 6px;
+                margin: 4px;
+            }}
+            .action-btn:hover {{ background: #5a67d8; }}
+            .action-btn.success {{ background: #28a745; }}
+            .action-btn.success:hover {{ background: #218838; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <a href="/admin/scan-execution/list" class="back-link">← Back to Scans</a>
+            <h1 style="margin: 12px 0 0 0;">{scan.repo_name}</h1>
+            <p style="margin: 8px 0 0 0; opacity: 0.9;">
+                {scan.repo_url or 'No URL'} • 
+                Scanned {scan.created_at.strftime('%Y-%m-%d %H:%M') if scan.created_at else 'N/A'}
+            </p>
+        </div>
+        
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-value" style="color: {'#dc3545' if (scan.risk_score or 0) >= 70 else '#ffc107' if (scan.risk_score or 0) >= 40 else '#28a745'};">
+                    {scan.risk_score or 0}
+                </div>
+                <div class="stat-label">Risk Score</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{len(scan.findings or [])}</div>
+                <div class="stat-label">Findings</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{scan.contracts_scanned or 0}</div>
+                <div class="stat-label">Contracts Scanned</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">{scan.risk_level or 'N/A'}</div>
+                <div class="stat-label">Risk Level</div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>Summary</h2>
+            <p>{scan.summary or 'No summary available.'}</p>
+            {quality_html}
+        </div>
+        
+        <div class="card">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2 style="margin: 0;">Findings ({len(scan.findings or [])})</h2>
+                <div>
+                    <a href="/admin/scan-execution/details/{scan.id}" class="action-btn">View in Admin</a>
+                    {'<a href="/admin/project/details/' + str(scan.project_id) + '" class="action-btn success">View Project</a>' if scan.project_id else '<a href="/admin/scan-execution/list?pks=' + str(scan.id) + '&action=convert_to_project" class="action-btn success">Convert to Project</a>'}
+                </div>
+            </div>
+            {findings_html}
+        </div>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html)
 
 
 # WebSocket endpoint for live audit logs

@@ -6,7 +6,6 @@ Access at /admin when mounted to the FastAPI app.
 """
 
 from sqladmin import Admin, ModelView, action
-from sqladmin.formatters import BASE_FORMATTERS
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
 from markupsafe import Markup
@@ -395,27 +394,337 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
     column_list = [
         ScanExecution.id,
         ScanExecution.repo_name,
+        ScanExecution.repo_url,
         ScanExecution.status,
+        ScanExecution.risk_score,
         ScanExecution.risk_level,
+        ScanExecution.contracts_scanned,
+        ScanExecution.project_id,
         ScanExecution.created_at,
     ]
-    column_searchable_list = [ScanExecution.repo_name, ScanExecution.execution_id]
+    column_searchable_list = [ScanExecution.repo_name, ScanExecution.execution_id, ScanExecution.repo_url]
     column_sortable_list = [
         ScanExecution.id,
         ScanExecution.status,
+        ScanExecution.risk_score,
         ScanExecution.risk_level,
         ScanExecution.created_at,
     ]
     column_default_sort = [(ScanExecution.created_at, True)]
-    # Exclude large JSON/text fields from detail view
-    column_details_exclude_list = [
-        ScanExecution.findings,
-        ScanExecution.quality_metrics,
-        ScanExecution.scan_config,
+    column_formatters = {
+        ScanExecution.status: lambda m, a: status_formatter(m.status),
+        ScanExecution.risk_level: lambda m, a: severity_formatter(m.risk_level),
+        ScanExecution.risk_score: lambda m, a: Markup(
+            f'<span class="badge bg-{"danger" if (m.risk_score or 0) >= 70 else "warning" if (m.risk_score or 0) >= 40 else "success"}">'
+            f'{m.risk_score or 0}/100</span>'
+        ) if m.risk_score is not None else "",
+    }
+    # Only use column_details_list to specify exactly which fields to show (exclude large JSON fields)
+    column_details_list = [
+        ScanExecution.id,
+        ScanExecution.execution_id,
+        ScanExecution.repo_name,
+        ScanExecution.repo_url,
+        ScanExecution.status,
+        ScanExecution.risk_score,
+        ScanExecution.risk_level,
+        ScanExecution.summary,
+        ScanExecution.contracts_scanned,
+        ScanExecution.contracts_total,
+        ScanExecution.llm_calls_made,
+        ScanExecution.project,
+        ScanExecution.tenant,
+        ScanExecution.error_message,
+        ScanExecution.started_at,
+        ScanExecution.completed_at,
+        ScanExecution.created_at,
     ]
     icon = "fa-solid fa-radar"
-    name = "Scan"
-    name_plural = "Scans"
+    name = "Surface Scan"
+    name_plural = "Surface Scans"
+    
+    # Allow creating new scans
+    can_create = True
+    can_edit = False  # Scans are read-only after creation
+    can_delete = True
+    
+    # Form fields for creating a new scan
+    form_columns = ["repo_url", "tenant"]
+    form_args = {
+        "repo_url": {
+            "label": "Repository URL",
+            "description": "GitHub URL to scan (e.g., https://github.com/org/repo). After creating, use the 'Run Scan' action to execute.",
+        },
+    }
+    
+    async def on_model_change(self, data, model, is_created, request):
+        """Handle new scan creation - set up initial state."""
+        if is_created and data.get("repo_url"):
+            import uuid
+            from datetime import datetime
+            from urllib.parse import urlparse
+            
+            # Set initial state
+            repo_url = data.get("repo_url")
+            parsed = urlparse(repo_url)
+            path_parts = parsed.path.strip("/").split("/")
+            repo_name = f"{path_parts[-2]}-{path_parts[-1]}" if len(path_parts) >= 2 else "unknown-repo"
+            
+            model.execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
+            model.repo_name = repo_name
+            model.status = "pending"
+            model.repo_url = repo_url
+    
+    @action(
+        name="run_scan",
+        label="Run Scan",
+        confirmation_message="Run surface scan on the selected repositories?",
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def run_scan_action(self, request: Request) -> RedirectResponse:
+        """Run surface scan on pending scan records."""
+        pks = request.query_params.get("pks", "").split(",")
+        
+        if not pks or pks == [""]:
+            return RedirectResponse(
+                request.url_for("admin:list", identity=self.identity),
+                status_code=302,
+            )
+        
+        from analysis.surface import SurfaceScanner
+        from utils.config_loader import load_config
+        from datetime import datetime
+        from server.api import get_engine
+        from database import create_db_session
+        
+        engine = get_engine()
+        db = create_db_session(engine)
+        scanned = []
+        
+        try:
+            config = load_config()
+        except Exception:
+            config = {}
+        
+        scanner = SurfaceScanner(
+            config=config,
+            llm_budget=0,  # Fast scan without LLM
+            model=None,
+            quiet=True,
+        )
+        
+        try:
+            for pk in pks:
+                try:
+                    scan = db.query(ScanExecution).filter(ScanExecution.id == int(pk)).first()
+                    if scan and scan.repo_url and scan.status in ("pending", "failed"):
+                        # Mark as in progress
+                        scan.status = "running"
+                        scan.started_at = datetime.now()
+                        db.commit()
+                        
+                        # Run the scan
+                        result = scanner.scan(scan.repo_url)
+                        
+                        # Update with results
+                        scan.repo_name = result.repo_name
+                        scan.status = "completed" if not result.error else "failed"
+                        scan.risk_score = result.risk_score
+                        scan.risk_level = result.risk_level
+                        scan.findings = [f.model_dump() for f in result.findings]
+                        scan.quality_metrics = result.quality_metrics.model_dump()
+                        scan.summary = result.summary
+                        scan.llm_calls_made = result.llm_calls_used
+                        scan.contracts_scanned = result.contracts_scanned
+                        scan.contracts_total = result.contracts_total
+                        scan.error_message = result.error
+                        scan.completed_at = datetime.now()
+                        db.commit()
+                        scanned.append(scan.repo_name)
+                except Exception as e:
+                    print(f"Failed to scan {pk}: {e}")
+        finally:
+            db.close()
+        
+        if scanned:
+            request.session["flash"] = f"Scanned: {', '.join(scanned)}"
+        else:
+            request.session["flash"] = "No scans executed"
+        
+        return RedirectResponse(
+            request.url_for("admin:list", identity=self.identity),
+            status_code=302,
+        )
+    
+    @action(
+        name="convert_to_project",
+        label="Convert to Project",
+        confirmation_message="Create a project from the selected scans? This will make them ready for full audits.",
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def convert_to_project_action(self, request: Request) -> RedirectResponse:
+        """Convert selected scans to full projects."""
+        pks = request.query_params.get("pks", "").split(",")
+        
+        if not pks or pks == [""]:
+            return RedirectResponse(
+                request.url_for("admin:list", identity=self.identity),
+                status_code=302,
+            )
+        
+        from server.api import get_engine
+        from database import create_db_session
+        engine = get_engine()
+        db = create_db_session(engine)
+        created_projects = []
+        
+        try:
+            for pk in pks:
+                try:
+                    scan = db.query(ScanExecution).filter(ScanExecution.id == int(pk)).first()
+                    if scan and scan.repo_url:
+                        # Check if project already exists for this URL
+                        existing = db.query(Project).filter(Project.git_url == scan.repo_url).first()
+                        if existing:
+                            # Link scan to existing project
+                            scan.project_id = existing.id
+                            db.commit()
+                            created_projects.append(f"{scan.repo_name} (linked to existing)")
+                            continue
+                        
+                        # Create new project
+                        project = Project(
+                            name=scan.repo_name,
+                            git_url=scan.repo_url,
+                            tenant_id=scan.tenant_id,
+                            status="pending",
+                        )
+                        db.add(project)
+                        db.flush()  # Get the project ID
+                        
+                        # Link scan to project
+                        scan.project_id = project.id
+                        db.commit()
+                        created_projects.append(scan.repo_name)
+                except Exception as e:
+                    print(f"Failed to convert scan {pk} to project: {e}")
+        finally:
+            db.close()
+        
+        if created_projects:
+            request.session["flash"] = f"Created projects: {', '.join(created_projects)}"
+        else:
+            request.session["flash"] = "No projects created"
+        
+        return RedirectResponse(
+            request.url_for("admin:list", identity=self.identity),
+            status_code=302,
+        )
+    
+    @action(
+        name="view_findings",
+        label="View Findings",
+        confirmation_message=None,
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def view_findings_action(self, request: Request) -> RedirectResponse:
+        """View scan findings in detail."""
+        pks = request.query_params.get("pks", "").split(",")
+        
+        if pks and pks[0]:
+            # Redirect to a findings view page
+            return RedirectResponse(
+                f"/admin/scan-findings/{pks[0]}",
+                status_code=302,
+            )
+        
+        return RedirectResponse(
+            request.url_for("admin:list", identity=self.identity),
+            status_code=302,
+        )
+    
+    @action(
+        name="generate_report",
+        label="Generate Report",
+        confirmation_message="Generate HTML marketing report for the selected scans?",
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def generate_report_action(self, request: Request) -> RedirectResponse:
+        """Generate HTML report for selected scans."""
+        pks = request.query_params.get("pks", "").split(",")
+        
+        if not pks or pks == [""]:
+            return RedirectResponse(
+                request.url_for("admin:list", identity=self.identity),
+                status_code=302,
+            )
+        
+        from server.api import get_engine
+        from database import create_db_session
+        from analysis.surface.report import ScanReportGenerator
+        from analysis.surface.models import ScanResult, Finding, QualityMetrics
+        from pathlib import Path
+        
+        engine = get_engine()
+        db = create_db_session(engine)
+        generated_reports = []
+        
+        try:
+            report_gen = ScanReportGenerator()
+            reports_dir = Path.home() / ".hound/surface_reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            
+            for pk in pks:
+                try:
+                    scan = db.query(ScanExecution).filter(ScanExecution.id == int(pk)).first()
+                    if scan:
+                        # Reconstruct ScanResult from database
+                        findings = []
+                        for f in (scan.findings or []):
+                            findings.append(Finding(**f))
+                        
+                        qm = scan.quality_metrics or {}
+                        quality_metrics = QualityMetrics(**qm)
+                        
+                        result = ScanResult(
+                            repo_url=scan.repo_url,
+                            repo_path=scan.repo_url or "",
+                            repo_name=scan.repo_name,
+                            scan_timestamp=scan.started_at or scan.created_at,
+                            risk_score=scan.risk_score or 0,
+                            risk_level=scan.risk_level or "low",
+                            findings=findings,
+                            quality_metrics=quality_metrics,
+                            contracts_scanned=scan.contracts_scanned,
+                            contracts_total=scan.contracts_total,
+                            llm_calls_used=scan.llm_calls_made,
+                            summary=scan.summary or "",
+                            error=scan.error_message,
+                        )
+                        
+                        # Generate HTML report
+                        html = report_gen.generate_html(result)
+                        report_path = reports_dir / f"{scan.repo_name}_{scan.execution_id}.html"
+                        report_path.write_text(html)
+                        generated_reports.append(str(report_path))
+                except Exception as e:
+                    print(f"Failed to generate report for scan {pk}: {e}")
+        finally:
+            db.close()
+        
+        if generated_reports:
+            request.session["flash"] = f"Generated {len(generated_reports)} report(s) in {reports_dir}"
+        else:
+            request.session["flash"] = "No reports generated"
+        
+        return RedirectResponse(
+            request.url_for("admin:list", identity=self.identity),
+            status_code=302,
+        )
 
 
 class GraphAdmin(ModelView, model=Graph):

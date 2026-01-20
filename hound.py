@@ -1205,7 +1205,8 @@ def scan(
     model: str = typer.Option(None, "--model", help="Override LLM model (default: gpt-4o-mini)"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Suppress progress output"),
     no_llm: bool = typer.Option(False, "--no-llm", help="Skip LLM verification (faster, less accurate)"),
-    max_concurrent: int = typer.Option(10, "--max-concurrent", help="Max concurrent scans for batch mode")
+    max_concurrent: int = typer.Option(10, "--max-concurrent", help="Max concurrent scans for batch mode"),
+    save: bool = typer.Option(False, "--save", help="Save scan results to database for admin panel (requires DATABASE_URL)")
 ):
     """Fast preliminary security scan for smart contract repos.
 
@@ -1216,18 +1217,30 @@ def scan(
         hound scan https://github.com/uniswap/v4-core
         hound scan /path/to/contracts --format html --output report.html
         hound scan --batch repos.csv --output results.csv
+        hound scan https://github.com/org/repo --save  # Save to admin panel
     """
-    from commands.scan import run_scan
-
-    run_scan(
-        target=target,
-        batch=batch,
-        output=output,
-        output_format=format,
-        budget=0 if no_llm else budget,
-        model=model,
-        quiet=quiet,
-    )
+    import click
+    from commands.scan import scan as scan_command
+    
+    # Create Click context and invoke
+    ctx = click.Context(scan_command)
+    ctx.params = {
+        "target": target,
+        "batch": batch,
+        "output": output,
+        "output_format": format,
+        "budget": 0 if no_llm else budget,
+        "model": model,
+        "quiet": quiet,
+        "no_llm": no_llm,
+        "max_concurrent": max_concurrent,
+        "save": save,
+    }
+    try:
+        scan_command.invoke(ctx)
+    except SystemExit as e:
+        if e.code != 0:
+            raise typer.Exit(e.code)
 
 
 @app.command()

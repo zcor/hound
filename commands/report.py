@@ -3,7 +3,10 @@ Generate professional security audit reports from project analysis.
 """
 
 import json
+import os
 import random
+import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +18,227 @@ from analysis.report_generator import ReportGenerator
 from commands.project import ProjectManager
 
 console = Console()
+
+
+def _load_report_data_from_db(project_name: str, include_all: bool = False) -> tuple[dict | None, Path | None, Path | None]:
+    """
+    Load report data from database.
+    
+    Returns: (hypotheses_dict, repo_root, temp_project_dir) or (None, None, None) if not using DB
+    """
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        return None, None, None
+    
+    try:
+        from sqlalchemy import create_engine, text
+        engine = create_engine(database_url)
+        
+        with engine.connect() as conn:
+            # Find project by name
+            result = conn.execute(text(
+                "SELECT id, name, source_path, git_url FROM projects WHERE name = :name"
+            ), {"name": project_name})
+            project = result.fetchone()
+            
+            if not project:
+                # Try matching by partial name
+                result = conn.execute(text(
+                    "SELECT id, name, source_path, git_url FROM projects WHERE name ILIKE :pattern ORDER BY id DESC LIMIT 1"
+                ), {"pattern": f"%{project_name}%"})
+                project = result.fetchone()
+            
+            if not project:
+                return None, None, None
+            
+            project_id, name, source_path, git_url = project
+            
+            # Determine repo root
+            repo_root = None
+            if source_path and Path(source_path).exists():
+                repo_root = Path(source_path)
+            elif git_url:
+                # Check common clone locations
+                repo_name = git_url.rstrip('/').split('/')[-1].replace('.git', '')
+                for base in [Path('/tmp'), Path('/workspaces')]:
+                    candidate = base / repo_name
+                    if candidate.exists():
+                        repo_root = candidate
+                        break
+                
+                # Clone if not found
+                if not repo_root:
+                    clone_path = Path('/tmp') / repo_name
+                    console.print(f"[dim]Cloning {git_url} to {clone_path}...[/dim]")
+                    try:
+                        result = subprocess.run(
+                            ["git", "clone", "--depth", "1", git_url, str(clone_path)],
+                            capture_output=True,
+                            text=True,
+                            timeout=120,
+                        )
+                        if result.returncode == 0 and clone_path.exists():
+                            repo_root = clone_path
+                            console.print(f"[dim]Cloned successfully[/dim]")
+                    except Exception as e:
+                        console.print(f"[yellow]Clone warning: {e}[/yellow]")
+            
+            # Get hypotheses based on include_all flag
+            if include_all:
+                result = conn.execute(text("""
+                    SELECT hypothesis_id, title, description, vulnerability_type,
+                           status, confidence, severity, node_refs, evidence
+                    FROM hypotheses 
+                    WHERE project_id = :pid
+                    ORDER BY confidence DESC
+                """), {"pid": project_id})
+            else:
+                result = conn.execute(text("""
+                    SELECT hypothesis_id, title, description, vulnerability_type,
+                           status, confidence, severity, node_refs, evidence
+                    FROM hypotheses 
+                    WHERE project_id = :pid 
+                    AND (status = 'confirmed' OR confidence >= 0.7)
+                    ORDER BY confidence DESC
+                """), {"pid": project_id})
+            
+            rows = result.fetchall()
+            
+            # Helper function to extract file paths from hypothesis text
+            def _extract_source_files_from_text(hyp_title: str, description: str, repo_root: Path | None) -> list[str]:
+                """Extract source file paths from hypothesis text using keyword matching."""
+                if not repo_root:
+                    return []
+                
+                import re
+                source_files = []
+                combined = f"{hyp_title} {description}".lower()
+                
+                # Look for camelCase or PascalCase identifiers
+                identifiers = set(re.findall(
+                    r'\b([A-Za-z][a-zA-Z0-9]*(?:[A-Z][a-zA-Z0-9]*)+)\b', 
+                    f"{hyp_title} {description}"
+                ))
+                
+                # Extract simple keywords that might be file names
+                keywords = set()
+                for word in re.findall(r'\b([a-zA-Z]{4,20})\b', combined):
+                    if word not in {'this', 'that', 'with', 'from', 'allows', 'which', 'could', 
+                                  'would', 'should', 'using', 'funds', 'tokens', 'called', 'function',
+                                  'contract', 'address', 'operator', 'manager', 'admin', 'oracle',
+                                  'strategy', 'balance', 'transfer', 'approve'}:
+                        keywords.add(word)
+                
+                # Scan contracts directory for matching files
+                contracts_dir = repo_root / 'contracts'
+                if contracts_dir.exists():
+                    for sol_file in contracts_dir.glob('**/*.sol'):
+                        file_lower = sol_file.stem.lower()
+                        for kw in keywords | {i.lower() for i in identifiers}:
+                            if kw in file_lower or file_lower in kw:
+                                rel_path = str(sol_file.relative_to(repo_root))
+                                if rel_path not in source_files:
+                                    source_files.append(rel_path)
+                                break
+                
+                # Also scan src directory
+                src_dir = repo_root / 'src'
+                if src_dir.exists():
+                    for sol_file in src_dir.glob('**/*.sol'):
+                        file_lower = sol_file.stem.lower()
+                        for kw in keywords | {i.lower() for i in identifiers}:
+                            if kw in file_lower or file_lower in kw:
+                                rel_path = str(sol_file.relative_to(repo_root))
+                                if rel_path not in source_files:
+                                    source_files.append(rel_path)
+                                break
+                
+                return source_files
+            
+            hypotheses = {}
+            for row in rows:
+                hid, hyp_title, description, vuln_type, status, confidence, severity, node_refs, evidence = row
+                
+                # Extract source files from hypothesis text
+                source_files = _extract_source_files_from_text(hyp_title, description, repo_root)
+                
+                # Build node_refs from extracted files if empty
+                effective_node_refs = node_refs or []
+                if not effective_node_refs and source_files:
+                    effective_node_refs = source_files
+                
+                hypotheses[hid] = {
+                    'title': hyp_title,
+                    'description': description,
+                    'vulnerability_type': vuln_type,
+                    'status': status,
+                    'confidence': confidence,
+                    'severity': severity,
+                    'node_refs': effective_node_refs,
+                    'evidence': evidence or {},
+                    'annotations': [],
+                    'locations': [],
+                    'reasoning': description,
+                    'properties': {
+                        'source_files': source_files  # Add source_files to properties
+                    }
+                }
+                # Convert node_refs to annotations format
+                if effective_node_refs:
+                    for ref in effective_node_refs:
+                        if isinstance(ref, str) and ':' in ref:
+                            parts = ref.split(':')
+                            file_path = parts[0]
+                            line = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                            hypotheses[hid]['annotations'].append({
+                                'file_path': file_path,
+                                'line': line
+                            })
+                        elif isinstance(ref, str):
+                            hypotheses[hid]['annotations'].append({'file_path': ref})
+            
+            # Create temporary project directory structure for ReportGenerator
+            temp_project_dir = Path(tempfile.mkdtemp(prefix="hound_report_"))
+            
+            # Create graphs directory with minimal metadata
+            graphs_dir = temp_project_dir / "graphs"
+            graphs_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create knowledge_graphs.json with repo root
+            kg_data = {
+                "manifest": {"repo_path": str(repo_root) if repo_root else None},
+                "card_store_path": None
+            }
+            with open(graphs_dir / "knowledge_graphs.json", "w") as f:
+                json.dump(kg_data, f)
+            
+            # Create a minimal graph file so the generator doesn't fail
+            with open(graphs_dir / "graph_analysis.json", "w") as f:
+                json.dump({"nodes": [], "edges": []}, f)
+            
+            # Create hypotheses.json
+            hyp_data = {
+                "hypotheses": hypotheses,
+                "metadata": {
+                    "source": "database",
+                    "project_name": name
+                }
+            }
+            with open(temp_project_dir / "hypotheses.json", "w") as f:
+                json.dump(hyp_data, f)
+            
+            # Create reports directory
+            (temp_project_dir / "reports").mkdir(exist_ok=True)
+            
+            console.print(f"[dim]Loaded {len(hypotheses)} hypotheses from database[/dim]")
+            
+            return hypotheses, repo_root, temp_project_dir
+            
+    except Exception as e:
+        console.print(f"[yellow]Database lookup failed: {e}[/yellow]")
+        import traceback
+        traceback.print_exc()
+        return None, None, None
 
 
 @click.command()
@@ -37,22 +261,39 @@ def report(project_name: str, output: str | None, format: str,
     - Scope and methodology
     - Testing coverage appendix
     """
-    manager = ProjectManager()
-    project = manager.get_project(project_name)
+    # Try loading from database first
+    db_hypotheses, repo_root, temp_project_dir = _load_report_data_from_db(project_name, include_all)
     
-    if not project:
-        console.print(f"[red]Project '{project_name}' not found.[/red]")
-        raise click.Exit(1)
+    project_dir = None
+    project_source = None
+    cleanup_temp = False
     
-    project_dir = Path(project["path"])
+    if db_hypotheses is not None and temp_project_dir:
+        # Use database mode
+        console.print(f"[dim]Using database mode...[/dim]")
+        project_dir = temp_project_dir
+        project_source = str(repo_root) if repo_root else None
+        cleanup_temp = True
+    else:
+        # Fall back to filesystem mode
+        manager = ProjectManager()
+        project = manager.get_project(project_name)
+        
+        if not project:
+            console.print(f"[red]Project '{project_name}' not found.[/red]")
+            console.print("[dim]Hint: Set DATABASE_URL environment variable to load from database[/dim]")
+            raise click.Exit(1)
+        
+        project_dir = Path(project["path"])
+        project_source = project.get("source_path")
+        
+        # Check for required data
+        graphs_dir = project_dir / "graphs"
+        if not graphs_dir.exists() or not list(graphs_dir.glob("*.json")):
+            console.print("[red]No graphs found. Run graph build first.[/red]")
+            raise click.Exit(1)
     
-    # Check for required data
-    graphs_dir = project_dir / "graphs"
-    if not graphs_dir.exists() or not list(graphs_dir.glob("*.json")):
-        console.print("[red]No graphs found. Run graph build first.[/red]")
-        raise click.Exit(1)
-    
-    # Load hypotheses if available
+    # Load hypotheses count
     hypothesis_file = project_dir / "hypotheses.json"
     hypotheses = {}
     if hypothesis_file.exists():
@@ -166,7 +407,7 @@ def report(project_name: str, output: str | None, format: str,
     try:
         report_data = generator.generate(
             project_name=project_name,
-            project_source=project["source_path"],
+            project_source=project_source,
             title=title or f"Security Audit: {project_name}",
             auditors=auditors.split(','),
             format=format,
@@ -188,8 +429,14 @@ def report(project_name: str, output: str | None, format: str,
                 if generator.last_response:
                     console.print(Panel(generator.last_response, title="Raw Response"))
 
-        # Write report
+        # Write report - for DB mode, write to user's home directory
         console.print(f"[bright_cyan]Writing {format.upper()} report...[/bright_cyan]")
+        
+        # If using temp project dir, redirect output to user's home
+        if cleanup_temp and str(output_path).startswith(str(temp_project_dir)):
+            user_reports_dir = Path.home() / f".hound/reports/{project_name}"
+            user_reports_dir.mkdir(parents=True, exist_ok=True)
+            output_path = user_reports_dir / output_path.name
         
         if format == 'html':
             with open(output_path, 'w') as f:
@@ -215,6 +462,14 @@ def report(project_name: str, output: str | None, format: str,
             import traceback
             console.print(traceback.format_exc())
         raise click.Exit(1)
+    finally:
+        # Cleanup temp directory if we created one
+        if cleanup_temp and temp_project_dir and temp_project_dir.exists():
+            import shutil
+            try:
+                shutil.rmtree(temp_project_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

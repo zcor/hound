@@ -1,13 +1,70 @@
 """Surface scan command for lightweight security analysis."""
 
+import os
 import sys
+import uuid
+from datetime import datetime
 from pathlib import Path
 
 import click
 from rich.console import Console
-from rich.table import Table
 
 console = Console()
+
+
+def _save_scan_to_database(result, tenant_id: int = 1) -> str | None:
+    """Save scan result to database for admin panel tracking.
+    
+    Returns execution_id if saved successfully, None otherwise.
+    """
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        return None
+    
+    try:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from database.models import ScanExecution
+        
+        engine = create_engine(database_url)
+        Session = sessionmaker(bind=engine)
+        db = Session()
+        
+        # Generate unique execution ID
+        execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
+        
+        # Create scan execution record
+        scan_exec = ScanExecution(
+            execution_id=execution_id,
+            tenant_id=tenant_id,
+            repo_url=result.repo_url,
+            repo_name=result.repo_name,
+            status="completed" if not result.error else "failed",
+            risk_score=result.risk_score,
+            risk_level=result.risk_level,
+            findings=[f.model_dump() for f in result.findings],
+            quality_metrics=result.quality_metrics.model_dump(),
+            summary=result.summary,
+            scan_config={
+                "llm_calls_used": result.llm_calls_used,
+                "contracts_scanned": result.contracts_scanned,
+            },
+            llm_calls_made=result.llm_calls_used,
+            contracts_scanned=result.contracts_scanned,
+            contracts_total=result.contracts_total,
+            error_message=result.error,
+            started_at=result.scan_timestamp,
+            completed_at=datetime.now(),
+        )
+        
+        db.add(scan_exec)
+        db.commit()
+        db.close()
+        
+        return execution_id
+    except Exception as e:
+        console.print(f"[yellow]Warning: Failed to save scan to database: {e}[/yellow]")
+        return None
 
 
 @click.command()
@@ -20,6 +77,7 @@ console = Console()
 @click.option("--quiet", "-q", is_flag=True, help="Suppress progress output")
 @click.option("--no-llm", is_flag=True, help="Skip LLM verification (faster, less accurate)")
 @click.option("--max-concurrent", type=int, default=10, help="Max concurrent scans for batch mode")
+@click.option("--save", is_flag=True, help="Save scan results to database (requires DATABASE_URL)")
 def scan(
     target: str | None,
     batch: str | None,
@@ -30,6 +88,7 @@ def scan(
     quiet: bool,
     no_llm: bool,
     max_concurrent: int,
+    save: bool,
 ):
     """Fast preliminary security scan for smart contract repos.
 
@@ -95,6 +154,15 @@ def scan(
             max_concurrent=max_concurrent,
         )
 
+        # Save batch results to database if requested
+        if save:
+            saved_count = 0
+            for result in batch_result.results:
+                if _save_scan_to_database(result):
+                    saved_count += 1
+            if not quiet:
+                console.print(f"[dim]Saved {saved_count}/{len(batch_result.results)} scans to database[/dim]")
+
         # Also generate full report if HTML format requested
         if output_format == "html" and output:
             # Generate individual HTML reports in a directory
@@ -122,6 +190,12 @@ def scan(
     if result.error:
         console.print(f"[red]Error scanning {target}:[/red] {result.error}")
         sys.exit(1)
+
+    # Save to database if requested (or if DATABASE_URL is set and --save flag used)
+    if save:
+        execution_id = _save_scan_to_database(result)
+        if execution_id and not quiet:
+            console.print(f"[dim]Saved to database: {execution_id}[/dim]")
 
     # Generate output
     report_gen = ScanReportGenerator()

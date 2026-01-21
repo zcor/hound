@@ -1,10 +1,11 @@
 # Hound SaaS Stack Dockerfile
-# Base image with Python 3.10
-FROM python:3.10-slim
+# Base image with Python 3.11
+FROM python:3.11-slim
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV PORT=8000
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,7 +31,11 @@ RUN useradd --create-home --shell /bin/bash hound \
     && chown -R hound:hound /app
 USER hound
 
-# Expose default port (API server)
-EXPOSE 8000
+# Create .hound directory for local storage
+RUN mkdir -p /home/hound/.hound
 
-# No default CMD - will be overridden by docker-compose
+# Expose default port (Railway sets $PORT)
+EXPOSE ${PORT}
+
+# Default command for Railway (uses $PORT env var)
+CMD uvicorn server.api:app --host 0.0.0.0 --port ${PORT} --proxy-headers --forwarded-allow-ips='*'

@@ -1,5 +1,21 @@
 # Hound Railway Deployment Guide
 
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      Railway Project                            │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌──────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────────┐   │
+│  │ Postgres │  │  Redis  │  │ Hound   │  │ Hound Frontend  │   │
+│  │ (plugin) │  │ (plugin)│  │ API     │  │ (Next.js)       │   │
+│  └────┬─────┘  └────┬────┘  └────┬────┘  └────────┬────────┘   │
+│       │             │            │                │            │
+│       └─────────────┴────────────┴────────────────┘            │
+│                    Internal networking                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ## Quick Start (Single Service - SQLite)
 
 For simple single-tenant deployment with SQLite:
@@ -34,38 +50,49 @@ In Railway dashboard:
 
 Railway automatically creates `DATABASE_URL` and `REDIS_URL` variables.
 
-### Step 3: Deploy API Service
+### Step 3: Deploy API Service (Backend)
 
 1. Click **"New"** → **"GitHub Repo"**
 2. Select your `hound` repository
-3. Railway detects `railway.json` and uses it
+3. Set **Root Directory** to `/` (or leave empty)
+4. Railway detects `railway.json` and uses it
 
-### Step 4: Set Environment Variables
+### Step 4: Deploy Frontend Service
 
-In the API service settings, add:
+1. Click **"New"** → **"GitHub Repo"**
+2. Select your `hound` repository **again**
+3. Set **Root Directory** to `frontend`
+4. Railway detects `frontend/railway.json`
 
+### Step 5: Set Environment Variables
+
+**For API service:**
 ```env
 # Required - LLM API Keys (at least one)
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
 DEEPSEEK_API_KEY=sk-...
 
-# Auto-set by Railway plugins (don't manually set these)
+# Auto-set by Railway plugins (reference them, don't set manually)
 # DATABASE_URL=postgresql://...
 # REDIS_URL=redis://...
-
-# Optional - GitHub Integration
-GITHUB_APP_ID=123456
-GITHUB_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----...
-GITHUB_WEBHOOK_SECRET=your-webhook-secret
 ```
 
-### Step 5: Link Services
+**For Frontend service:**
+```env
+# Point to your API service's Railway URL
+NEXT_PUBLIC_API_URL=https://your-api-service.railway.app
+```
 
-In Railway dashboard:
-1. Go to API service → **Variables**
-2. Click **"Reference"** to link `DATABASE_URL` from PostgreSQL
-3. Click **"Reference"** to link `REDIS_URL` from Redis
+### Step 6: Link Services
+
+1. Go to API service → **Variables** → Click **"Reference"** to link `DATABASE_URL` from PostgreSQL
+2. Go to Frontend service → **Variables** → Set `NEXT_PUBLIC_API_URL` to API service URL
+
+### Step 7: Set Up Custom Domains (Optional)
+
+1. **API**: `api.yourdomain.com` → API service
+2. **Frontend**: `app.yourdomain.com` → Frontend service
 
 ---
 

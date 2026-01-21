@@ -112,6 +112,24 @@ services:
       - hound-net
     restart: unless-stopped
 
+  # Next.js Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    container_name: hound-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://api:8000
+    depends_on:
+      - api
+    networks:
+      - hound-net
+    restart: unless-stopped
+
 networks:
   hound-net:
     driver: bridge

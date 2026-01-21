@@ -291,6 +291,110 @@ class ScanExecution(Base):
         return f"<ScanExecution(id={self.id}, execution_id='{self.execution_id}', repo='{self.repo_name}', status='{self.status}')>"
 
 
+class TokenUsageLog(Base):
+    """
+    TokenUsageLog table for tracking LLM token usage and costs.
+    
+    Stores per-request token usage for cost analysis:
+    - project_id: Link to project (optional for system-wide tracking)
+    - session_id: Link to audit session (optional)
+    - provider: LLM provider (openai, anthropic, google, etc.)
+    - model: Specific model used (gpt-4o, claude-3-opus, etc.)
+    - profile: Usage profile (agent, graph, guidance, finalize, etc.)
+    - input_tokens, output_tokens: Token counts
+    - cost_usd: Calculated cost in USD
+    """
+    __tablename__ = "token_usage_logs"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    session_id = Column(String(255), nullable=True, index=True)  # Audit session ID
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True)
+    
+    # Provider and model info
+    provider = Column(String(100), nullable=False, index=True)  # openai, anthropic, google, deepseek, xai
+    model = Column(String(255), nullable=False, index=True)  # gpt-4o, claude-3-opus, etc.
+    profile = Column(String(100), nullable=True, index=True)  # agent, graph, guidance, finalize, scout, strategist
+    
+    # Token counts
+    input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens = Column(Integer, nullable=False, default=0)
+    total_tokens = Column(Integer, nullable=False, default=0)
+    
+    # Cost calculation (in USD)
+    cost_usd = Column(Float, nullable=True)  # Calculated cost based on model pricing
+    
+    # Request context
+    request_type = Column(String(100), nullable=True)  # raw, structured, stream
+    endpoint = Column(String(255), nullable=True)  # API endpoint that triggered this
+    
+    # Timing
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    
+    # Relationships
+    project = relationship("Project", backref="token_usage_logs")
+    tenant = relationship("Tenant", backref="token_usage_logs")
+    
+    def __repr__(self):
+        return f"<TokenUsageLog(id={self.id}, model='{self.model}', tokens={self.total_tokens}, cost=${self.cost_usd or 0:.4f})>"
+
+
+# Model pricing table (per 1M tokens) - Updated January 2026
+MODEL_PRICING = {
+    # OpenAI
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4-turbo": {"input": 10.00, "output": 30.00},
+    "gpt-4": {"input": 30.00, "output": 60.00},
+    "gpt-3.5-turbo": {"input": 0.50, "output": 1.50},
+    "o1": {"input": 15.00, "output": 60.00},
+    "o1-mini": {"input": 3.00, "output": 12.00},
+    "o1-preview": {"input": 15.00, "output": 60.00},
+    # Anthropic
+    "claude-3-opus": {"input": 15.00, "output": 75.00},
+    "claude-3-sonnet": {"input": 3.00, "output": 15.00},
+    "claude-3-haiku": {"input": 0.25, "output": 1.25},
+    "claude-3-5-sonnet": {"input": 3.00, "output": 15.00},
+    "claude-3-5-haiku": {"input": 0.80, "output": 4.00},
+    "claude-sonnet-4": {"input": 3.00, "output": 15.00},
+    "claude-opus-4": {"input": 15.00, "output": 75.00},
+    # Google
+    "gemini-1.5-pro": {"input": 1.25, "output": 5.00},
+    "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
+    "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
+    # DeepSeek
+    "deepseek-chat": {"input": 0.14, "output": 0.28},
+    "deepseek-coder": {"input": 0.14, "output": 0.28},
+    "deepseek-reasoner": {"input": 0.55, "output": 2.19},
+    # xAI
+    "grok-beta": {"input": 5.00, "output": 15.00},
+    "grok-2": {"input": 2.00, "output": 10.00},
+}
+
+
+def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Calculate cost in USD for a given model and token counts."""
+    # Normalize model name (handle variations)
+    model_lower = model.lower()
+    
+    # Find matching pricing
+    pricing = None
+    for model_key, prices in MODEL_PRICING.items():
+        if model_key in model_lower or model_lower in model_key:
+            pricing = prices
+            break
+    
+    if not pricing:
+        # Default fallback pricing (conservative estimate)
+        pricing = {"input": 1.00, "output": 3.00}
+    
+    # Calculate cost (prices are per 1M tokens)
+    input_cost = (input_tokens / 1_000_000) * pricing["input"]
+    output_cost = (output_tokens / 1_000_000) * pricing["output"]
+    
+    return round(input_cost + output_cost, 6)
+
+
 # Database connection helper
 def create_db_engine(database_url: str, echo: bool = False):
     """

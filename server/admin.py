@@ -17,6 +17,7 @@ from database.models import (
     Project,
     ScanExecution,
     Tenant,
+    TokenUsageLog,
 )
 
 
@@ -145,7 +146,7 @@ class ProjectAdmin(ModelView, model=Project):
         add_in_list=True,
     )
     async def build_graphs_action(self, request: Request) -> RedirectResponse:
-        """Build knowledge graphs for selected projects."""
+        """Build knowledge graphs for selected projects. Uses Celery if available, falls back to sync."""
         pks = request.query_params.get("pks", "").split(",")
         
         if not pks or pks == [""]:
@@ -154,53 +155,90 @@ class ProjectAdmin(ModelView, model=Project):
                 status_code=302,
             )
         
-        # Import worker task
+        # Try to use Celery worker first (production/scalable mode)
+        use_celery = False
         try:
             from worker.tasks import build_graphs_task
-        except ImportError:
-            request.session["flash"] = "Worker tasks not available"
-            return RedirectResponse(
-                request.url_for("admin:list", identity=self.identity),
-                status_code=302,
-            )
+            # Test if Celery is actually connected by checking broker
+            build_graphs_task.app.control.ping(timeout=1)
+            use_celery = True
+        except Exception:
+            use_celery = False
         
-        # Get projects and start graph builds
+        # Get database session
         from server.api import get_engine
         from database import create_db_session
         engine = get_engine()
         db = create_db_session(engine)
-        started_projects = []
+        
+        results = []
         try:
             for pk in pks:
                 try:
-                    project = db.query(Project).filter(Project.id == int(pk)).first()
-                    if project and project.git_url:
+                    project_id = int(pk)
+                    project = db.query(Project).filter(Project.id == project_id).first()
+                    
+                    if not project:
+                        results.append(f"Project {pk} not found")
+                        continue
+                    
+                    if not project.source_path and not project.git_url:
+                        results.append(f"{project.name}: No source path or git URL")
+                        continue
+                    
+                    if use_celery and project.git_url:
+                        # PRODUCTION MODE: Use Celery worker (non-blocking, scalable)
                         import hashlib
                         import time
                         scan_id = f"graphs_{hashlib.md5(project.git_url.encode()).hexdigest()[:12]}_{int(time.time())}"
                         
-                        # Dispatch graph build task
                         build_graphs_task.delay(
                             repo_url=project.git_url,
                             scan_id=scan_id,
                             tenant_id=project.tenant_id,
                             project_id=project.id,
+                            num_graphs=4,
                         )
-                        started_projects.append(project.name)
+                        results.append(f"🚀 {project.name}: Graph build queued (Celery)")
+                    else:
+                        # DEVELOPMENT MODE: Use sync endpoint (blocking)
+                        import httpx
+                        
+                        async def build_graphs_request():
+                            async with httpx.AsyncClient(timeout=600.0) as client:
+                                host = request.headers.get("host", "localhost:8000")
+                                scheme = request.headers.get("x-forwarded-proto", "http")
+                                base_url = f"{scheme}://{host}"
+                                
+                                response = await client.post(
+                                    f"{base_url}/graphs/build-sync",
+                                    json={
+                                        "project_id": project_id,
+                                        "num_graphs": 4,
+                                        "init_only": False,
+                                    }
+                                )
+                                return response
+                        
+                        response = await build_graphs_request()
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            results.append(f"✅ {project.name}: {data['graphs_built']} graphs ({data['total_nodes']}N/{data['total_edges']}E) [sync]")
+                        else:
+                            error = response.json().get("detail", "Unknown error")
+                            results.append(f"❌ {project.name}: {error}")
+                        
                 except Exception as e:
-                    print(f"Failed to start graph build for project {pk}: {e}")
+                    results.append(f"❌ Project {pk}: {str(e)[:100]}")
         finally:
             db.close()
         
-        if started_projects:
-            message = f"Graph build started for: {', '.join(started_projects)}"
-        else:
-            message = "No graph builds started (projects may be missing git_url)"
-        
-        request.session["flash"] = message
+        mode = "Celery workers" if use_celery else "sync mode"
+        message = f"[{mode}] " + " | ".join(results) if results else "No projects processed"
         
         return RedirectResponse(
-            request.url_for("admin:list", identity=self.identity),
+            f"/admin/project/list?message={message[:200]}",
             status_code=302,
         )
     
@@ -212,68 +250,100 @@ class ProjectAdmin(ModelView, model=Project):
         add_in_list=True,
     )
     async def run_audit_action(self, request: Request) -> RedirectResponse:
-        """Start an audit for selected projects."""
+        """Start audit for selected projects. Uses Celery if available, falls back to sync."""
         pks = request.query_params.get("pks", "").split(",")
         
         if not pks or pks == [""]:
-            # No projects selected
             return RedirectResponse(
                 request.url_for("admin:list", identity=self.identity),
                 status_code=302,
             )
         
-        # Import worker task
+        # Try to use Celery worker first (production/scalable mode)
+        use_celery = False
         try:
             from worker.tasks import execute_audit_task
-        except ImportError:
-            # Worker not available, flash error
-            request.session["flash"] = "Worker tasks not available"
-            return RedirectResponse(
-                request.url_for("admin:list", identity=self.identity),
-                status_code=302,
-            )
+            execute_audit_task.app.control.ping(timeout=1)
+            use_celery = True
+        except Exception:
+            use_celery = False
         
-        # Get projects and start audits
+        # Get database session
         from server.api import get_engine
         from database import create_db_session
         engine = get_engine()
         db = create_db_session(engine)
-        started_projects = []
+        
+        results = []
         try:
             for pk in pks:
                 try:
-                    project = db.query(Project).filter(Project.id == int(pk)).first()
-                    if project and project.git_url:
-                        # Generate session ID
+                    project_id = int(pk)
+                    project = db.query(Project).filter(Project.id == project_id).first()
+                    
+                    if not project:
+                        results.append(f"Project {pk} not found")
+                        continue
+                    
+                    # Check if project has graphs
+                    from database.models import Graph
+                    graphs_count = db.query(Graph).filter(Graph.project_id == project_id).count()
+                    if graphs_count == 0:
+                        results.append(f"⚠️ {project.name}: No graphs - build graphs first!")
+                        continue
+                    
+                    if use_celery and project.git_url:
+                        # PRODUCTION MODE: Use Celery worker (non-blocking, scalable)
                         import hashlib
                         import time
                         session_id = f"audit_{hashlib.md5(project.git_url.encode()).hexdigest()[:12]}_{int(time.time())}"
                         
-                        # Dispatch audit task
                         execute_audit_task.delay(
                             repo_url=project.git_url,
                             scan_id=session_id,
                             tenant_id=project.tenant_id,
                             project_id=project.id,
                         )
-                        started_projects.append(project.name)
+                        results.append(f"🚀 {project.name}: Audit queued (Celery)")
+                    else:
+                        # DEVELOPMENT MODE: Use sync endpoint (blocking)
+                        import httpx
+                        
+                        async def run_audit_request():
+                            async with httpx.AsyncClient(timeout=3600.0) as client:
+                                host = request.headers.get("host", "localhost:8000")
+                                scheme = request.headers.get("x-forwarded-proto", "http")
+                                base_url = f"{scheme}://{host}"
+                                
+                                response = await client.post(
+                                    f"{base_url}/audits/run-sync",
+                                    json={
+                                        "project_id": project_id,
+                                        "max_investigations": 20,
+                                        "time_limit_minutes": 30,
+                                    }
+                                )
+                                return response
+                        
+                        response = await run_audit_request()
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            results.append(f"✅ {project.name}: {data['hypotheses_found']} findings ({data['confirmed_count']} confirmed) [sync]")
+                        else:
+                            error = response.json().get("detail", "Unknown error")
+                            results.append(f"❌ {project.name}: {error}")
+                        
                 except Exception as e:
-                    # Log error but continue with other projects
-                    print(f"Failed to start audit for project {pk}: {e}")
+                    results.append(f"❌ Project {pk}: {str(e)[:100]}")
         finally:
             db.close()
         
-        # Flash success message
-        if started_projects:
-            message = f"Audit started for: {', '.join(started_projects)}"
-        else:
-            message = "No audits started (projects may be missing git_url)"
-        
-        # Store flash message in session
-        request.session["flash"] = message
+        mode = "Celery workers" if use_celery else "sync mode"
+        message = f"[{mode}] " + " | ".join(results) if results else "No projects processed"
         
         return RedirectResponse(
-            request.url_for("admin:list", identity=self.identity),
+            f"/admin/project/list?message={message[:200]}",
             status_code=302,
         )
 
@@ -909,6 +979,64 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
         )
 
 
+class TokenUsageAdmin(ModelView, model=TokenUsageLog):
+    """Admin view for TokenUsageLog model - track LLM costs."""
+    
+    column_list = [
+        TokenUsageLog.id,
+        TokenUsageLog.provider,
+        TokenUsageLog.model,
+        TokenUsageLog.profile,
+        TokenUsageLog.total_tokens,
+        TokenUsageLog.cost_usd,
+        TokenUsageLog.project,
+        TokenUsageLog.created_at,
+    ]
+    column_searchable_list = [TokenUsageLog.model, TokenUsageLog.provider, TokenUsageLog.session_id]
+    column_sortable_list = [
+        TokenUsageLog.id,
+        TokenUsageLog.provider,
+        TokenUsageLog.model,
+        TokenUsageLog.total_tokens,
+        TokenUsageLog.cost_usd,
+        TokenUsageLog.created_at,
+    ]
+    column_default_sort = [(TokenUsageLog.created_at, True)]
+    column_formatters = {
+        TokenUsageLog.cost_usd: lambda m, a: Markup(
+            f'<span class="badge bg-{"success" if (m.cost_usd or 0) < 0.01 else "warning" if (m.cost_usd or 0) < 0.10 else "danger"}">'
+            f'${m.cost_usd:.4f}</span>'
+        ) if m.cost_usd is not None else Markup('<span class="text-muted">N/A</span>'),
+        TokenUsageLog.total_tokens: lambda m, a: f"{m.total_tokens:,}",
+        TokenUsageLog.provider: lambda m, a: Markup(
+            f'<span class="badge bg-info">{m.provider}</span>'
+        ),
+    }
+    column_details_list = [
+        TokenUsageLog.id,
+        TokenUsageLog.provider,
+        TokenUsageLog.model,
+        TokenUsageLog.profile,
+        TokenUsageLog.input_tokens,
+        TokenUsageLog.output_tokens,
+        TokenUsageLog.total_tokens,
+        TokenUsageLog.cost_usd,
+        TokenUsageLog.project,
+        TokenUsageLog.session_id,
+        TokenUsageLog.request_type,
+        TokenUsageLog.endpoint,
+        TokenUsageLog.created_at,
+    ]
+    icon = "fa-solid fa-coins"
+    name = "Token Usage"
+    name_plural = "Token Usage"
+    
+    # Read-only - token logs shouldn't be manually created/edited
+    can_create = False
+    can_edit = False
+    can_delete = True  # Allow cleanup of old logs
+
+
 def setup_admin(app, engine):
     """
     Set up SQLAdmin with all model views.
@@ -940,5 +1068,6 @@ def setup_admin(app, engine):
     admin.add_view(ScanExecutionAdmin)
     admin.add_view(GraphAdmin)
     admin.add_view(HypothesisAdmin)
+    admin.add_view(TokenUsageAdmin)
     
     return admin

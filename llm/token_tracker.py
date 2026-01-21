@@ -1,9 +1,17 @@
 """Token usage tracking for LLM providers."""
 import json
+import os
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
+
+# Context variables for tracking request context
+_current_project_id: ContextVar[int | None] = ContextVar('current_project_id', default=None)
+_current_session_id: ContextVar[str | None] = ContextVar('current_session_id', default=None)
+_current_tenant_id: ContextVar[int | None] = ContextVar('current_tenant_id', default=None)
+_current_endpoint: ContextVar[str | None] = ContextVar('current_endpoint', default=None)
 
 
 @dataclass
@@ -81,6 +89,56 @@ class TokenTracker:
             # Save to file if configured
             if self._output_file:
                 self._save_to_file()
+            
+            # Save to database if DATABASE_URL is set
+            self._save_to_database(provider, model, input_tokens, output_tokens, profile)
+    
+    def _save_to_database(self, provider: str, model: str, input_tokens: int, output_tokens: int, profile: str | None):
+        """Save token usage to database (non-blocking)."""
+        database_url = os.environ.get("DATABASE_URL")
+        if not database_url:
+            return
+        
+        try:
+            # Import here to avoid circular dependency
+            from database.models import TokenUsageLog, calculate_cost, create_db_engine, create_db_session
+            
+            # Get context variables
+            project_id = _current_project_id.get()
+            session_id = _current_session_id.get()
+            tenant_id = _current_tenant_id.get()
+            endpoint = _current_endpoint.get()
+            
+            # Calculate cost
+            cost = calculate_cost(model, input_tokens, output_tokens)
+            
+            # Create log entry
+            engine = create_db_engine(database_url)
+            db = create_db_session(engine)
+            
+            try:
+                log_entry = TokenUsageLog(
+                    project_id=project_id,
+                    session_id=session_id,
+                    tenant_id=tenant_id,
+                    provider=provider,
+                    model=model,
+                    profile=profile,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
+                    cost_usd=cost,
+                    endpoint=endpoint,
+                )
+                db.add(log_entry)
+                db.commit()
+            finally:
+                db.close()
+                engine.dispose()
+        except Exception as e:
+            # Don't fail on database errors - just log to stderr
+            import sys
+            print(f"Warning: Failed to save token usage to database: {e}", file=sys.stderr)
     
     def _save_to_file(self):
         """Save current state to file (called within lock)."""
@@ -128,3 +186,29 @@ _token_tracker = TokenTracker()
 def get_token_tracker() -> TokenTracker:
     """Get the global token tracker instance."""
     return _token_tracker
+
+
+def set_token_context(project_id: int | None = None, session_id: str | None = None, 
+                     tenant_id: int | None = None, endpoint: str | None = None):
+    """
+    Set the context for token tracking.
+    
+    This should be called at the start of API requests to associate
+    token usage with specific projects, sessions, etc.
+    """
+    if project_id is not None:
+        _current_project_id.set(project_id)
+    if session_id is not None:
+        _current_session_id.set(session_id)
+    if tenant_id is not None:
+        _current_tenant_id.set(tenant_id)
+    if endpoint is not None:
+        _current_endpoint.set(endpoint)
+
+
+def clear_token_context():
+    """Clear the token tracking context."""
+    _current_project_id.set(None)
+    _current_session_id.set(None)
+    _current_tenant_id.set(None)
+    _current_endpoint.set(None)

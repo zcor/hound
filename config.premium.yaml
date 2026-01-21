@@ -1,0 +1,95 @@
+# Premium Configuration
+# High-quality config using the best models from each provider
+# Best accuracy and results, but significantly higher cost
+#
+# Usage:
+#   python hound.py project graph <project_id> --config config.premium.yaml
+#   python hound.py agent run <project_id> --config config.premium.yaml
+#
+# Cost comparison (per 1M tokens):
+#   This config: ~$5-15 per audit depending on complexity
+#   DeepSeek config: ~$0.10-0.50 per audit
+#
+# Use this for:
+#   - High-value audits where accuracy is critical
+#   - Final verification of findings
+#   - Complex codebases requiring advanced reasoning
+
+# API keys configuration
+openai:
+  api_key_env: OPENAI_API_KEY
+
+anthropic:
+  api_key_env: ANTHROPIC_API_KEY
+
+gemini:
+  api_key_env: GOOGLE_API_KEY
+
+# Model configuration - Premium providers
+models:
+  # Graph building - Gemini for large context
+  graph:
+    provider: gemini
+    model: gemini-2.5-pro
+    max_context: 1000000
+    thinking_enabled: true
+    thinking_budget: -1
+    
+  # Scout/agent - GPT-4o for exploration
+  scout:
+    provider: openai
+    model: gpt-4o
+    max_context: 128000
+    temperature: 0.2
+  
+  # Strategic thinking - Claude for reasoning
+  strategist:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_context: 200000
+    temperature: 0.1
+  
+  # Lightweight tasks - GPT-4o-mini for speed
+  lightweight:
+    provider: openai
+    model: gpt-4o-mini
+    max_context: 128000
+    temperature: 0.0
+  
+  # QA/finalize - GPT-5 for highest quality
+  finalize:
+    provider: openai
+    model: gpt-5
+    max_context: 128000
+    reasoning_effort: high
+  
+  # Reporting - GPT-4o
+  reporting:
+    provider: openai
+    model: gpt-4o
+    max_context: 128000
+    temperature: 0.3
+
+# Global context settings
+context:
+  max_tokens: 128000
+  compression_threshold: 0.75
+
+# Timeouts
+timeouts:
+  request_seconds: 300
+
+# Retries
+retries:
+  max_attempts: 3
+  backoff_min_seconds: 1
+  backoff_max_seconds: 2
+
+# Bundling settings
+bundling:
+  target_chars: 25000
+  max_bundle_chars: 40000
+
+# Logging
+logging:
+  llm_verbose: false

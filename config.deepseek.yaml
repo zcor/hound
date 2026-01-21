@@ -1,0 +1,91 @@
+# DeepSeek Configuration
+# Cost-effective config using DeepSeek for all LLM operations
+# ~95% cost savings compared to GPT-4/Claude
+#
+# Usage:
+#   python hound.py project graph <project_id> --config config.deepseek.yaml
+#   python hound.py agent run <project_id> --config config.deepseek.yaml
+#
+# Pricing (as of Jan 2026):
+#   deepseek-chat:     $0.14/M input, $0.28/M output
+#   deepseek-reasoner: $0.55/M input, $2.19/M output (for complex reasoning)
+#
+# Compare to:
+#   gpt-4o:    $2.50/M input, $10.00/M output
+#   claude-3:  $3.00/M input, $15.00/M output
+
+# API keys configuration
+deepseek:
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
+
+# Model configuration - ALL DeepSeek
+models:
+  # Graph building model
+  # Uses deepseek-chat for large context code analysis
+  graph:
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 64000
+    temperature: 0.0
+    
+  # Scout/agent model for exploration
+  scout:
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 64000
+    temperature: 0.2
+  
+  # Strategic thinking model
+  # For planning and reasoning about security issues
+  strategist:
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 64000
+    temperature: 0.1
+  
+  # Lightweight utility model for quick tasks
+  lightweight:
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 32000
+    temperature: 0.0
+  
+  # QA/finalize model
+  # Use deepseek-reasoner for higher quality final analysis
+  finalize:
+    provider: deepseek
+    model: deepseek-reasoner
+    max_context: 64000
+    reasoning_effort: high
+  
+  # Reporting model
+  reporting:
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 64000
+    temperature: 0.3
+
+# Global context settings
+context:
+  max_tokens: 64000
+  compression_threshold: 0.75
+
+# Timeouts - DeepSeek can be slower
+timeouts:
+  request_seconds: 180
+
+# Retries
+retries:
+  max_attempts: 3
+  backoff_min_seconds: 2
+  backoff_max_seconds: 8
+
+# Bundling settings (smaller bundles for DeepSeek's context)
+bundling:
+  target_chars: 20000
+  max_bundle_chars: 30000
+
+# Logging
+logging:
+  llm_verbose: false

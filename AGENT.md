@@ -315,6 +315,125 @@ proposed → investigating → confirmed/rejected/uncertain
 
 ## 🧪 Testing
 
+### SaaS Testing (Production Environment)
+
+**Always test on SaaS mode** - this is the production environment. CLI is for development only.
+
+#### Quick SaaS Test Workflow:
+```bash
+# 1. Start the server
+python -m uvicorn server.api:app --host 0.0.0.0 --port 8000
+
+# 2. Switch to DeepSeek config (95% cheaper for testing)
+curl -X POST "http://localhost:8000/config/profiles/deepseek/activate" -H "Content-Type: application/json"
+
+# 3. Create a project
+curl -X POST "http://localhost:8000/projects" -H "Content-Type: application/json" \
+  -d '{"name": "Test Project", "source_path": "/path/to/code", "description": "Testing"}'
+
+# 4. Build graphs (sync mode - no Celery needed)
+curl -X POST "http://localhost:8000/graphs/build-sync" -H "Content-Type: application/json" \
+  -d '{"project_id": 1, "num_graphs": 4}'
+
+# 5. Run audit (sync mode)
+curl -X POST "http://localhost:8000/audits/run-sync" -H "Content-Type: application/json" \
+  -d '{"project_id": 1, "max_investigations": 20}'
+
+# 6. Check results
+curl "http://localhost:8000/projects/1/graphs"
+curl "http://localhost:8000/sessions/{session_id}/findings"
+```
+
+#### Importing CLI Graphs to SaaS Database:
+If graphs were built via CLI (stored in `~/.hound/projects/`), import to database:
+```python
+# Quick import script
+import json, sqlite3
+from pathlib import Path
+from datetime import datetime, timezone
+
+conn = sqlite3.connect('hound.db')
+cursor = conn.cursor()
+cursor.execute('SELECT id FROM projects WHERE name = ?', ('ProjectName',))
+project_id = cursor.fetchone()[0]
+
+graphs_dir = Path.home() / '.hound/projects/ProjectName/graphs'
+for graph_file in graphs_dir.glob('graph_*.json'):
+    with open(graph_file) as f:
+        data = json.load(f)
+    name = data.get('name', graph_file.stem.replace('graph_', ''))
+    cursor.execute('''
+        INSERT INTO graphs (project_id, name, internal_name, data, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (project_id, name, name, json.dumps(data),
+          datetime.now(timezone.utc).isoformat(),
+          datetime.now(timezone.utc).isoformat()))
+conn.commit()
+```
+
+#### SaaS Endpoints (Sync vs Async):
+
+| Endpoint | Type | Use Case |
+|----------|------|----------|
+| `POST /graphs/build` | Async (Celery) | Production - scales to many customers |
+| `POST /audits/start` | Async (Celery) | Production - scales to many customers |
+| `POST /graphs/build-sync` | Sync (blocking) | Development/testing/single-tenant |
+| `POST /audits/run-sync` | Sync (blocking) | Development/testing/single-tenant |
+
+#### Config Profiles:
+- `default` - Standard models (OpenAI/Anthropic)
+- `deepseek` - DeepSeek models (~95% cheaper, good for testing)
+- `premium` - Best models (GPT-5, Claude Sonnet)
+
+Switch profiles via: `POST /config/profiles/{profile}/activate`
+
+#### Admin Dashboard:
+- Home: `http://localhost:8000/admin/home`
+- Projects: `http://localhost:8000/admin/project/list`
+- Project Dashboard: `http://localhost:8000/admin/dashboard/{project_id}`
+- Cost Tracking: `http://localhost:8000/admin/cost-dashboard`
+
+#### Testing Status (January 2026):
+- ✅ Server starts and health check works
+- ✅ Config profiles can be switched (DeepSeek, premium, default)
+- ✅ Graphs can be built via sync endpoint (takes 5-15 min)
+- ✅ Graphs can be imported from CLI to database
+- ✅ **Audit runs successfully via sync endpoint (AutonomousAgent)**
+- ✅ **Hypotheses are saved to database and returned via API**
+- ✅ **Admin dashboard shows project with graphs and findings**
+- ✅ Finding status can be updated (confirm/reject)
+- ✅ **Report generation works** (Markdown format, professional quality)
+- ✅ **PoC test scaffold generation works**
+
+### Successful Audit Results (Jan 21, 2026)
+
+SecretHippo DeFi project audit with DeepSeek found **5 security hypotheses**:
+1. **HIGH**: Missing access control on setUserBalance functions
+2. **MEDIUM**: Inconsistent total supply updates across contracts
+3. **HIGH**: Unprotected notifyReward calls from external contracts
+4. **HIGH**: Strategy harvester mapping can be manipulated by operator
+5. **MEDIUM**: Reward caller authorization bypass risk
+
+### Full SaaS API Reference
+
+| Endpoint | Method | Status | Description |
+|----------|--------|--------|-------------|
+| `/health` | GET | ✅ | Health check |
+| `/projects` | GET/POST | ✅ | List/create projects |
+| `/projects/{id}/hypotheses` | GET | ✅ | Get all findings for project |
+| `/projects/{id}/graphs` | GET | ✅ | Get graphs for project |
+| `/graphs/build-sync` | POST | ✅ | Build knowledge graphs (sync) |
+| `/audits/run-sync` | POST | ✅ | Run security audit (sync) |
+| `/sessions/{id}/findings` | GET | ✅ | Get confirmed findings |
+| `/sessions/{id}/report` | POST | ✅ | Generate audit report |
+| `/sessions/{id}/poc` | POST | ✅ | Generate PoC test scaffolds |
+| `/findings/{id}/status` | POST | ✅ | Update finding status |
+| `/config/profiles/{name}/activate` | POST | ✅ | Switch LLM profile |
+| `/admin/home` | GET | ✅ | Admin dashboard home |
+| `/admin/dashboard/{id}` | GET | ✅ | Project dashboard with graph viz |
+
+### CLI Testing (Development Only)
+
 Run tests with PostgreSQL:
 ```bash
 export DATABASE_URL="postgresql://hound:hound_secret@localhost:5432/hound"
@@ -358,10 +477,13 @@ When adding a new feature:
 
 ## 🐛 Known Issues / TODOs
 
-- [ ] PoC API endpoint not yet implemented (need to add to server/api.py)
-- [ ] Report generation endpoint not yet SaaS-ready
+- [x] ~~Hypothesis persistence in SaaS audit~~ - **FIXED**: Hypotheses now save to database
+- [x] ~~PoC generation endpoint~~ - **WORKING**: Generates defensive test scaffolds
+- [x] ~~Report generation endpoint~~ - **WORKING**: Generates professional Markdown reports
 - [ ] Webhook integration needs testing with live GitHub App
+- [ ] Graph building via API can be slow (5-15 min) - consider progress streaming
+- [ ] Add async Celery workers for production scale
 
 ---
 
-*Last updated: January 20, 2026*
+*Last updated: January 21, 2026 - SaaS fully working end-to-end!*

@@ -39,6 +39,10 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 import redis.asyncio as aioredis
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -174,6 +178,323 @@ from fastapi.responses import HTMLResponse
 # ============================================================================
 # INTERACTIVE ADMIN DASHBOARD PAGES
 # ============================================================================
+
+@app.get("/admin/home", response_class=HTMLResponse)
+def admin_home(db: Session = Depends(get_db)):
+    """
+    Admin home page with quick links to all features.
+    """
+    from sqlalchemy import func
+    from database.models import TokenUsageLog
+    
+    # Get quick stats
+    total_projects = db.query(func.count(Project.id)).scalar() or 0
+    total_scans = db.query(func.count(ScanExecution.id)).scalar() or 0
+    total_findings = db.query(func.count(Hypothesis.id)).scalar() or 0
+    
+    # Token stats (last 30 days)
+    since = datetime.now() - timedelta(days=30)
+    total_cost = db.query(func.sum(TokenUsageLog.cost_usd)).filter(
+        TokenUsageLog.created_at >= since
+    ).scalar() or 0
+    total_tokens = db.query(func.sum(TokenUsageLog.total_tokens)).filter(
+        TokenUsageLog.created_at >= since
+    ).scalar() or 0
+    
+    # Get active config profile
+    active_profile = _active_config_profile
+    config = get_active_config()
+    models = config.get("models", {})
+    
+    # Build model badges for display
+    profile_badges = {
+        "default": ("Default", "secondary"),
+        "deepseek": ("DeepSeek", "success"),
+        "premium": ("Premium", "warning"),
+        "example": ("Example", "info"),
+    }
+    badge_text, badge_color = profile_badges.get(active_profile, (active_profile, "secondary"))
+    
+    # Get primary model for display
+    primary_model = "Not configured"
+    if models:
+        first_profile = list(models.values())[0]
+        provider = first_profile.get("provider", "?")
+        model = first_profile.get("model", "?")
+        primary_model = f"{provider}/{model}"
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Hound Admin - Home</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+        <style>
+            body {{ background: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}
+            .header {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 40px 30px;
+                margin-bottom: 30px;
+            }}
+            .stat-card {{
+                background: white;
+                border-radius: 12px;
+                padding: 25px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                text-align: center;
+                transition: transform 0.2s;
+            }}
+            .stat-card:hover {{ transform: translateY(-5px); }}
+            .stat-value {{ font-size: 36px; font-weight: bold; color: #667eea; }}
+            .stat-label {{ color: #666; font-size: 14px; margin-top: 5px; }}
+            .link-card {{
+                background: white;
+                border-radius: 12px;
+                padding: 25px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                text-decoration: none;
+                color: inherit;
+                display: block;
+                transition: all 0.2s;
+            }}
+            .link-card:hover {{ 
+                transform: translateY(-5px); 
+                box-shadow: 0 8px 20px rgba(0,0,0,0.15);
+                color: inherit;
+            }}
+            .link-icon {{
+                font-size: 40px;
+                margin-bottom: 15px;
+                color: #667eea;
+            }}
+            .link-title {{ font-size: 18px; font-weight: 600; margin-bottom: 8px; }}
+            .link-desc {{ color: #666; font-size: 14px; }}
+            .section-title {{ 
+                font-size: 20px; 
+                font-weight: 600; 
+                margin: 30px 0 20px 0;
+                color: #333;
+            }}
+            .config-selector {{
+                background: rgba(255,255,255,0.15);
+                border-radius: 8px;
+                padding: 15px 20px;
+                margin-top: 20px;
+                display: flex;
+                align-items: center;
+                gap: 15px;
+            }}
+            .config-selector select {{
+                padding: 8px 15px;
+                border-radius: 6px;
+                border: none;
+                font-size: 14px;
+                min-width: 200px;
+            }}
+            .config-selector .model-info {{
+                opacity: 0.9;
+                font-size: 13px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div class="container">
+                <h1><i class="fas fa-shield-dog"></i> Hound Admin</h1>
+                <p style="opacity: 0.9; margin: 0;">Security Analysis Platform Dashboard</p>
+                
+                <div class="config-selector">
+                    <label style="font-weight: 500;"><i class="fas fa-cog"></i> LLM Config:</label>
+                    <select id="configProfile" onchange="switchConfig(this.value)">
+                        <option value="default" {"selected" if active_profile == "default" else ""}>Default</option>
+                        <option value="deepseek" {"selected" if active_profile == "deepseek" else ""}>🚀 DeepSeek (95% cheaper)</option>
+                        <option value="premium" {"selected" if active_profile == "premium" else ""}>⭐ Premium (best quality)</option>
+                    </select>
+                    <span class="model-info">Primary model: <strong>{primary_model}</strong></span>
+                    <span class="badge bg-{badge_color}">{badge_text}</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="container">
+            <!-- Quick Stats -->
+            <div class="row g-4 mb-4">
+                <div class="col-md-3">
+                    <div class="stat-card">
+                        <div class="stat-value">{total_projects}</div>
+                        <div class="stat-label">Projects</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="stat-card">
+                        <div class="stat-value">{total_scans}</div>
+                        <div class="stat-label">Surface Scans</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="stat-card">
+                        <div class="stat-value">{total_findings}</div>
+                        <div class="stat-label">Findings</div>
+                    </div>
+                </div>
+                <div class="col-md-3">
+                    <div class="stat-card">
+                        <div class="stat-value" style="color: #28a745;">${total_cost:.2f}</div>
+                        <div class="stat-label">LLM Cost (30d)</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Cost & Analytics -->
+            <div class="section-title"><i class="fas fa-chart-line"></i> Cost & Analytics</div>
+            <div class="row g-4 mb-4">
+                <div class="col-md-4">
+                    <a href="/admin/cost-dashboard" class="link-card">
+                        <div class="link-icon"><i class="fas fa-coins"></i></div>
+                        <div class="link-title">Cost Dashboard</div>
+                        <div class="link-desc">View LLM token usage and costs. Track spending by model, project, and profile.</div>
+                    </a>
+                </div>
+                <div class="col-md-4">
+                    <a href="/admin/token-usage-log/list" class="link-card">
+                        <div class="link-icon"><i class="fas fa-list-alt"></i></div>
+                        <div class="link-title">Token Usage Logs</div>
+                        <div class="link-desc">Browse detailed logs of every LLM API call with token counts and costs.</div>
+                    </a>
+                </div>
+                <div class="col-md-4">
+                    <a href="/admin/token-stats" class="link-card">
+                        <div class="link-icon"><i class="fas fa-chart-bar"></i></div>
+                        <div class="link-title">Stats API (JSON)</div>
+                        <div class="link-desc">Raw statistics endpoint for building custom dashboards and integrations.</div>
+                    </a>
+                </div>
+            </div>
+            
+            <!-- Lead Generation -->
+            <div class="section-title"><i class="fas fa-magnet"></i> Lead Generation</div>
+            <div class="row g-4 mb-4">
+                <div class="col-md-4">
+                    <a href="/admin/scan-execution/list" class="link-card">
+                        <div class="link-icon"><i class="fas fa-radar"></i></div>
+                        <div class="link-title">Surface Scans</div>
+                        <div class="link-desc">Manage lightweight security scans. Run scans, view findings, convert to projects.</div>
+                    </a>
+                </div>
+                <div class="col-md-4">
+                    <a href="/admin/scan-execution/create" class="link-card">
+                        <div class="link-icon"><i class="fas fa-plus-circle"></i></div>
+                        <div class="link-title">New Scan</div>
+                        <div class="link-desc">Start a new surface scan by entering a GitHub repository URL.</div>
+                    </a>
+                </div>
+                <div class="col-md-4">
+                    <a href="/surface/stats" class="link-card">
+                        <div class="link-icon"><i class="fas fa-chart-pie"></i></div>
+                        <div class="link-title">Scan Statistics</div>
+                        <div class="link-desc">View scan analytics: risk levels, completion rates, recent activity.</div>
+                    </a>
+                </div>
+            </div>
+            
+            <!-- Audit Management -->
+            <div class="section-title"><i class="fas fa-shield-alt"></i> Audit Management</div>
+            <div class="row g-4 mb-4">
+                <div class="col-md-3">
+                    <a href="/admin/project/list" class="link-card">
+                        <div class="link-icon"><i class="fas fa-code-branch"></i></div>
+                        <div class="link-title">Projects</div>
+                        <div class="link-desc">Manage audit projects, build graphs, run audits.</div>
+                    </a>
+                </div>
+                <div class="col-md-3">
+                    <a href="/admin/audit-session/list" class="link-card">
+                        <div class="link-icon"><i class="fas fa-search"></i></div>
+                        <div class="link-title">Audit Sessions</div>
+                        <div class="link-desc">View running and completed audit sessions.</div>
+                    </a>
+                </div>
+                <div class="col-md-3">
+                    <a href="/admin/hypothesis/list" class="link-card">
+                        <div class="link-icon"><i class="fas fa-lightbulb"></i></div>
+                        <div class="link-title">Findings</div>
+                        <div class="link-desc">Review vulnerability findings, confirm or reject.</div>
+                    </a>
+                </div>
+                <div class="col-md-3">
+                    <a href="/admin/graph/list" class="link-card">
+                        <div class="link-icon"><i class="fas fa-project-diagram"></i></div>
+                        <div class="link-title">Knowledge Graphs</div>
+                        <div class="link-desc">Browse code knowledge graphs built for analysis.</div>
+                    </a>
+                </div>
+            </div>
+            
+            <!-- System -->
+            <div class="section-title"><i class="fas fa-cog"></i> System</div>
+            <div class="row g-4 mb-5">
+                <div class="col-md-4">
+                    <a href="/admin/tenant/list" class="link-card">
+                        <div class="link-icon"><i class="fas fa-building"></i></div>
+                        <div class="link-title">Tenants</div>
+                        <div class="link-desc">Manage multi-tenant organizations and GitHub installations.</div>
+                    </a>
+                </div>
+                <div class="col-md-4">
+                    <a href="/health" class="link-card">
+                        <div class="link-icon"><i class="fas fa-heartbeat"></i></div>
+                        <div class="link-title">Health Check</div>
+                        <div class="link-desc">API health status and system information.</div>
+                    </a>
+                </div>
+                <div class="col-md-4">
+                    <a href="/docs" class="link-card">
+                        <div class="link-icon"><i class="fas fa-book"></i></div>
+                        <div class="link-title">API Documentation</div>
+                        <div class="link-desc">Interactive Swagger/OpenAPI documentation for all endpoints.</div>
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+        <script>
+            async function switchConfig(profileId) {{
+                try {{
+                    const response = await fetch(`/config/profiles/${{profileId}}/activate`, {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'application/json' }}
+                    }});
+                    
+                    if (response.ok) {{
+                        const data = await response.json();
+                        // Show success toast
+                        const toast = document.createElement('div');
+                        toast.className = 'alert alert-success position-fixed';
+                        toast.style.cssText = 'top: 20px; right: 20px; z-index: 9999; min-width: 300px;';
+                        toast.innerHTML = `<strong>✅ Config Switched!</strong><br>Now using: ${{profileId}}`;
+                        document.body.appendChild(toast);
+                        setTimeout(() => toast.remove(), 3000);
+                        
+                        // Reload to update the page
+                        setTimeout(() => location.reload(), 1000);
+                    }} else {{
+                        const err = await response.json();
+                        alert('Failed to switch config: ' + err.detail);
+                    }}
+                }} catch (e) {{
+                    alert('Error switching config: ' + e.message);
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html)
+
 
 @app.get("/admin/dashboard/{project_id}", response_class=HTMLResponse)
 async def admin_project_dashboard(project_id: int, request: Request, db: Session = Depends(get_db)):
@@ -2154,7 +2475,7 @@ class FindingResponse(BaseModel):
     confidence: float
     severity: str
     node_refs: Optional[List[str]]
-    evidence: Optional[Dict[str, Any]]
+    evidence: Optional[Any] = None  # Can be dict or list
     reported_by_model: Optional[str]
     junior_model: Optional[str]
     senior_model: Optional[str]
@@ -2448,6 +2769,496 @@ async def get_graph(graph_id: int, db: Session = Depends(get_db)):
         "created_at": graph.created_at.isoformat(),
         "updated_at": graph.updated_at.isoformat(),
     }
+
+
+# ============================================================================
+# SYNCHRONOUS GRAPH BUILDING AND AUDIT - FOR SAAS WITHOUT CELERY
+# ============================================================================
+
+class SyncGraphBuildRequest(BaseModel):
+    """Request model for synchronous graph building."""
+    project_id: int = Field(..., description="Project ID to build graphs for")
+    num_graphs: int = Field(4, description="Number of graphs to build (1-10)")
+    init_only: bool = Field(False, description="Only build SystemArchitecture graph (faster)")
+    max_iterations: int = Field(3, description="Max refinement iterations per graph")
+
+
+class SyncGraphBuildResponse(BaseModel):
+    """Response model for synchronous graph build."""
+    success: bool
+    message: str
+    graphs_built: int
+    graphs: List[Dict[str, Any]]
+    total_nodes: int
+    total_edges: int
+    duration_seconds: float
+
+
+@app.post("/graphs/build-sync", response_model=SyncGraphBuildResponse)
+async def build_graphs_sync(request: SyncGraphBuildRequest, db: Session = Depends(get_db)):
+    """
+    Build knowledge graphs SYNCHRONOUSLY (blocking call).
+    
+    This is the simple SaaS-friendly version that doesn't require Celery/Redis.
+    Use this for single-tenant setups or when you want immediate results.
+    
+    The graphs are saved directly to the database for viewing in the admin panel.
+    
+    Example:
+        POST /graphs/build-sync
+        {
+            "project_id": 1,
+            "num_graphs": 4,
+            "init_only": false
+        }
+    
+    Returns when complete (may take 1-10 minutes depending on codebase size).
+    """
+    import time
+    import tempfile
+    from pathlib import Path
+    
+    start_time = time.time()
+    
+    # Get project
+    project = db.query(Project).filter(Project.id == request.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+    
+    # Determine source path
+    source_path = project.source_path
+    if not source_path:
+        if project.git_url:
+            # Clone to temp directory
+            import subprocess
+            temp_dir = tempfile.mkdtemp(prefix="hound_")
+            source_path = temp_dir
+            logger.info(f"Cloning {project.git_url} to {temp_dir}")
+            result = subprocess.run(
+                ["git", "clone", "--depth", "1", project.git_url, temp_dir],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                raise HTTPException(status_code=500, detail=f"Git clone failed: {result.stderr}")
+        else:
+            raise HTTPException(status_code=400, detail="Project has no source_path or git_url")
+    
+    source_path = Path(source_path)
+    if not source_path.exists():
+        raise HTTPException(status_code=400, detail=f"Source path does not exist: {source_path}")
+    
+    logger.info(f"Building graphs for project {project.id} ({project.name}) from {source_path}")
+    
+    try:
+        # Load config (using active config profile)
+        config = get_active_config()
+        
+        # Create manifest using RepositoryManifest class
+        from ingest.manifest import RepositoryManifest
+        from ingest.bundles import AdaptiveBundler
+        
+        with tempfile.TemporaryDirectory(prefix="hound_manifest_") as manifest_dir:
+            manifest_path = Path(manifest_dir)
+            
+            # Create manifest
+            logger.info("Creating manifest...")
+            manifest = RepositoryManifest(str(source_path), config, file_filter=None)
+            cards, files = manifest.walk_repository()
+            manifest.save_manifest(manifest_path)
+            logger.info(f"Ingested {len(files)} files → {len(cards)} cards")
+            
+            # Create bundles (cards)
+            logger.info("Creating code bundles...")
+            bundler = AdaptiveBundler(cards, files, config)
+            bundles = bundler.create_bundles()
+            bundler.save_bundles(manifest_path)
+            logger.info(f"Created {len(bundles)} bundles")
+            
+            # Build graphs
+            logger.info(f"Building {request.num_graphs if not request.init_only else 1} graphs...")
+            from analysis.graph_builder import GraphBuilder
+            
+            builder = GraphBuilder(config, debug=False)
+            
+            # Determine number of graphs
+            num_graphs = 1 if request.init_only else request.num_graphs
+            
+            # Build graphs - note: repo_root is not a param, it's read from manifest
+            results = builder.build(
+                manifest_dir=manifest_path,
+                output_dir=manifest_path / "graphs",
+                max_iterations=request.max_iterations,
+                max_graphs=num_graphs,
+            )
+            
+            # Save graphs to database
+            graphs_created = []
+            total_nodes = 0
+            total_edges = 0
+            
+            for graph_name, graph in builder.graphs.items():
+                graph_data = graph.to_dict()
+                
+                # Check if graph already exists for this project
+                existing = db.query(Graph).filter(
+                    Graph.project_id == project.id,
+                    Graph.name == graph_name
+                ).first()
+                
+                if existing:
+                    # Update existing graph
+                    existing.data = graph_data
+                    existing.updated_at = datetime.now(timezone.utc)
+                    db_graph = existing
+                else:
+                    # Create new graph
+                    db_graph = Graph(
+                        project_id=project.id,
+                        name=graph_name,
+                        internal_name=graph_data.get("internal_name", graph_name),
+                        data=graph_data,
+                    )
+                    db.add(db_graph)
+                
+                db.commit()
+                db.refresh(db_graph)
+                
+                node_count = len(graph_data.get("nodes", []))
+                edge_count = len(graph_data.get("edges", []))
+                total_nodes += node_count
+                total_edges += edge_count
+                
+                graphs_created.append({
+                    "id": db_graph.id,
+                    "name": graph_name,
+                    "node_count": node_count,
+                    "edge_count": edge_count,
+                })
+                
+                logger.info(f"Saved graph '{graph_name}': {node_count} nodes, {edge_count} edges")
+            
+            duration = time.time() - start_time
+            
+            return SyncGraphBuildResponse(
+                success=True,
+                message=f"Built {len(graphs_created)} graphs for project '{project.name}'",
+                graphs_built=len(graphs_created),
+                graphs=graphs_created,
+                total_nodes=total_nodes,
+                total_edges=total_edges,
+                duration_seconds=round(duration, 2),
+            )
+            
+    except Exception as e:
+        logger.exception(f"Graph build failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Graph build failed: {str(e)}")
+
+
+class SyncAuditRequest(BaseModel):
+    """Request model for synchronous audit execution."""
+    project_id: int = Field(..., description="Project ID to audit")
+    max_investigations: int = Field(20, description="Maximum investigations (1-100)")
+    time_limit_minutes: int = Field(30, description="Time limit in minutes (1-120)")
+
+
+class SyncAuditResponse(BaseModel):
+    """Response model for synchronous audit."""
+    success: bool
+    message: str
+    session_id: str
+    hypotheses_found: int
+    confirmed_count: int
+    findings: List[Dict[str, Any]]
+    duration_seconds: float
+
+
+@app.post("/audits/run-sync", response_model=SyncAuditResponse)
+async def run_audit_sync(request: SyncAuditRequest, db: Session = Depends(get_db)):
+    """
+    Run a security audit SYNCHRONOUSLY (blocking call).
+    
+    This is the simple SaaS-friendly version that doesn't require Celery/Redis.
+    Requires graphs to be built first via /graphs/build-sync.
+    
+    The audit results (hypotheses) are saved directly to the database.
+    
+    Example:
+        POST /audits/run-sync
+        {
+            "project_id": 1,
+            "max_investigations": 20,
+            "time_limit_minutes": 30
+        }
+    
+    Returns when complete (may take 5-60 minutes depending on settings).
+    """
+    import time
+    import tempfile
+    from pathlib import Path
+    
+    start_time = time.time()
+    
+    # Get project
+    project = db.query(Project).filter(Project.id == request.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project {request.project_id} not found")
+    
+    # Check if project has graphs
+    graphs = db.query(Graph).filter(Graph.project_id == request.project_id).all()
+    if not graphs:
+        raise HTTPException(
+            status_code=400, 
+            detail="No graphs found for this project. Build graphs first using /graphs/build-sync"
+        )
+    
+    logger.info(f"Starting audit for project {project.id} ({project.name}) with {len(graphs)} graphs")
+    
+    # Generate session ID
+    session_id = f"audit_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
+    
+    # Create audit session record
+    audit_session = AuditSession(
+        session_id=session_id,
+        project_id=project.id,
+        status="running",
+        start_time=datetime.now(timezone.utc),
+        models={"trigger": "api_sync"},
+    )
+    db.add(audit_session)
+    db.commit()
+    
+    try:
+        # Load config
+        config = get_active_config()
+        
+        # Determine source path
+        source_path = project.source_path
+        if not source_path or not Path(source_path).exists():
+            if project.git_url:
+                import subprocess
+                temp_dir = tempfile.mkdtemp(prefix="hound_audit_")
+                source_path = temp_dir
+                subprocess.run(
+                    ["git", "clone", "--depth", "1", project.git_url, temp_dir],
+                    capture_output=True, text=True, timeout=300
+                )
+            else:
+                raise HTTPException(status_code=400, detail="Project source not available")
+        
+        source_path = Path(source_path)
+        
+        # Create temporary directory for audit artifacts
+        with tempfile.TemporaryDirectory(prefix="hound_audit_") as temp_dir:
+            temp_path = Path(temp_dir)
+            graphs_dir = temp_path / "graphs"
+            graphs_dir.mkdir()
+            manifest_dir = temp_path / "manifest"
+            manifest_dir.mkdir()
+            
+            # Write graphs to temp files (agent expects filesystem graphs)
+            graphs_paths = {}
+            for graph in graphs:
+                graph_file = graphs_dir / f"graph_{graph.name}.json"
+                import json
+                with open(graph_file, "w") as f:
+                    json.dump(graph.data, f, indent=2)
+                # Build path entry for metadata (relative to graphs dir)
+                graphs_paths[graph.name] = str(graph_file)
+            
+            # Write graphs metadata file in the format agent expects
+            # Format: {"graphs": {"GraphName": "/path/to/graph.json"}}
+            graphs_metadata_file = graphs_dir / "graphs_metadata.json"
+            with open(graphs_metadata_file, "w") as f:
+                json.dump({"graphs": graphs_paths}, f, indent=2)
+            
+            # Create manifest with source files (needed for code lookup)
+            # First, try to load existing manifest from CLI if available
+            cli_manifest_path = Path.home() / ".hound" / "projects" / project.name / "manifest" / "manifest.json"
+            cli_cards_path = Path.home() / ".hound" / "projects" / project.name / "manifest" / "cards.json"
+            
+            manifest_data = {"repo_path": str(source_path), "num_files": 0, "files": []}
+            cards_data = []
+            
+            if cli_manifest_path.exists():
+                try:
+                    with open(cli_manifest_path) as f:
+                        manifest_data = json.load(f)
+                    logger.info(f"Loaded existing manifest with {manifest_data.get('num_files', 0)} files")
+                except Exception as e:
+                    logger.warning(f"Failed to load CLI manifest: {e}")
+            
+            if cli_cards_path.exists():
+                try:
+                    with open(cli_cards_path) as f:
+                        cards_data = json.load(f)
+                    logger.info(f"Loaded {len(cards_data)} cards from CLI")
+                except Exception as e:
+                    logger.warning(f"Failed to load CLI cards: {e}")
+            
+            # Write manifest files
+            manifest_file = manifest_dir / "manifest.json"
+            with open(manifest_file, "w") as f:
+                json.dump(manifest_data, f, indent=2)
+            
+            cards_file = manifest_dir / "cards.json"
+            with open(cards_file, "w") as f:
+                json.dump(cards_data, f, indent=2)
+            
+            logger.info(f"Prepared {len(graphs)} graphs in {graphs_dir}")
+            
+            # Run the agent
+            from analysis.agent_core import AutonomousAgent
+            
+            # Calculate token budget - be generous for sync mode (no Celery overhead)
+            # Use 500K tokens as default, or unlimited if time_limit is high
+            token_budget = max(500000, request.time_limit_minutes * 60 * 500)
+            
+            agent = AutonomousAgent(
+                graphs_metadata_path=graphs_metadata_file,
+                manifest_path=manifest_dir,
+                agent_id=session_id,
+                config=config,
+                debug=False,
+                session_id=session_id,
+                budget_limit=token_budget,
+                budget_type='tokens',
+            )
+            
+            # Create investigation prompt
+            investigation_prompt = f"""Perform a comprehensive security audit of this codebase.
+Focus on identifying:
+1. Critical vulnerabilities (reentrancy, access control, overflow)
+2. Logic bugs and edge cases
+3. Economic exploits (flash loans, price manipulation)
+4. Integration risks
+
+Analyze the loaded graphs systematically and form hypotheses for any potential issues."""
+
+            # Run investigation
+            results = agent.investigate(
+                prompt=investigation_prompt,
+                max_iterations=request.max_investigations,
+            )
+            
+            # Get hypotheses from the agent's hypothesis store
+            hypotheses = agent.hypothesis_store.list_all()
+            
+            # Save hypotheses to database
+            hypotheses_saved = []
+            confirmed_count = 0
+            
+            for hyp in hypotheses:
+                # Create unique hypothesis ID
+                hyp_id = hyp.get("id") or f"hyp_{uuid.uuid4().hex[:12]}"
+                
+                # Check if already exists
+                existing = db.query(Hypothesis).filter(
+                    Hypothesis.hypothesis_id == hyp_id
+                ).first()
+                
+                if existing:
+                    continue
+                
+                db_hyp = Hypothesis(
+                    project_id=project.id,
+                    hypothesis_id=hyp_id,
+                    title=hyp.get("title", "Untitled"),
+                    description=hyp.get("description", ""),
+                    vulnerability_type=hyp.get("vulnerability_type", "unknown"),
+                    status=hyp.get("status", "proposed"),
+                    confidence=hyp.get("confidence", 0.5),
+                    severity=hyp.get("severity", "medium"),
+                    node_refs=hyp.get("node_refs", []),
+                    evidence=hyp.get("evidence", {}),
+                    reported_by_model=hyp.get("reported_by_model"),
+                )
+                db.add(db_hyp)
+                db.commit()
+                db.refresh(db_hyp)
+                
+                if db_hyp.status == "confirmed":
+                    confirmed_count += 1
+                
+                hypotheses_saved.append({
+                    "id": db_hyp.id,
+                    "hypothesis_id": db_hyp.hypothesis_id,
+                    "title": db_hyp.title,
+                    "severity": db_hyp.severity,
+                    "confidence": db_hyp.confidence,
+                    "status": db_hyp.status,
+                })
+            
+            # Update session status
+            audit_session.status = "completed"
+            audit_session.end_time = datetime.now(timezone.utc)
+            db.commit()
+            
+            duration = time.time() - start_time
+            
+            return SyncAuditResponse(
+                success=True,
+                message=f"Audit completed for project '{project.name}'",
+                session_id=session_id,
+                hypotheses_found=len(hypotheses_saved),
+                confirmed_count=confirmed_count,
+                findings=hypotheses_saved,
+                duration_seconds=round(duration, 2),
+            )
+            
+    except Exception as e:
+        logger.exception(f"Audit failed: {e}")
+        
+        # Try to capture any hypotheses that were formed before the error
+        hypotheses_saved = []
+        try:
+            if 'agent' in locals() and hasattr(agent, 'hypothesis_store'):
+                hypotheses = agent.hypothesis_store.list_all()
+                logger.info(f"Captured {len(hypotheses)} hypotheses despite error")
+                
+                for hyp in hypotheses:
+                    hyp_id = hyp.get("id") or f"hyp_{uuid.uuid4().hex[:12]}"
+                    existing = db.query(Hypothesis).filter(Hypothesis.hypothesis_id == hyp_id).first()
+                    if existing:
+                        continue
+                    
+                    db_hyp = Hypothesis(
+                        project_id=project.id,
+                        hypothesis_id=hyp_id,
+                        title=hyp.get("title", "Untitled"),
+                        description=hyp.get("description", ""),
+                        vulnerability_type=hyp.get("vulnerability_type", "unknown"),
+                        status=hyp.get("status", "proposed"),
+                        confidence=hyp.get("confidence", 0.5),
+                        severity=hyp.get("severity", "medium"),
+                        node_refs=hyp.get("node_refs", []),
+                        evidence=hyp.get("evidence", {}),
+                        reported_by_model=hyp.get("reported_by_model"),
+                    )
+                    db.add(db_hyp)
+                    db.commit()
+                    hypotheses_saved.append({"id": db_hyp.id, "title": db_hyp.title})
+        except Exception as capture_err:
+            logger.warning(f"Failed to capture hypotheses on error: {capture_err}")
+        
+        # Update session status
+        audit_session.status = "failed" if not hypotheses_saved else "partial"
+        audit_session.end_time = datetime.now(timezone.utc)
+        db.commit()
+        
+        # If we captured hypotheses, return a partial success
+        if hypotheses_saved:
+            duration = time.time() - start_time
+            return SyncAuditResponse(
+                success=True,
+                message=f"Audit partially completed (budget exceeded) for project '{project.name}' - captured {len(hypotheses_saved)} findings",
+                session_id=session_id,
+                hypotheses_found=len(hypotheses_saved),
+                confirmed_count=0,
+                findings=hypotheses_saved,
+                duration_seconds=round(duration, 2),
+            )
+        
+        raise HTTPException(status_code=500, detail=f"Audit failed: {str(e)}")
 
 
 # ============================================================================
@@ -2869,6 +3680,56 @@ async def get_session_graph(session_id: str, db: Session = Depends(get_db)):
             raise HTTPException(status_code=500, detail=f"Failed to load graph: {str(e)}")
 
     raise HTTPException(status_code=404, detail="System graph not found")
+
+
+@app.get("/projects/{project_id}/hypotheses", response_model=List[FindingResponse])
+async def get_project_hypotheses(
+    project_id: int, 
+    status: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Return all hypotheses for a project, optionally filtered by status.
+    
+    Query params:
+        - status: Filter by status (proposed, investigating, confirmed, rejected, resolved)
+    """
+    # Verify project exists
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    # Build query
+    query = db.query(Hypothesis).filter(Hypothesis.project_id == project_id)
+    
+    if status:
+        query = query.filter(Hypothesis.status == status)
+    
+    hypotheses = query.order_by(Hypothesis.created_at.desc()).all()
+    
+    response = []
+    for hypothesis in hypotheses:
+        response.append(
+            FindingResponse(
+                id=hypothesis.id,
+                hypothesis_id=hypothesis.hypothesis_id,
+                title=hypothesis.title,
+                description=hypothesis.description,
+                vulnerability_type=hypothesis.vulnerability_type,
+                status=hypothesis.status,
+                confidence=hypothesis.confidence,
+                severity=hypothesis.severity,
+                node_refs=hypothesis.node_refs,
+                evidence=hypothesis.evidence,
+                reported_by_model=hypothesis.reported_by_model,
+                junior_model=hypothesis.junior_model,
+                senior_model=hypothesis.senior_model,
+                created_at=hypothesis.created_at,
+                updated_at=hypothesis.updated_at,
+            )
+        )
+    
+    return response
 
 
 @app.get("/sessions/{session_id}/findings", response_model=List[FindingResponse])
@@ -3963,13 +4824,9 @@ async def run_surface_scan(
     Time: ~2-10 seconds depending on repo size
     """
     from analysis.surface import SurfaceScanner
-    from utils.config_loader import load_config
     
-    # Load config
-    try:
-        config = load_config()
-    except Exception:
-        config = {}
+    # Load active config profile
+    config = get_active_config()
     
     # Initialize scanner
     scanner = SurfaceScanner(
@@ -4248,6 +5105,360 @@ async def get_surface_scan_stats(
         "by_risk_level": {r[0]: r[1] for r in risk_counts if r[0]},
         "by_status": {s[0]: s[1] for s in status_counts if s[0]},
     }
+
+
+# ============================================================================
+# Token Usage & Cost Tracking Endpoints
+# ============================================================================
+
+@app.get("/admin/token-stats")
+async def get_token_usage_stats(
+    project_id: int | None = Query(None, description="Filter by project ID"),
+    days: int = Query(30, description="Number of days to look back"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get token usage and cost statistics for the admin dashboard.
+    
+    Returns aggregated statistics by model, provider, profile, and project.
+    """
+    from sqlalchemy import func
+    from database.models import TokenUsageLog
+    
+    # Date filter
+    since = datetime.now() - timedelta(days=days)
+    
+    # Base query
+    query = db.query(TokenUsageLog).filter(TokenUsageLog.created_at >= since)
+    if project_id:
+        query = query.filter(TokenUsageLog.project_id == project_id)
+    
+    # Total stats
+    total_tokens = db.query(func.sum(TokenUsageLog.total_tokens)).filter(
+        TokenUsageLog.created_at >= since
+    )
+    if project_id:
+        total_tokens = total_tokens.filter(TokenUsageLog.project_id == project_id)
+    total_tokens = total_tokens.scalar() or 0
+    
+    total_cost = db.query(func.sum(TokenUsageLog.cost_usd)).filter(
+        TokenUsageLog.created_at >= since
+    )
+    if project_id:
+        total_cost = total_cost.filter(TokenUsageLog.project_id == project_id)
+    total_cost = total_cost.scalar() or 0
+    
+    total_calls = db.query(func.count(TokenUsageLog.id)).filter(
+        TokenUsageLog.created_at >= since
+    )
+    if project_id:
+        total_calls = total_calls.filter(TokenUsageLog.project_id == project_id)
+    total_calls = total_calls.scalar() or 0
+    
+    # By model
+    by_model_query = db.query(
+        TokenUsageLog.model,
+        func.sum(TokenUsageLog.total_tokens).label('tokens'),
+        func.sum(TokenUsageLog.cost_usd).label('cost'),
+        func.count(TokenUsageLog.id).label('calls')
+    ).filter(TokenUsageLog.created_at >= since)
+    
+    if project_id:
+        by_model_query = by_model_query.filter(TokenUsageLog.project_id == project_id)
+    
+    by_model = by_model_query.group_by(TokenUsageLog.model).all()
+    
+    # By provider
+    by_provider_query = db.query(
+        TokenUsageLog.provider,
+        func.sum(TokenUsageLog.total_tokens).label('tokens'),
+        func.sum(TokenUsageLog.cost_usd).label('cost'),
+        func.count(TokenUsageLog.id).label('calls')
+    ).filter(TokenUsageLog.created_at >= since)
+    
+    if project_id:
+        by_provider_query = by_provider_query.filter(TokenUsageLog.project_id == project_id)
+    
+    by_provider = by_provider_query.group_by(TokenUsageLog.provider).all()
+    
+    # By profile
+    by_profile_query = db.query(
+        TokenUsageLog.profile,
+        func.sum(TokenUsageLog.total_tokens).label('tokens'),
+        func.sum(TokenUsageLog.cost_usd).label('cost'),
+        func.count(TokenUsageLog.id).label('calls')
+    ).filter(TokenUsageLog.created_at >= since, TokenUsageLog.profile.isnot(None))
+    
+    if project_id:
+        by_profile_query = by_profile_query.filter(TokenUsageLog.project_id == project_id)
+    
+    by_profile = by_profile_query.group_by(TokenUsageLog.profile).all()
+    
+    # By project (top 10)
+    by_project_query = db.query(
+        TokenUsageLog.project_id,
+        Project.name,
+        func.sum(TokenUsageLog.total_tokens).label('tokens'),
+        func.sum(TokenUsageLog.cost_usd).label('cost'),
+        func.count(TokenUsageLog.id).label('calls')
+    ).join(Project, TokenUsageLog.project_id == Project.id, isouter=True)\
+     .filter(TokenUsageLog.created_at >= since, TokenUsageLog.project_id.isnot(None))
+    
+    if project_id:
+        by_project_query = by_project_query.filter(TokenUsageLog.project_id == project_id)
+    
+    by_project = by_project_query.group_by(TokenUsageLog.project_id, Project.name)\
+                                 .order_by(func.sum(TokenUsageLog.cost_usd).desc())\
+                                 .limit(10).all()
+    
+    # Daily trend (last N days)
+    daily_query = db.query(
+        func.date_trunc('day', TokenUsageLog.created_at).label('day'),
+        func.sum(TokenUsageLog.total_tokens).label('tokens'),
+        func.sum(TokenUsageLog.cost_usd).label('cost'),
+        func.count(TokenUsageLog.id).label('calls')
+    ).filter(TokenUsageLog.created_at >= since)
+    
+    if project_id:
+        daily_query = daily_query.filter(TokenUsageLog.project_id == project_id)
+    
+    daily = daily_query.group_by('day').order_by('day').all()
+    
+    return {
+        "period_days": days,
+        "project_id": project_id,
+        "totals": {
+            "tokens": int(total_tokens),
+            "cost_usd": round(float(total_cost), 4),
+            "calls": int(total_calls),
+            "avg_cost_per_call": round(float(total_cost) / max(total_calls, 1), 4)
+        },
+        "by_model": [
+            {
+                "model": row[0],
+                "tokens": int(row[1] or 0),
+                "cost_usd": round(float(row[2] or 0), 4),
+                "calls": int(row[3] or 0)
+            }
+            for row in by_model
+        ],
+        "by_provider": [
+            {
+                "provider": row[0],
+                "tokens": int(row[1] or 0),
+                "cost_usd": round(float(row[2] or 0), 4),
+                "calls": int(row[3] or 0)
+            }
+            for row in by_provider
+        ],
+        "by_profile": [
+            {
+                "profile": row[0] or "unknown",
+                "tokens": int(row[1] or 0),
+                "cost_usd": round(float(row[2] or 0), 4),
+                "calls": int(row[3] or 0)
+            }
+            for row in by_profile
+        ],
+        "by_project": [
+            {
+                "project_id": row[0],
+                "project_name": row[1] or "Unknown",
+                "tokens": int(row[2] or 0),
+                "cost_usd": round(float(row[3] or 0), 4),
+                "calls": int(row[4] or 0)
+            }
+            for row in by_project
+        ],
+        "daily_trend": [
+            {
+                "date": row[0].isoformat() if row[0] else None,
+                "tokens": int(row[1] or 0),
+                "cost_usd": round(float(row[2] or 0), 4),
+                "calls": int(row[3] or 0)
+            }
+            for row in daily
+        ]
+    }
+
+
+@app.get("/admin/cost-dashboard", response_class=HTMLResponse)
+def cost_dashboard(db: Session = Depends(get_db)):
+    """
+    Cost tracking dashboard page for the admin panel.
+    
+    Shows token usage and cost statistics with charts and breakdowns.
+    """
+    from sqlalchemy import func
+    from database.models import TokenUsageLog
+    
+    # Get stats for last 30 days
+    since = datetime.now() - timedelta(days=30)
+    
+    total_cost = db.query(func.sum(TokenUsageLog.cost_usd)).filter(
+        TokenUsageLog.created_at >= since
+    ).scalar() or 0
+    
+    total_tokens = db.query(func.sum(TokenUsageLog.total_tokens)).filter(
+        TokenUsageLog.created_at >= since
+    ).scalar() or 0
+    
+    total_calls = db.query(func.count(TokenUsageLog.id)).filter(
+        TokenUsageLog.created_at >= since
+    ).scalar() or 0
+    
+    # By model (top 5)
+    by_model = db.query(
+        TokenUsageLog.model,
+        func.sum(TokenUsageLog.cost_usd).label('cost')
+    ).filter(TokenUsageLog.created_at >= since)\
+     .group_by(TokenUsageLog.model)\
+     .order_by(func.sum(TokenUsageLog.cost_usd).desc())\
+     .limit(5).all()
+    
+    model_chart_data = [{"name": row[0], "value": float(row[1] or 0)} for row in by_model]
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Cost Dashboard - Hound Admin</title>
+        <style>
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                max-width: 1400px;
+                margin: 0 auto;
+                padding: 20px;
+                background: #f5f5f5;
+            }}
+            .header {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 30px;
+                border-radius: 12px;
+                margin-bottom: 20px;
+            }}
+            .back-link {{
+                color: white;
+                text-decoration: none;
+                opacity: 0.8;
+            }}
+            .back-link:hover {{ opacity: 1; }}
+            .stats-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 20px;
+                margin-bottom: 30px;
+            }}
+            .stat-card {{
+                background: white;
+                padding: 25px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }}
+            .stat-value {{
+                font-size: 36px;
+                font-weight: bold;
+                color: #667eea;
+                margin: 10px 0;
+            }}
+            .stat-label {{
+                color: #666;
+                font-size: 14px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }}
+            .card {{
+                background: white;
+                padding: 25px;
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                margin-bottom: 20px;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+            }}
+            th, td {{
+                padding: 12px;
+                text-align: left;
+                border-bottom: 1px solid #eee;
+            }}
+            th {{
+                background: #f8f9fa;
+                font-weight: 600;
+            }}
+            .cost {{
+                color: #28a745;
+                font-weight: bold;
+            }}
+            .btn {{
+                display: inline-block;
+                padding: 10px 20px;
+                background: #667eea;
+                color: white;
+                text-decoration: none;
+                border-radius: 6px;
+                margin: 4px;
+            }}
+            .btn:hover {{ background: #5a67d8; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <a href="/admin" class="back-link">← Back to Admin</a>
+            <h1 style="margin: 12px 0 0 0;">💰 Cost Dashboard</h1>
+            <p style="margin: 8px 0 0 0; opacity: 0.9;">LLM Token Usage & Cost Tracking (Last 30 Days)</p>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total Cost</div>
+                <div class="stat-value">${total_cost:.2f}</div>
+                <div style="color: #666; font-size: 12px;">Last 30 days</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Total Tokens</div>
+                <div class="stat-value">{total_tokens:,}</div>
+                <div style="color: #666; font-size: 12px;">{total_calls:,} API calls</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Avg Cost/Call</div>
+                <div class="stat-value">${(total_cost / max(total_calls, 1)):.4f}</div>
+                <div style="color: #666; font-size: 12px;">Per API request</div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>Top Models by Cost</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Model</th>
+                        <th>Cost (USD)</th>
+                        <th>% of Total</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {"".join([
+                        f'<tr><td>{row["name"]}</td><td class="cost">${row["value"]:.4f}</td><td>{(row["value"] / max(total_cost, 0.0001) * 100):.1f}%</td></tr>'
+                        for row in model_chart_data
+                    ])}
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="card">
+            <h2>Quick Actions</h2>
+            <a href="/admin/token-usage-log/list" class="btn">View All Token Logs</a>
+            <a href="/admin/token-stats?days=30" class="btn">API Stats (JSON)</a>
+            <a href="/admin/project/list" class="btn">View Projects</a>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html)
 
 
 @app.get("/admin/scan-findings/{scan_id}", response_class=HTMLResponse)
@@ -4603,6 +5814,195 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             except asyncio.CancelledError:
                 pass
         manager_ws.disconnect(websocket, session_id)
+
+
+# ============================================================================
+# CONFIG PROFILE MANAGEMENT
+# ============================================================================
+
+# Global active config profile (can be overridden per-tenant in future)
+_active_config_profile: str = "default"
+_config_cache: dict = {}
+
+def get_available_config_profiles() -> list[dict]:
+    """Get list of available config profiles."""
+    from pathlib import Path
+    import yaml
+    
+    hound_dir = Path(__file__).parent.parent
+    profiles = []
+    
+    # Look for config files
+    config_files = [
+        ("default", "config.yaml", "Default configuration"),
+        ("deepseek", "config.deepseek.yaml", "DeepSeek only - 95% cost savings"),
+        ("premium", "config.premium.yaml", "Premium models - best quality"),
+        ("example", "config.yaml.example", "Example configuration template"),
+    ]
+    
+    for profile_id, filename, description in config_files:
+        config_path = hound_dir / filename
+        if config_path.exists():
+            try:
+                with open(config_path) as f:
+                    cfg = yaml.safe_load(f) or {}
+                
+                # Extract model info
+                models = cfg.get("models", {})
+                model_summary = {}
+                for profile_name, settings in models.items():
+                    provider = settings.get("provider", "unknown")
+                    model = settings.get("model", "unknown")
+                    model_summary[profile_name] = f"{provider}/{model}"
+                
+                profiles.append({
+                    "id": profile_id,
+                    "filename": filename,
+                    "description": description,
+                    "path": str(config_path),
+                    "models": model_summary,
+                    "exists": True
+                })
+            except Exception as e:
+                profiles.append({
+                    "id": profile_id,
+                    "filename": filename,
+                    "description": description,
+                    "path": str(config_path),
+                    "error": str(e),
+                    "exists": True
+                })
+    
+    return profiles
+
+
+def load_config_profile(profile_id: str) -> dict:
+    """Load a specific config profile."""
+    from pathlib import Path
+    import yaml
+    
+    # Check cache
+    if profile_id in _config_cache:
+        return _config_cache[profile_id]
+    
+    hound_dir = Path(__file__).parent.parent
+    
+    profile_files = {
+        "default": "config.yaml",
+        "deepseek": "config.deepseek.yaml",
+        "premium": "config.premium.yaml",
+        "example": "config.yaml.example",
+    }
+    
+    filename = profile_files.get(profile_id, f"config.{profile_id}.yaml")
+    config_path = hound_dir / filename
+    
+    # Fallback chain
+    if not config_path.exists():
+        # Try default config.yaml
+        config_path = hound_dir / "config.yaml"
+    if not config_path.exists():
+        # Try example
+        config_path = hound_dir / "config.yaml.example"
+    if not config_path.exists():
+        return {}
+    
+    with open(config_path) as f:
+        config = yaml.safe_load(f) or {}
+    
+    _config_cache[profile_id] = config
+    return config
+
+
+def get_active_config() -> dict:
+    """Get the currently active config."""
+    return load_config_profile(_active_config_profile)
+
+
+@app.get("/config/profiles")
+async def list_config_profiles():
+    """
+    List available LLM configuration profiles.
+    
+    Returns all config profiles with their model configurations.
+    Use this to see what profiles are available and switch between them.
+    """
+    global _active_config_profile
+    
+    profiles = get_available_config_profiles()
+    
+    return {
+        "active_profile": _active_config_profile,
+        "profiles": profiles
+    }
+
+
+@app.post("/config/profiles/{profile_id}/activate")
+async def activate_config_profile(profile_id: str):
+    """
+    Activate a specific config profile for all API operations.
+    
+    This changes which LLM models are used for scans, graph building, and audits.
+    
+    Available profiles:
+    - default: Your main config.yaml
+    - deepseek: Cost-effective DeepSeek models (~95% savings)
+    - premium: Best quality models (GPT-5, Claude, Gemini)
+    """
+    global _active_config_profile, _config_cache
+    
+    profiles = get_available_config_profiles()
+    profile_ids = [p["id"] for p in profiles]
+    
+    if profile_id not in profile_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Profile '{profile_id}' not found. Available: {profile_ids}"
+        )
+    
+    # Clear cache to reload config
+    _config_cache.clear()
+    _active_config_profile = profile_id
+    
+    # Load and return the new config summary
+    config = load_config_profile(profile_id)
+    models = config.get("models", {})
+    
+    return {
+        "status": "success",
+        "active_profile": profile_id,
+        "models": {
+            name: f"{cfg.get('provider', 'unknown')}/{cfg.get('model', 'unknown')}"
+            for name, cfg in models.items()
+        }
+    }
+
+
+@app.get("/config/active")
+async def get_active_config_info():
+    """
+    Get the currently active configuration profile and its settings.
+    """
+    global _active_config_profile
+    
+    config = get_active_config()
+    models = config.get("models", {})
+    
+    return {
+        "active_profile": _active_config_profile,
+        "models": {
+            name: {
+                "provider": cfg.get("provider", "unknown"),
+                "model": cfg.get("model", "unknown"),
+                "max_context": cfg.get("max_context"),
+                "temperature": cfg.get("temperature")
+            }
+            for name, cfg in models.items()
+        },
+        "context": config.get("context", {}),
+        "timeouts": config.get("timeouts", {}),
+        "retries": config.get("retries", {})
+    }
 
 
 # Health check endpoint

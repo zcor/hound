@@ -68,6 +68,9 @@ Railway automatically creates `DATABASE_URL` and `REDIS_URL` variables.
 
 **For API service:**
 ```env
+# Required - Admin Panel Protection
+HOUND_ADMIN_KEY=your-secure-admin-password-here
+
 # Required - LLM API Keys (at least one)
 OPENAI_API_KEY=sk-...
 ANTHROPIC_API_KEY=sk-ant-...
@@ -100,6 +103,7 @@ NEXT_PUBLIC_API_URL=https://your-api-service.railway.app
 
 | Variable | Required | Description |
 |----------|----------|-------------|
+| `HOUND_ADMIN_KEY` | **Yes** | Password to access admin panel |
 | `OPENAI_API_KEY` | Yes* | OpenAI API key |
 | `ANTHROPIC_API_KEY` | No | Anthropic API key |
 | `DEEPSEEK_API_KEY` | No | DeepSeek API key (95% cheaper) |
@@ -112,13 +116,26 @@ NEXT_PUBLIC_API_URL=https://your-api-service.railway.app
 
 ---
 
+## Admin Panel Authentication
+
+The admin panel is protected by `HOUND_ADMIN_KEY`. Access methods:
+
+1. **Browser Login**: Go to `/admin/login` and enter the admin key
+2. **API Header**: `X-Admin-Key: your-admin-key`
+3. **Query Param**: `?admin_key=your-admin-key`
+
+If `HOUND_ADMIN_KEY` is not set, admin panel is open (for local development only).
+
+---
+
 ## Costs Estimate
 
 ### Railway Pricing (Hobby Plan - $5/month)
 - **API Service**: ~$2-5/month (depends on usage)
 - **PostgreSQL**: ~$1-3/month
 - **Redis**: ~$1-2/month
-- **Total**: ~$5-10/month
+- **Frontend**: ~$2-3/month
+- **Total**: ~$8-15/month
 
 ### LLM API Costs
 - **DeepSeek**: ~$0.14/million input tokens, $0.28/million output (~95% cheaper)

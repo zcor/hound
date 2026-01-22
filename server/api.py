@@ -34,6 +34,7 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -44,8 +45,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import redis.asyncio as aioredis
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Query
+from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
@@ -68,6 +70,57 @@ logger = logging.getLogger(__name__)
 
 # Database configuration
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
+
+# =============================================================================
+# ADMIN AUTHENTICATION
+# =============================================================================
+# Set HOUND_ADMIN_KEY environment variable to protect admin panel
+# If not set, admin panel is open (for local development)
+ADMIN_API_KEY = os.environ.get("HOUND_ADMIN_KEY", "")
+ADMIN_SESSION_COOKIE = "hound_admin_session"
+# Store valid session tokens (in production, use Redis)
+_admin_sessions: set = set()
+
+
+def generate_session_token() -> str:
+    """Generate a secure session token."""
+    return secrets.token_urlsafe(32)
+
+
+def verify_admin_auth(request: Request, admin_session: Optional[str] = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)) -> bool:
+    """
+    Verify admin authentication.
+    Returns True if authenticated, raises HTTPException if not.
+    """
+    # If no admin key is set, allow access (local development)
+    if not ADMIN_API_KEY:
+        return True
+    
+    # Check session cookie
+    if admin_session and admin_session in _admin_sessions:
+        return True
+    
+    # Check API key in header
+    api_key = request.headers.get("X-Admin-Key") or request.headers.get("Authorization", "").replace("Bearer ", "")
+    if api_key == ADMIN_API_KEY:
+        return True
+    
+    # Check API key in query param (for browser access)
+    api_key = request.query_params.get("admin_key")
+    if api_key == ADMIN_API_KEY:
+        return True
+    
+    return False
+
+
+def require_admin(request: Request, admin_session: Optional[str] = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)):
+    """Dependency to require admin authentication."""
+    if not verify_admin_auth(request, admin_session):
+        # For HTML pages, redirect to login
+        if "text/html" in request.headers.get("accept", ""):
+            raise HTTPException(status_code=303, detail="Redirect to login", headers={"Location": "/admin/login"})
+        raise HTTPException(status_code=401, detail="Admin authentication required. Set X-Admin-Key header or admin_key query param.")
+
 
 # Create engine lazily to avoid connection errors during import
 _engine = None
@@ -161,6 +214,142 @@ async def redirect_auditsession(path: str):
     return StarletteRedirect(f"/admin/audit-session/{path}", status_code=301)
 
 
+# =============================================================================
+# ADMIN LOGIN/LOGOUT ENDPOINTS
+# =============================================================================
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login_page(request: Request, error: Optional[str] = None):
+    """Admin login page."""
+    # If no admin key is set, redirect to home (no auth needed)
+    if not ADMIN_API_KEY:
+        return RedirectResponse("/admin/home", status_code=303)
+    
+    error_html = f'<div class="error">{error}</div>' if error else ''
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Hound Admin Login</title>
+        <style>
+            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+            body {{
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }}
+            .login-box {{
+                background: #1e1e2e;
+                padding: 40px;
+                border-radius: 12px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+                width: 100%;
+                max-width: 400px;
+            }}
+            h1 {{
+                color: #30a14e;
+                margin-bottom: 8px;
+                font-size: 24px;
+            }}
+            p {{
+                color: #888;
+                margin-bottom: 24px;
+                font-size: 14px;
+            }}
+            .error {{
+                background: #da3633;
+                color: white;
+                padding: 12px;
+                border-radius: 6px;
+                margin-bottom: 16px;
+                font-size: 14px;
+            }}
+            input {{
+                width: 100%;
+                padding: 12px 16px;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                background: #0d1117;
+                color: #e6edf3;
+                font-size: 16px;
+                margin-bottom: 16px;
+            }}
+            input:focus {{
+                outline: none;
+                border-color: #30a14e;
+            }}
+            button {{
+                width: 100%;
+                padding: 12px;
+                background: #238636;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 16px;
+                cursor: pointer;
+                transition: background 0.2s;
+            }}
+            button:hover {{
+                background: #2ea043;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="login-box">
+            <h1>🐕 Hound Admin</h1>
+            <p>Enter your admin key to access the dashboard</p>
+            {error_html}
+            <form method="POST" action="/admin/login">
+                <input type="password" name="admin_key" placeholder="Admin Key" required autofocus>
+                <button type="submit">Login</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.post("/admin/login")
+async def admin_login(request: Request):
+    """Handle admin login."""
+    form = await request.form()
+    admin_key = form.get("admin_key", "")
+    
+    if admin_key == ADMIN_API_KEY:
+        # Create session token
+        session_token = generate_session_token()
+        _admin_sessions.add(session_token)
+        
+        # Set cookie and redirect to home
+        response = RedirectResponse("/admin/home", status_code=303)
+        response.set_cookie(
+            key=ADMIN_SESSION_COOKIE,
+            value=session_token,
+            httponly=True,
+            secure=True,  # Only send over HTTPS
+            samesite="lax",
+            max_age=86400 * 7  # 7 days
+        )
+        return response
+    
+    return RedirectResponse("/admin/login?error=Invalid+admin+key", status_code=303)
+
+
+@app.get("/admin/logout")
+def admin_logout(admin_session: Optional[str] = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)):
+    """Logout and clear session."""
+    if admin_session and admin_session in _admin_sessions:
+        _admin_sessions.discard(admin_session)
+    
+    response = RedirectResponse("/admin/login", status_code=303)
+    response.delete_cookie(ADMIN_SESSION_COOKIE)
+    return response
+
+
 # Dependency for database session
 def get_db():
     """Get database session."""
@@ -172,15 +361,12 @@ def get_db():
         db.close()
 
 
-# Progress viewer page for admin panel
-from fastapi.responses import HTMLResponse
-
 # ============================================================================
 # INTERACTIVE ADMIN DASHBOARD PAGES
 # ============================================================================
 
 @app.get("/admin/home", response_class=HTMLResponse)
-def admin_home(db: Session = Depends(get_db)):
+def admin_home(request: Request, db: Session = Depends(get_db), _auth: bool = Depends(require_admin)):
     """
     Admin home page with quick links to all features.
     """
@@ -305,15 +491,18 @@ def admin_home(db: Session = Depends(get_db)):
                 <h1><i class="fas fa-shield-dog"></i> Hound Admin</h1>
                 <p style="opacity: 0.9; margin: 0;">Security Analysis Platform Dashboard</p>
                 
-                <div class="config-selector">
-                    <label style="font-weight: 500;"><i class="fas fa-cog"></i> LLM Config:</label>
-                    <select id="configProfile" onchange="switchConfig(this.value)">
-                        <option value="default" {"selected" if active_profile == "default" else ""}>Default</option>
-                        <option value="deepseek" {"selected" if active_profile == "deepseek" else ""}>🚀 DeepSeek (95% cheaper)</option>
-                        <option value="premium" {"selected" if active_profile == "premium" else ""}>⭐ Premium (best quality)</option>
-                    </select>
-                    <span class="model-info">Primary model: <strong>{primary_model}</strong></span>
-                    <span class="badge bg-{badge_color}">{badge_text}</span>
+                <div class="d-flex justify-content-between align-items-start mt-3">
+                    <div class="config-selector" style="margin-top: 0;">
+                        <label style="font-weight: 500;"><i class="fas fa-cog"></i> LLM Config:</label>
+                        <select id="configProfile" onchange="switchConfig(this.value)">
+                            <option value="default" {"selected" if active_profile == "default" else ""}>Default</option>
+                            <option value="deepseek" {"selected" if active_profile == "deepseek" else ""}>🚀 DeepSeek (95% cheaper)</option>
+                            <option value="premium" {"selected" if active_profile == "premium" else ""}>⭐ Premium (best quality)</option>
+                        </select>
+                        <span class="model-info">Primary model: <strong>{primary_model}</strong></span>
+                        <span class="badge bg-{badge_color}">{badge_text}</span>
+                    </div>
+                    {"<a href='/admin/logout' class='btn btn-outline-light btn-sm'><i class='fas fa-sign-out-alt'></i> Logout</a>" if ADMIN_API_KEY else ""}
                 </div>
             </div>
         </div>
@@ -497,7 +686,7 @@ def admin_home(db: Session = Depends(get_db)):
 
 
 @app.get("/admin/dashboard/{project_id}", response_class=HTMLResponse)
-async def admin_project_dashboard(project_id: int, request: Request, db: Session = Depends(get_db)):
+async def admin_project_dashboard(project_id: int, request: Request, db: Session = Depends(get_db), _auth: bool = Depends(require_admin)):
     """
     Interactive project dashboard with graph visualization, findings, and activity.
     Brings chatbot-style visualization features to the admin panel.
@@ -2212,7 +2401,7 @@ async def admin_project_dashboard(project_id: int, request: Request, db: Session
 
 
 @app.get("/admin/progress/{session_id}", response_class=HTMLResponse)
-async def admin_progress_viewer(session_id: str, request: Request, db: Session = Depends(get_db)):
+async def admin_progress_viewer(session_id: str, request: Request, db: Session = Depends(get_db), _auth: bool = Depends(require_admin)):
     """
     Render a live progress viewer for audit/graph build sessions.
     Connects to WebSocket and shows real-time updates.
@@ -5113,9 +5302,11 @@ async def get_surface_scan_stats(
 
 @app.get("/admin/token-stats")
 async def get_token_usage_stats(
+    request: Request,
     project_id: int | None = Query(None, description="Filter by project ID"),
     days: int = Query(30, description="Number of days to look back"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _auth: bool = Depends(require_admin)
 ):
     """
     Get token usage and cost statistics for the admin dashboard.
@@ -5283,7 +5474,7 @@ async def get_token_usage_stats(
 
 
 @app.get("/admin/cost-dashboard", response_class=HTMLResponse)
-def cost_dashboard(db: Session = Depends(get_db)):
+def cost_dashboard(request: Request, db: Session = Depends(get_db), _auth: bool = Depends(require_admin)):
     """
     Cost tracking dashboard page for the admin panel.
     
@@ -5462,7 +5653,7 @@ def cost_dashboard(db: Session = Depends(get_db)):
 
 
 @app.get("/admin/scan-findings/{scan_id}", response_class=HTMLResponse)
-def view_scan_findings(scan_id: int, db: Session = Depends(get_db)):
+def view_scan_findings(scan_id: int, request: Request, db: Session = Depends(get_db), _auth: bool = Depends(require_admin)):
     """
     View scan findings in a detailed HTML page.
     

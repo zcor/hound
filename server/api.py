@@ -48,6 +48,7 @@ import redis.asyncio as aioredis
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
+from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
@@ -154,6 +155,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Session middleware for flash messages in admin panel
+# Use HOUND_SECRET_KEY env var or generate a random one
+session_secret = os.environ.get("HOUND_SECRET_KEY", secrets.token_urlsafe(32))
+app.add_middleware(SessionMiddleware, secret_key=session_secret)
 
 
 # Middleware to fix URL generation for proxied requests (Codespaces, ngrok, etc.)

@@ -1,82 +1,64 @@
-# Example configuration showing model-specific context limits
+# Hound Default Configuration
+# Gemini for graph building (fast + cheap), OpenAI for analysis
 
-# API keys configuration
 openai:
   api_key_env: OPENAI_API_KEY
-  # Optional: override base URL (env var OPENAI_BASE_URL takes precedence)
-  # base_url: https://api.openai.com
-
 gemini:
   api_key_env: GOOGLE_API_KEY
-  # Vertex AI (optional). When enabled, the Gemini provider will use Vertex AI
-  # instead of AI Studio. Credentials are resolved from Application Default
-  # Credentials (ADC) or a service account, not the GOOGLE_API_KEY.
   vertex_ai:
     enabled: false
-    # Your Google Cloud Project ID (alternatively set VERTEX_PROJECT_ID or GOOGLE_CLOUD_PROJECT)
-    project_id: ""
-    # Region/location for Vertex AI (e.g., "us-central1"; alternatively set VERTEX_LOCATION or GOOGLE_CLOUD_REGION)
-    region: ""
-
+    project_id: ''
+    region: ''
 anthropic:
   api_key_env: ANTHROPIC_API_KEY
-
 xai:
   api_key_env: XAI_API_KEY
-
+rei:
+  api_key_env: REI_API_KEY
+  base_url: https://api.reilabs.org
+  endpoint: /v1/chat/completions
 deepseek:
   api_key_env: DEEPSEEK_API_KEY
-  # Base URL for DeepSeek API (alternatively set DEEPSEEK_BASE_URL)
   base_url: https://api.deepseek.com
 
-# Model configuration with context limits
 models:
-  # Graph building model - using DeepSeek for cost efficiency
-  # DeepSeek has 256k context which is sufficient for most repos
   graph:
-    provider: deepseek
-    model: deepseek-chat
-    max_context: 256000
-    
-  # Scout/agent model for exploration
-  # Using DeepSeek for ~90% cost savings vs GPT-4
+    provider: gemini
+    model: gemini-2.5-pro
+    max_context: 1000000
+    thinking_enabled: true
+    thinking_budget: -1
   scout:
-    provider: deepseek
-    model: deepseek-chat
+    provider: openai
+    model: gpt-5-mini
     max_context: 256000
-  
-  # Strategic thinking model
-  # For planning and reasoning about security issues
   strategist:
-    provider: deepseek
-    model: deepseek-chat
+    provider: openai
+    model: gpt-5-mini
     max_context: 256000
     plan_reasoning_effort: medium
     hypothesize_reasoning_effort: high
-  
-  # Lightweight utility model for quick, low-cost tasks (e.g., dedup)
   lightweight:
-    provider: deepseek
-    model: deepseek-chat
-  
-  # QA model
+    provider: openai
+    model: gpt-4o-mini
   finalize:
-    provider: deepseek
-    model: deepseek-chat
-    max_context: 256000
-  
-  # Reporting model
+    provider: openai
+    model: gpt-5-mini
+    reasoning_effort: high
   reporting:
-    provider: deepseek
-    model: deepseek-chat
+    provider: openai
+    model: gpt-4o
+  math:
+    provider: rei
+    model: math
     max_context: 256000
+    plan_reasoning_effort: high
+    hypothesize_reasoning_effort: high
 
-# Global context settings (used when model doesn't specify max_context)
 context:
-  max_tokens: 256000           # Default for models without specific max_context
-  compression_threshold: 0.75  # Compress history when 75% full
+  max_tokens: 256000
+  compression_threshold: 0.75
 
-# Timeouts and retries
 timeouts:
   request_seconds: 300
 
@@ -84,11 +66,3 @@ retries:
   max_attempts: 3
   backoff_min_seconds: 1
   backoff_max_seconds: 2
-
-# Notes:
-# - Each model can have its own max_context setting
-# - Graph model uses large context for building iterations (sees more code)
-# - Guidance model uses smaller context for initial discovery/design phase
-# - Discovery phase and building iterations use different context limits
-# - Models without max_context use the global context.max_tokens value
-# - Token counting is done using the specific model for accuracy

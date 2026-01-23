@@ -52,6 +52,33 @@ flag_modified(hypothesis, "evidence")  # Tell SQLAlchemy it changed
 db.commit()
 ```
 
+
+---
+
+## 🔐 Admin Panel Authentication
+
+The admin panel (`/admin/*` endpoints) can be protected with a password using the `HOUND_ADMIN_KEY` environment variable.
+
+**Configuration**:
+1. Set `HOUND_ADMIN_KEY` in your `.env` file:
+   ```
+   HOUND_ADMIN_KEY=your_secure_password
+   ```
+
+2. Ensure `HOUND_ADMIN_KEY` is passed to the `api` service in `docker-compose.yml`:
+   ```yaml
+   environment:
+     HOUND_ADMIN_KEY: ${HOUND_ADMIN_KEY:-}
+   ```
+
+3. **HTTP vs HTTPS**: The session cookie's `secure` flag is set to `False` by default to support HTTP access during development. For production deployments with HTTPS, change `secure=False` to `secure=True` in `server/api.py` (line ~333).
+
+**Authentication Methods**:
+- **Web UI**: Login at `/admin/login` with your admin key
+- **API Header**: `X-Admin-Key: your_password` or `Authorization: Bearer your_password`
+- **Query Parameter**: `?admin_key=your_password` (for browser testing)
+
+**Note**: If `HOUND_ADMIN_KEY` is not set, the admin panel is accessible without authentication (local development mode).
 ---
 
 ## 🔑 Key Commands & Endpoints

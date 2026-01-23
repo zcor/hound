@@ -59,6 +59,8 @@ services:
       GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
       GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Admin Key
+      HOUND_ADMIN_KEY: ${HOUND_ADMIN_KEY:-}
     depends_on:
       db:
         condition: service_healthy
@@ -95,6 +97,8 @@ services:
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
       GITHUB_APP_PRIVATE_KEY_PATH: ${GITHUB_APP_PRIVATE_KEY_PATH:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Admin Key
+      HOUND_ADMIN_KEY: ${HOUND_ADMIN_KEY:-}
       # S3/MinIO Storage (optional)
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}

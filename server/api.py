@@ -330,7 +330,7 @@ async def admin_login(request: Request):
             key=ADMIN_SESSION_COOKIE,
             value=session_token,
             httponly=True,
-            secure=True,  # Only send over HTTPS
+            secure=False,  # Set to True when using HTTPS
             samesite="lax",
             max_age=86400 * 7  # 7 days
         )

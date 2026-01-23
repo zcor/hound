@@ -31,32 +31,22 @@ deepseek:
 
 # Model configuration with context limits
 models:
-  # Graph building model - needs large context
+  # Graph building model - using DeepSeek for cost efficiency
+  # DeepSeek has 256k context which is sufficient for most repos
   graph:
-    # GPT-4.1 WORKS WELL HERE BUT IS VERY EXPENSIVE!
-    # provider: openai
-    # model: gpt-4.1 
-    # max_context: 1000000
-
-    provider: gemini
-    model: gemini-2.5-pro
-    max_context: 1000000
-    thinking_enabled: true
-    thinking_budget: -1
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 256000
     
   # Scout/agent model for exploration
   # Using DeepSeek for ~90% cost savings vs GPT-4
-  # Alternative: provider: openai, model: gpt-5-mini
   scout:
     provider: deepseek
     model: deepseek-chat
     max_context: 256000
-    # reasoning_effort: low
   
   # Strategic thinking model
   # For planning and reasoning about security issues
-  # Using DeepSeek for ~90% cost savings vs GPT-4
-  # Alternative: provider: openai, model: gpt-5
   strategist:
     provider: deepseek
     model: deepseek-chat
@@ -66,23 +56,20 @@ models:
   
   # Lightweight utility model for quick, low-cost tasks (e.g., dedup)
   lightweight:
-    provider: openai
-    model: gpt-4o-mini
-    # No large context or special reasoning required
+    provider: deepseek
+    model: deepseek-chat
   
   # QA model
   finalize:
-    provider: openai
-    model: gpt-5
-    reasoning_effort: high
-    # No max_context specified - will use global default
-    # reasoning_effort: medium  # Options: low, medium, high (GPT-5 models only)
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 256000
   
   # Reporting model
   reporting:
-    provider: openai
-    model: gpt-4o
-    # No max_context specified - will use global default
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 256000
 
 # Global context settings (used when model doesn't specify max_context)
 context:

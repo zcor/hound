@@ -263,19 +263,33 @@ class GraphBuilder:
     
     def __init__(self, config: dict, debug: bool = False, debug_logger=None):
         # Use a local copy of config and honor user-provided model settings.
-        # We now use a single model profile ('graph') for both discovery and build.
+        # Support hybrid mode: 'discovery' profile for large context discovery,
+        # 'graph' profile for iterative building (can use cheaper model).
         import copy as _copy
         cfg = _copy.deepcopy(config) if isinstance(config, dict) else {}
         self.config = cfg
         self.debug = debug
         self.debug_logger = debug_logger
 
-        # Initialize LLM client for graph building (also used for discovery)
+        # Initialize LLM client for graph building iterations
         self.llm = LLMClient(self.config, profile="graph", debug_logger=debug_logger)
-        self.llm_agent = self.llm  # single-model setup
-        if debug:
-            graph_model = self.config.get("models", {}).get("graph", {}).get("model", "unknown")
-            print(f"[*] Graph model: {graph_model} (used for discovery and build)")
+        
+        # Check if separate discovery model is configured (for hybrid mode)
+        # Discovery needs large context (50K+ tokens), building can use cheaper model
+        models_cfg = self.config.get("models", {})
+        if "discovery" in models_cfg:
+            # Hybrid mode: use discovery model for large context phase
+            self.llm_agent = LLMClient(self.config, profile="discovery", debug_logger=debug_logger)
+            if debug:
+                discovery_model = models_cfg.get("discovery", {}).get("model", "unknown")
+                graph_model = models_cfg.get("graph", {}).get("model", "unknown")
+                print(f"[*] Hybrid mode: discovery={discovery_model}, build={graph_model}")
+        else:
+            # Single model mode (backward compatible)
+            self.llm_agent = self.llm
+            if debug:
+                graph_model = models_cfg.get("graph", {}).get("model", "unknown")
+                print(f"[*] Graph model: {graph_model} (used for discovery and build)")
         
         # Knowledge graphs storage
         self.graphs: dict[str, KnowledgeGraph] = {}
@@ -1038,21 +1052,33 @@ Return empty lists only if graph is TRULY complete and comprehensive."""
     def _sample_cards_for_discovery(self, cards: list[dict]) -> list[dict]:
         """
         Sample cards specifically for the discovery phase.
-        Single-model mode: use the graph model's context limit.
+        In hybrid mode: use discovery model's context limit.
+        In single-model mode: use the graph model's context limit.
         """
-        # Get context limit from graph model or fall back to global default
-        graph_model_config = self.config.get("models", {}).get("graph", {})
-        max_context_tokens = graph_model_config.get("max_context") or self.config.get("context", {}).get("max_tokens", 256000)
-        if self.debug:
-            print(f"      Discovery: Using graph model's max_context: {max_context_tokens:,} tokens")
+        models_cfg = self.config.get("models", {})
+        
+        # Check if we're in hybrid mode (discovery profile exists)
+        if "discovery" in models_cfg:
+            # Hybrid mode: use discovery model's context limit
+            discovery_config = models_cfg.get("discovery", {})
+            max_context_tokens = discovery_config.get("max_context", 1000000)
+            model = discovery_config.get("model", "gemini-2.5-flash")
+            if self.debug:
+                print(f"      Discovery: Using discovery model's max_context: {max_context_tokens:,} tokens")
+        else:
+            # Single-model mode: use graph model's context limit
+            graph_model_config = models_cfg.get("graph", {})
+            max_context_tokens = graph_model_config.get("max_context") or self.config.get("context", {}).get("max_tokens", 256000)
+            model = graph_model_config.get("model", "gpt-4o-mini")
+            if self.debug:
+                print(f"      Discovery: Using graph model's max_context: {max_context_tokens:,} tokens")
         
         # Reserve more tokens for discovery (system prompt is larger, needs more response space)
         reserved_tokens = 50000  # More conservative reservation for discovery
         available_tokens = max_context_tokens - reserved_tokens
         target_tokens = int(available_tokens * 0.7)  # More conservative: 70% instead of 80%
         
-        # Use the graph model for token counting
-        model = graph_model_config.get("model", "gpt-4o-mini")
+        # model is already set above based on hybrid/single mode
         
         # Count tokens for all cards
         total_tokens = 0

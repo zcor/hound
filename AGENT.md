@@ -109,6 +109,27 @@ The admin panel (`/admin/*` endpoints) can be protected with a password using th
 
 ## 🧠 LLM Configuration
 
+### Recommended Model: GPT-5-mini (Best Cost/Quality Ratio)
+
+After extensive benchmarking (January 2026), **GPT-5-mini** is the recommended model for graph building:
+
+| Model | Time (3 graphs) | Cost | Notes |
+|-------|-----------------|------|-------|
+| **GPT-5-mini** | 14.4 min | ~$0.06 | ✅ RECOMMENDED |
+| Gemini 2.5 Flash | ~9 min | ~$0.30 | Fastest, but 5x cost |
+| Hybrid (Gemini+DeepSeek) | ~10 min | ~$0.10 | Good balance |
+| DeepSeek Reasoner R1 | 17.8 min | ~$0.15 | Overkill for graphs |
+| DeepSeek Chat | ~168 min | ~$0.05 | Too slow for production |
+
+### Config Files
+
+| File | Use Case |
+|------|----------|
+| `config.yaml` | Default - GPT-5-mini (recommended) |
+| `config.premium.yaml` | Best quality (GPT-5/Claude) |
+| `config.deepseek.yaml` | Budget testing (slow but cheap) |
+| `config.hybrid.yaml` | Gemini discovery + DeepSeek building |
+
 **Profiles** (defined in config.yaml):
 - `strategist` - High-level reasoning (Claude/GPT-4)
 - `junior` - Code analysis tasks
@@ -408,9 +429,10 @@ conn.commit()
 | `POST /audits/run-sync` | Sync (blocking) | Development/testing/single-tenant |
 
 #### Config Profiles:
-- `default` - Standard models (OpenAI/Anthropic)
-- `deepseek` - DeepSeek models (~95% cheaper, good for testing)
-- `premium` - Best models (GPT-5, Claude Sonnet)
+- `config.yaml` - **Default** - GPT-5-mini (best cost/quality, ~$0.06/build)
+- `config.deepseek.yaml` - DeepSeek models (cheapest but slow)
+- `config.premium.yaml` - Best models (GPT-5, Claude Sonnet)
+- `config.hybrid.yaml` - Gemini discovery + DeepSeek building (~$0.10/build)
 
 Switch profiles via: `POST /config/profiles/{profile}/activate`
 
@@ -513,4 +535,4 @@ When adding a new feature:
 
 ---
 
-*Last updated: January 21, 2026 - SaaS fully working end-to-end!*
+*Last updated: January 23, 2026 - GPT-5-mini recommended as default model*

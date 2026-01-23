@@ -56,6 +56,7 @@ class UnifiedLLMClient:
                 "qa": ["finalize", "graph"],
                 "finalize": ["qa", "graph"],
                 "graph": ["scout", "agent", "strategist"],  # Graph can fall back to other models
+                "discovery": ["graph"],  # Discovery falls back to graph if not in hybrid mode
             }
             for alt in fallbacks.get(profile_key, []):
                 if alt in models_cfg:

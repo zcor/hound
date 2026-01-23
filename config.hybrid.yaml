@@ -1,0 +1,60 @@
+# Hound Hybrid Configuration
+# Optimized for cost savings while maintaining speed
+#
+# Strategy:
+# - Discovery phase: Gemini (fast on large 50K+ token context)
+# - Build iterations: DeepSeek (cheap for smaller repeated calls)
+#
+# Cost comparison (approximate):
+# - Pure Gemini: ~$0.30 per scan
+# - Pure DeepSeek: ~$0.05 per scan (but 10x slower)
+# - Hybrid: ~$0.10 per scan (best of both worlds!)
+
+openai:
+  api_key_env: OPENAI_API_KEY
+gemini:
+  api_key_env: GOOGLE_API_KEY
+deepseek:
+  api_key_env: DEEPSEEK_API_KEY
+  base_url: https://api.deepseek.com
+anthropic:
+  api_key_env: ANTHROPIC_API_KEY
+
+models:
+  # Discovery model: handles the large codebase context (~50K tokens)
+  # Use a model with fast large-context processing
+  discovery:
+    provider: gemini
+    model: gemini-2.5-flash
+    max_context: 1000000
+    thinking_enabled: false
+
+  # Graph building: iterative refinement with smaller prompts
+  # DeepSeek supports 64K context, but is slow on large prompts
+  # Set a lower max_context to force more aggressive sampling
+  graph:
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 32000  # Force smaller batches for speed
+
+  # Other profiles use cost-effective options
+  scout:
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 64000
+  strategist:
+    provider: deepseek
+    model: deepseek-chat
+    max_context: 64000
+  lightweight:
+    provider: deepseek
+    model: deepseek-chat
+  finalize:
+    provider: openai
+    model: gpt-4o-mini
+  reporting:
+    provider: openai
+    model: gpt-4o-mini
+
+logging:
+  llm_verbose: false

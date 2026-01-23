@@ -33,27 +33,33 @@ def get_default_config() -> dict[str, Any]:
     }
     
     # Add model profiles based on available API keys
-    # Priority: Gemini > DeepSeek > OpenAI > Anthropic
+    # Priority: DeepSeek (cheapest) > OpenAI > Gemini > Anthropic
     
-    has_gemini = bool(os.environ.get("GOOGLE_API_KEY"))
     has_deepseek = bool(os.environ.get("DEEPSEEK_API_KEY"))
     has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+    has_gemini = bool(os.environ.get("GOOGLE_API_KEY"))
     has_anthropic = bool(os.environ.get("ANTHROPIC_API_KEY"))
     
-    # Graph profile - prefer Gemini for large context
-    if has_gemini:
+    # Graph profile - prefer DeepSeek for cost efficiency (large 256k context)
+    if has_deepseek:
         config["models"]["graph"] = {
-            "provider": "gemini",
-            "model": "gemini-2.5-pro",
-            "max_context": 1000000,
-            "thinking_enabled": True,
-            "thinking_budget": -1,
+            "provider": "deepseek",
+            "model": "deepseek-chat",
+            "max_context": 256000,
         }
     elif has_openai:
         config["models"]["graph"] = {
             "provider": "openai",
             "model": "gpt-4o",
             "max_context": 128000,
+        }
+    elif has_gemini:
+        config["models"]["graph"] = {
+            "provider": "gemini",
+            "model": "gemini-2.5-pro",
+            "max_context": 1000000,
+            "thinking_enabled": True,
+            "thinking_budget": -1,
         }
     elif has_anthropic:
         config["models"]["graph"] = {
@@ -82,7 +88,7 @@ def get_default_config() -> dict[str, Any]:
             "max_context": 1000000,
         }
     
-    # Strategist profile
+    # Strategist profile - prefer DeepSeek
     if has_deepseek:
         config["models"]["strategist"] = {
             "provider": "deepseek",
@@ -102,8 +108,14 @@ def get_default_config() -> dict[str, Any]:
             "max_context": 1000000,
         }
     
-    # Finalize/QA profile - use best available
-    if has_openai:
+    # Finalize/QA profile - prefer DeepSeek
+    if has_deepseek:
+        config["models"]["finalize"] = {
+            "provider": "deepseek",
+            "model": "deepseek-chat",
+            "max_context": 256000,
+        }
+    elif has_openai:
         config["models"]["finalize"] = {
             "provider": "openai",
             "model": "gpt-4o",
@@ -122,8 +134,14 @@ def get_default_config() -> dict[str, Any]:
             "max_context": 200000,
         }
     
-    # Reporting profile
-    if has_openai:
+    # Reporting profile - prefer DeepSeek
+    if has_deepseek:
+        config["models"]["reporting"] = {
+            "provider": "deepseek",
+            "model": "deepseek-chat",
+            "max_context": 256000,
+        }
+    elif has_openai:
         config["models"]["reporting"] = {
             "provider": "openai",
             "model": "gpt-4o",
@@ -136,16 +154,16 @@ def get_default_config() -> dict[str, Any]:
             "max_context": 1000000,
         }
     
-    # Lightweight profile for quick tasks
-    if has_openai:
-        config["models"]["lightweight"] = {
-            "provider": "openai",
-            "model": "gpt-4o-mini",
-        }
-    elif has_deepseek:
+    # Lightweight profile for quick tasks - prefer DeepSeek
+    if has_deepseek:
         config["models"]["lightweight"] = {
             "provider": "deepseek",
             "model": "deepseek-chat",
+        }
+    elif has_openai:
+        config["models"]["lightweight"] = {
+            "provider": "openai",
+            "model": "gpt-4o-mini",
         }
     elif has_gemini:
         config["models"]["lightweight"] = {

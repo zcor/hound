@@ -612,6 +612,38 @@ class AutonomousAgent:
         except Exception as e:
             print(f"[!] Failed to refresh graphs: {e}")
     
+    def reset_for_new_investigation(self):
+        """Reset agent state for a new investigation while preserving graphs and hypotheses.
+        
+        This allows running multiple investigations in sequence without re-loading graphs.
+        Called between investigations in the planning loop.
+        """
+        # Clear conversation history (start fresh for new investigation)
+        self.conversation_history = []
+        
+        # Clear action log
+        self.action_log = []
+        
+        # Clear memory notes
+        self.memory_notes = []
+        
+        # Clear loaded nodes/code (will be reloaded as needed)
+        self.loaded_data['nodes'] = {}
+        self.loaded_data['code'] = {}
+        
+        # Keep graphs loaded (system_graph and additional graphs)
+        # Keep hypotheses (they accumulate across investigations)
+        
+        # Reset abort flags
+        self._abort_requested = False
+        self._abort_reason = None
+        
+        # Reset investigation goal (will be set by investigate())
+        self.investigation_goal = ""
+        
+        # Reset steering cache
+        self._steering_seen = set()
+    
     def investigate(self, prompt: str, max_iterations: int = 20,
                    progress_callback: Callable[[dict], None] | None = None) -> dict:
         """

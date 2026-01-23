@@ -120,14 +120,17 @@ def execute_audit_task(
     tenant_id: int,
     project_id: Optional[int] = None,
     config: Optional[dict] = None,
-    max_iterations: int = 50,
+    max_iterations: int = 30,
     investigation_prompt: Optional[str] = None,
     installation_id: Optional[int] = None,
     pr_number: Optional[int] = None,
     repo_full_name: Optional[str] = None,
+    time_limit_minutes: int = 120,
+    mode: str = "sweep",
+    plan_n: int = 5,
 ) -> dict:
     """
-    Execute a full autonomous security audit.
+    Execute a full autonomous security audit with planning loop.
     
     This task:
     1. Clones the repository (with GitHub App auth if installation_id provided)
@@ -362,10 +365,12 @@ def execute_audit_task(
                 except Exception as e:
                     publisher.publish_thought(f"Warning: Failed to store graphs in DB: {e}", iteration=0)
         
-        # Step 4: Initialize and run autonomous agent
-        publisher.publish_status("running", "Starting autonomous investigation")
+        # Step 4: Initialize and run autonomous agent with planning loop
+        # This mirrors the CLI's AgentRunner behavior with Strategist planning
+        publisher.publish_status("running", f"Starting autonomous investigation (mode={mode})")
         
         from analysis.agent_core import AutonomousAgent
+        from analysis.strategist import Strategist
         
         agent = AutonomousAgent(
             graphs_metadata_path=knowledge_graphs_path,
@@ -374,8 +379,11 @@ def execute_audit_task(
             config=config,
             debug=False,
             session_id=scan_id,
-            redis_publisher=publisher,  # Pass publisher for internal Redis updates
+            redis_publisher=publisher,
         )
+        
+        # Initialize strategist for planning investigations
+        strategist = Strategist(config=config, debug=False, session_id=scan_id)
         
         # Set up progress callback that publishes to Redis
         def progress_callback(update: dict):
@@ -400,10 +408,8 @@ def execute_audit_task(
                     iteration=iteration,
                 )
             elif status == "hypothesis_formed":
-                # Extract hypothesis details if available
                 publisher.publish_thought(message, iteration=iteration)
             elif status == "usage":
-                # Parse usage message for token info
                 publisher.publish_thought(f"Context: {message}", iteration=iteration)
             elif status == "analyzing":
                 publisher.publish_thought(message, iteration=iteration)
@@ -414,46 +420,184 @@ def execute_audit_task(
             else:
                 publisher.publish_thought(message, iteration=iteration)
         
-        # Default investigation prompt
+        # Planning loop - mirrors CLI's AgentRunner.run() behavior
+        import time as time_module
+        start_overall = time_module.time()
+        completed_investigations = []
+        all_hypotheses = []
+        planned_round = 0
+        total_iterations = 0
+        consecutive_empty_rounds = 0
+        last_round_goals = set()
+        
+        # Default investigation prompt for strategist context
         if not investigation_prompt:
             investigation_prompt = """
             Perform a comprehensive security audit of this codebase.
-            
-            Focus on:
-            1. Access control vulnerabilities
-            2. Input validation issues
-            3. State management problems
-            4. Economic/financial exploits (if applicable)
-            5. Logic errors and edge cases
-            
-            Form hypotheses for any potential vulnerabilities found.
-            Prioritize high-severity issues.
+            Focus on: access control, input validation, state management,
+            economic/financial exploits, and logic errors.
             """
         
-        # Run investigation
-        publisher.publish_thought("Starting investigation...", iteration=1)
+        publisher.publish_thought(f"Starting {mode} mode audit with {time_limit_minutes} minute time limit", iteration=0)
         
-        print(f"[DEBUG] Calling agent.investigate with max_iterations={max_iterations}")
-        
-        result = agent.investigate(
-            prompt=investigation_prompt,
-            max_iterations=max_iterations,
-            progress_callback=progress_callback,
-        )
+        while True:
+            # Time limit check
+            elapsed_minutes = (time_module.time() - start_overall) / 60.0
+            if elapsed_minutes >= time_limit_minutes:
+                publisher.publish_thought(f"Time limit reached ({time_limit_minutes} minutes) — stopping audit", iteration=total_iterations)
+                break
+            
+            planned_round += 1
+            publisher.publish_thought(f"Planning round {planned_round} ({mode} mode, {elapsed_minutes:.1f}/{time_limit_minutes} min)", iteration=total_iterations)
+            
+            # Get coverage stats for strategist context
+            try:
+                coverage = agent.get_coverage_stats() if hasattr(agent, 'get_coverage_stats') else {}
+            except Exception:
+                coverage = {}
+            
+            # Determine phase based on mode
+            phase = 'Coverage' if mode == 'sweep' else 'Saliency'
+            
+            # Build context for strategist
+            graphs_summary = []
+            try:
+                for graph_name, graph_data in (agent.loaded_data.get('graphs', {}) or {}).items():
+                    data = graph_data.get('data', {}) if isinstance(graph_data, dict) else {}
+                    nodes = data.get('nodes', []) or []
+                    edges = data.get('edges', []) or []
+                    graphs_summary.append(f"{graph_name}: {len(nodes)} nodes, {len(edges)} edges")
+            except Exception:
+                pass
+            
+            # Get planning from strategist
+            try:
+                # Build graphs summary string
+                graphs_summary_str = "\n".join(graphs_summary) if graphs_summary else "(no graphs loaded)"
+                
+                # Get hypotheses summary
+                hyp_summary = f"{len(all_hypotheses)} hypotheses found so far"
+                if all_hypotheses:
+                    recent = [h.get('title', '') for h in all_hypotheses[-3:] if isinstance(h, dict)]
+                    if recent:
+                        hyp_summary += f" (recent: {', '.join(recent)})"
+                
+                # Coverage summary
+                cov_summary = ""
+                try:
+                    nodes_cov = coverage.get('nodes', {})
+                    cov_summary = f"Nodes: {nodes_cov.get('visited', 0)}/{nodes_cov.get('total', 0)} ({nodes_cov.get('percent', 0):.0f}%)"
+                except Exception:
+                    cov_summary = "(no coverage data)"
+                
+                items = strategist.plan_next(
+                    graphs_summary=graphs_summary_str,
+                    completed=completed_investigations,
+                    n=plan_n,
+                    hypotheses_summary=hyp_summary,
+                    coverage_summary=cov_summary,
+                    phase_hint=phase,
+                )
+                
+                if not items:
+                    publisher.publish_thought("No further investigations suggested — checking completion", iteration=total_iterations)
+                    consecutive_empty_rounds += 1
+                    if consecutive_empty_rounds >= 2:
+                        publisher.publish_thought(f"{mode.capitalize()} mode complete - no new targets", iteration=total_iterations)
+                        break
+                else:
+                    consecutive_empty_rounds = 0
+                    publisher.publish_thought(f"Strategist planned {len(items)} investigations", iteration=total_iterations)
+                    
+            except Exception as e:
+                publisher.publish_thought(f"Strategist planning failed: {e}, falling back to default", iteration=total_iterations)
+                import traceback
+                traceback.print_exc()
+                # Fallback: create a default investigation
+                items = [{'goal': investigation_prompt, 'priority': 1}]
+            
+            # Check for planning loop (same goals repeated)
+            current_round_goals = set(it.get('goal', '') if isinstance(it, dict) else getattr(it, 'goal', '') for it in items)
+            if current_round_goals == last_round_goals and last_round_goals:
+                consecutive_empty_rounds += 1
+                if consecutive_empty_rounds >= 2:
+                    publisher.publish_thought(f"Detected planning loop - {mode} mode complete", iteration=total_iterations)
+                    break
+            else:
+                last_round_goals = current_round_goals
+            
+            # Execute each planned investigation
+            for i, item in enumerate(items):
+                # Time check before each investigation
+                elapsed_minutes = (time_module.time() - start_overall) / 60.0
+                if elapsed_minutes >= time_limit_minutes:
+                    publisher.publish_thought(f"Time limit reached during investigation", iteration=total_iterations)
+                    break
+                
+                goal = item.get('goal', '') if isinstance(item, dict) else getattr(item, 'goal', '')
+                priority = item.get('priority', 0) if isinstance(item, dict) else getattr(item, 'priority', 0)
+                
+                if goal in completed_investigations:
+                    continue  # Skip already completed
+                
+                publisher.publish_thought(f"Investigation {i+1}/{len(items)}: {goal[:100]}", iteration=total_iterations)
+                
+                try:
+                    # Reset agent state for new investigation
+                    agent.reset_for_new_investigation()
+                    
+                    # Run investigation
+                    result = agent.investigate(
+                        prompt=goal,
+                        max_iterations=max_iterations,
+                        progress_callback=progress_callback,
+                    )
+                    
+                    total_iterations += result.get("iterations_completed", 0)
+                    
+                    # Collect hypotheses
+                    hyps = result.get("detailed_hypotheses", [])
+                    all_hypotheses.extend(hyps)
+                    
+                    completed_investigations.append(goal)
+                    publisher.publish_thought(f"Investigation complete: {len(hyps)} hypotheses found", iteration=total_iterations)
+                    
+                except Exception as e:
+                    publisher.publish_thought(f"Investigation failed: {e}", iteration=total_iterations)
+                    completed_investigations.append(goal)  # Mark as done to avoid retry
+            
+            # Sweep mode completion check
+            if mode == 'sweep' and planned_round > 1:
+                # Check if we've covered all major components
+                try:
+                    sys_graph = agent.loaded_data.get('graphs', {}).get('SystemArchitecture', {})
+                    gdata = sys_graph.get('data', {}) if isinstance(sys_graph, dict) else {}
+                    nodes = gdata.get('nodes', []) or []
+                    # Count high-level components
+                    comp_types = {'contract', 'component', 'module', 'class', 'service'}
+                    components = [n for n in nodes if n.get('type', '').lower() in comp_types]
+                    
+                    if components and len(completed_investigations) >= len(components):
+                        publisher.publish_thought(f"Sweep mode: all {len(components)} components analyzed", iteration=total_iterations)
+                        break
+                except Exception:
+                    pass
         
         # Log investigation result for debugging
-        iterations_completed = result.get("iterations_completed", 0)
-        print(f"[DEBUG] Investigation completed after {iterations_completed} iterations")
-        print(f"[DEBUG] Graphs analyzed: {result.get('graphs_analyzed', [])}")
-        print(f"[DEBUG] Nodes analyzed: {result.get('nodes_analyzed', 0)}")
-        print(f"[DEBUG] Hypotheses summary: {result.get('hypotheses', {})}")
+        print(f"[DEBUG] Full audit completed after {total_iterations} total iterations, {planned_round} rounds")
+        print(f"[DEBUG] Investigations completed: {len(completed_investigations)}")
+        print(f"[DEBUG] Total hypotheses: {len(all_hypotheses)}")
         
-        # Step 5: Collect and store results
-        # detailed_hypotheses contains the actual list, hypotheses is just a summary dict
-        hypotheses = result.get("detailed_hypotheses", [])
-        print(f"[DEBUG] detailed_hypotheses count: {len(hypotheses)}")
-        if hypotheses:
-            print(f"[DEBUG] First hypothesis sample: {hypotheses[0]}")
+        # Deduplicate hypotheses by title
+        seen_titles = set()
+        hypotheses = []
+        for h in all_hypotheses:
+            title = h.get('title', '') if isinstance(h, dict) else ''
+            if title and title not in seen_titles:
+                seen_titles.add(title)
+                hypotheses.append(h)
+        
+        print(f"[DEBUG] After dedup: {len(hypotheses)} unique hypotheses")
         
         # Store hypotheses in database
         print(f"[DEBUG] Storing {len(hypotheses)} hypotheses to DB for project_id={project_id}")

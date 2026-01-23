@@ -2691,11 +2691,14 @@ class AuditStartRequest(BaseModel):
     repo_url: str = Field(..., description="Git repository URL or local path")
     tenant_id: int = Field(default=1, description="Tenant ID for multi-tenancy")
     project_id: Optional[int] = Field(None, description="Link to existing project")
-    max_iterations: int = Field(default=50, description="Maximum agent iterations")
+    max_iterations: int = Field(default=30, description="Maximum agent iterations per investigation")
     investigation_prompt: Optional[str] = Field(None, description="Custom investigation prompt")
     installation_id: Optional[int] = Field(None, description="GitHub App installation ID")
     pr_number: Optional[int] = Field(None, description="PR number to post findings to")
     repo_full_name: Optional[str] = Field(None, description="Repository full name (owner/repo)")
+    time_limit_minutes: int = Field(default=120, description="Time limit for the entire audit in minutes")
+    mode: str = Field(default="sweep", description="Audit mode: 'sweep' (Phase 1 - broad coverage) or 'intuition' (Phase 2 - deep exploration)")
+    plan_n: int = Field(default=5, description="Number of investigations to plan per batch")
 
 
 class AuditStartResponse(BaseModel):
@@ -2791,6 +2794,9 @@ async def start_audit(request: AuditStartRequest, db: Session = Depends(get_db))
         installation_id=request.installation_id,
         pr_number=request.pr_number,
         repo_full_name=request.repo_full_name,
+        time_limit_minutes=request.time_limit_minutes,
+        mode=request.mode,
+        plan_n=request.plan_n,
     )
     
     logger.info(f"Dispatched audit task {task.id} for session {session_id}")

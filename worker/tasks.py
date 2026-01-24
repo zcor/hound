@@ -193,15 +193,15 @@ def execute_audit_task(
             publisher.publish_thought(f"Cloning repository: {repo_url}", iteration=0)
             
             import subprocess
-            result = subprocess.run(
+            clone_result = subprocess.run(
                 ["git", "clone", "--depth", "1", clone_url, str(repo_path)],
                 capture_output=True,
                 text=True,
                 timeout=300,  # 5 minute timeout for clone
             )
             
-            if result.returncode != 0:
-                raise RuntimeError(f"Git clone failed: {result.stderr}")
+            if clone_result.returncode != 0:
+                raise RuntimeError(f"Git clone failed: {clone_result.stderr}")
         else:
             repo_path = Path(repo_url).expanduser().resolve()
             if not repo_path.exists():
@@ -659,7 +659,7 @@ def execute_audit_task(
             "status": "completed",
             "scan_id": scan_id,
             "hypotheses_count": len(hypotheses),
-            "iterations": result.get("iterations_completed", 0),
+            "iterations": total_iterations,
             "hypotheses": hypotheses,
             "pr_result": pr_result,
         }

@@ -609,13 +609,14 @@ def execute_audit_task(
         print(f"[DEBUG] Investigations completed: {len(completed_investigations)}")
         print(f"[DEBUG] Total hypotheses: {len(all_hypotheses)}")
         
-        # Deduplicate hypotheses by title
-        seen_titles = set()
+        # Deduplicate hypotheses by description (detailed_hypotheses uses 'description' not 'title')
+        seen_descriptions = set()
         hypotheses = []
         for h in all_hypotheses:
-            title = h.get('title', '') if isinstance(h, dict) else ''
-            if title and title not in seen_titles:
-                seen_titles.add(title)
+            # Use description for dedup (title field may not exist in detailed_hypotheses format)
+            desc = h.get('description', '') if isinstance(h, dict) else ''
+            if desc and desc not in seen_descriptions:
+                seen_descriptions.add(desc)
                 hypotheses.append(h)
         
         print(f"[DEBUG] After dedup: {len(hypotheses)} unique hypotheses")

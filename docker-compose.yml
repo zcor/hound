@@ -6,8 +6,10 @@ services:
   db:
     image: postgres:15
     container_name: hound-db
+    # Increase max connections and shared buffers for concurrent workers
+    command: postgres -c max_connections=200 -c shared_buffers=256MB
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"  # Only expose to localhost
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-hound}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hound_secret}
@@ -26,14 +28,16 @@ services:
   redis:
     image: redis:7
     container_name: hound-redis
+    # Add password protection to prevent external attacks
+    command: redis-server --requirepass ${REDIS_PASSWORD:-hound_redis_secret}
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"  # Only expose to localhost
     volumes:
       - redis_data:/data
     networks:
       - hound-net
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-hound_redis_secret}", "ping"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -50,9 +54,9 @@ services:
     environment:
       # Database & Redis
       DATABASE_URL: postgresql://${POSTGRES_USER:-hound}:${POSTGRES_PASSWORD:-hound_secret}@db:5432/${POSTGRES_DB:-hound}
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:-hound_redis_secret}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-hound_redis_secret}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-hound_redis_secret}@redis:6379/0
       # GitHub Integration
       GITHUB_APP_ID: ${GITHUB_APP_ID:-}
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
@@ -82,9 +86,9 @@ services:
       PYTHONPATH: /app
       # Database & Redis
       DATABASE_URL: postgresql://${POSTGRES_USER:-hound}:${POSTGRES_PASSWORD:-hound_secret}@db:5432/${POSTGRES_DB:-hound}
-      REDIS_URL: redis://redis:6379/0
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:-hound_redis_secret}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-hound_redis_secret}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-hound_redis_secret}@redis:6379/0
       # LLM API Keys
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}

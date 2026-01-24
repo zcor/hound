@@ -459,16 +459,37 @@ def execute_audit_task(
             # Determine phase based on mode
             phase = 'Coverage' if mode == 'sweep' else 'Saliency'
             
-            # Build context for strategist
+            # Build context for strategist - use available_graphs for complete list
             graphs_summary = []
             try:
-                for graph_name, graph_data in (agent.loaded_data.get('graphs', {}) or {}).items():
-                    data = graph_data.get('data', {}) if isinstance(graph_data, dict) else {}
+                # First add the auto-loaded system graph
+                if agent.loaded_data.get('system_graph'):
+                    sys_graph = agent.loaded_data['system_graph']
+                    data = sys_graph.get('data', {})
                     nodes = data.get('nodes', []) or []
                     edges = data.get('edges', []) or []
-                    graphs_summary.append(f"{graph_name}: {len(nodes)} nodes, {len(edges)} edges")
-            except Exception:
-                pass
+                    graphs_summary.append(f"{sys_graph['name']}: {len(nodes)} nodes, {len(edges)} edges")
+                
+                # Then add any other available graphs
+                for graph_name, graph_meta in (agent.available_graphs or {}).items():
+                    # Skip if already added as system graph
+                    if agent.loaded_data.get('system_graph') and graph_name == agent.loaded_data['system_graph']['name']:
+                        continue
+                    # Load graph data to get node/edge counts
+                    try:
+                        graph_path = Path(graph_meta['path'])
+                        if graph_path.exists():
+                            with open(graph_path) as f:
+                                gdata = json.load(f)
+                            nodes = gdata.get('nodes', []) or []
+                            edges = gdata.get('edges', []) or []
+                            graphs_summary.append(f"{graph_name}: {len(nodes)} nodes, {len(edges)} edges")
+                    except Exception:
+                        graphs_summary.append(f"{graph_name}: (available)")
+            except Exception as e:
+                print(f"[DEBUG] Error building graphs_summary: {e}")
+            
+            print(f"[DEBUG] Graphs summary for strategist: {graphs_summary}")
             
             # Get planning from strategist
             try:

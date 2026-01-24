@@ -603,6 +603,10 @@ def execute_audit_task(
                         break
                 except Exception:
                     pass
+            
+            # Debug: log why we're continuing or breaking
+            elapsed_minutes = (time_module.time() - start_overall) / 60.0
+            print(f"[DEBUG] End of round {planned_round}: elapsed={elapsed_minutes:.1f}min, limit={time_limit_minutes}min, completed={len(completed_investigations)}, continuing to next round...")
         
         # Log investigation result for debugging
         print(f"[DEBUG] Full audit completed after {total_iterations} total iterations, {planned_round} rounds")

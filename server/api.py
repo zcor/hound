@@ -50,6 +50,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field, model_validator
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 
 from commands.project import ProjectManager
@@ -71,6 +74,15 @@ logger = logging.getLogger(__name__)
 
 # Database configuration
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
+
+# Redis configuration for state tokens
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+# GitHub App configuration
+GITHUB_APP_SLUG = os.environ.get("GITHUB_APP_SLUG", "firepan")
+
+# Rate limiter for auth endpoints
+limiter = Limiter(key_func=get_remote_address)
 
 # =============================================================================
 # ADMIN AUTHENTICATION
@@ -160,6 +172,13 @@ app.add_middleware(
 # Use HOUND_SECRET_KEY env var or generate a random one
 session_secret = os.environ.get("HOUND_SECRET_KEY", secrets.token_urlsafe(32))
 app.add_middleware(SessionMiddleware, secret_key=session_secret)
+
+# Add rate limiter state and exception handler
+app.state.limiter = limiter
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return HTTPException(status_code=429, detail="Rate limit exceeded")
 
 
 # Middleware to fix URL generation for proxied requests (Codespaces, ngrok, etc.)
@@ -6208,15 +6227,161 @@ async def get_active_config_info():
     }
 
 
+# ============================================================================
+# AUTH ENDPOINTS - GitHub App Waitlist Flow
+# ============================================================================
+
+
+class AuthStartRequest(BaseModel):
+    """Request model for starting OAuth flow."""
+    email: Optional[str] = None
+
+
+class AuthStartResponse(BaseModel):
+    """Response model for auth start endpoint."""
+    state_token: str
+    install_url: str
+
+
+class AuthCompleteRequest(BaseModel):
+    """Request model for completing OAuth flow."""
+    installation_id: int
+    state_token: str
+
+
+class AuthCompleteResponse(BaseModel):
+    """Response model for auth complete endpoint."""
+    success: bool
+    tenant_id: int
+    message: str
+
+
+def get_auth_redis_client():
+    """Get async Redis client for state token storage."""
+    return aioredis.from_url(REDIS_URL, decode_responses=True)
+
+
+@app.post("/auth/start", response_model=AuthStartResponse)
+@limiter.limit("20/minute")
+async def auth_start(request: Request, body: AuthStartRequest):
+    """
+    Start the GitHub App installation flow.
+
+    Generates a state token and stores the optional email in Redis.
+    Returns the state token and GitHub App install URL.
+
+    The frontend should redirect the user to the install_url.
+    """
+    # Generate opaque state token
+    state_token = secrets.token_urlsafe(32)
+
+    # Store in Redis with 10 minute TTL
+    redis_client = get_auth_redis_client()
+    try:
+        state_data = json.dumps({
+            "email": body.email,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        await redis_client.setex(f"auth_state:{state_token}", 600, state_data)
+    finally:
+        await redis_client.aclose()
+
+    # Build GitHub App install URL with state
+    install_url = f"https://github.com/apps/{GITHUB_APP_SLUG}/installations/new?state={state_token}"
+
+    return AuthStartResponse(
+        state_token=state_token,
+        install_url=install_url,
+    )
+
+
+@app.post("/auth/complete", response_model=AuthCompleteResponse)
+@limiter.limit("10/minute")
+async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session = Depends(get_db)):
+    """
+    Complete the GitHub App installation flow.
+
+    Called by the frontend after GitHub redirects back with installation_id.
+    Validates the state token, creates or updates the Tenant, and stores the email.
+
+    Security:
+    - State token is one-time use (deleted after validation)
+    - Rate limited to 10 requests/minute per IP
+    """
+    # Lookup and validate state token in Redis
+    redis_client = get_auth_redis_client()
+    try:
+        state_key = f"auth_state:{body.state_token}"
+        state_data_raw = await redis_client.get(state_key)
+
+        if not state_data_raw:
+            raise HTTPException(status_code=400, detail="Invalid or expired state token")
+
+        # Delete token immediately (one-time use, prevent replay)
+        await redis_client.delete(state_key)
+
+        state_data = json.loads(state_data_raw)
+        email = state_data.get("email")
+    finally:
+        await redis_client.aclose()
+
+    # Fetch installation details from GitHub API to verify it exists
+    try:
+        from integrations.github_app import get_github_app_integration
+        integration = get_github_app_integration()
+        installation = integration.get_installation(body.installation_id)
+        account_login = installation.account.login
+        account_type = installation.account.type
+    except Exception as e:
+        logger.warning(f"Failed to fetch installation {body.installation_id}: {e}")
+        # Installation might exist but we can't verify - proceed with limited info
+        account_login = f"installation_{body.installation_id}"
+        account_type = "Unknown"
+
+    # Find or create Tenant (webhook may have already created it)
+    tenant = db.query(Tenant).filter_by(installation_id=body.installation_id).first()
+
+    if not tenant:
+        # Webhook hasn't arrived yet - create pending tenant now
+        tenant = Tenant(
+            name=f"github_{account_login}",
+            installation_id=body.installation_id,
+            status="pending",
+            github_account_login=account_login,
+            github_account_type=account_type,
+        )
+        db.add(tenant)
+        db.flush()
+        logger.info(f"Created pending tenant {tenant.id} for installation {body.installation_id}")
+    else:
+        # Update GitHub account info if we have better data
+        if account_login and not account_login.startswith("installation_"):
+            tenant.github_account_login = account_login
+            tenant.github_account_type = account_type
+        logger.info(f"Found existing tenant {tenant.id} for installation {body.installation_id}")
+
+    # Update contact email if provided
+    if email:
+        tenant.contact_email = email
+
+    db.commit()
+
+    return AuthCompleteResponse(
+        success=True,
+        tenant_id=tenant.id,
+        message="You're on the waitlist! We'll review your application and be in touch.",
+    )
+
+
 # Health check endpoint
 @app.get("/health")
 async def health_check():
     """
     Health check endpoint.
-    
+
     Returns the current server status and timestamp. Used by load balancers
     and monitoring systems to verify the server is running and responsive.
-    
+
     Returns:
         dict: Status and UTC timestamp
     """

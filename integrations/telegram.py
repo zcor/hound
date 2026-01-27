@@ -120,8 +120,8 @@ async def notify_new_repo_synced(
         message_parts.append(f"📧 <b>Email:</b> {_escape_html(email)}")
 
     if installation_id:
-        # Link to GitHub App installation settings
-        message_parts.append(f"🔗 <b>Installation:</b> <a href=\"https://github.com/settings/installations/{installation_id}\">{installation_id}</a>")
+        # Link to GitHub App's installation list (accessible by app owners)
+        message_parts.append(f"🔗 <b>Installation:</b> <a href=\"https://github.com/organizations/firepan-labs/settings/apps/firepan-ai/installations\">{installation_id}</a>")
 
     if tenant_id:
         message_parts.append(f"🆔 <b>Tenant ID:</b> {tenant_id}")

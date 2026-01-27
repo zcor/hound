@@ -69,6 +69,8 @@ services:
       # Telegram Notifications
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./secrets:/secrets:ro
     depends_on:
       db:
         condition: service_healthy

@@ -6331,6 +6331,7 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
         await redis_client.aclose()
 
     # Fetch installation details from GitHub API to verify it exists
+    repos_list = []
     try:
         from integrations.github_app import get_github_app_integration
         integration = get_github_app_integration()
@@ -6338,6 +6339,18 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
         installation = integration.get_app_installation(body.installation_id)
         account_login = installation.account.login
         account_type = installation.account.type
+
+        # Fetch repos (limit to first 10 for notification)
+        try:
+            gh = integration.get_github_for_installation(body.installation_id)
+            repos = gh.get_installation(body.installation_id).get_repos()
+            for i, repo in enumerate(repos):
+                if i >= 10:
+                    repos_list.append("...")
+                    break
+                repos_list.append(repo.full_name)
+        except Exception as repo_err:
+            logger.warning(f"Failed to fetch repos for installation {body.installation_id}: {repo_err}")
     except Exception as e:
         logger.warning(f"Failed to fetch installation {body.installation_id}: {e}")
         # Installation might exist but we can't verify - proceed with limited info
@@ -6380,6 +6393,7 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
             email=email,
             tenant_id=tenant.id,
             installation_id=body.installation_id,
+            repos=repos_list,
         )
     except Exception as e:
         # Don't fail the request if notification fails

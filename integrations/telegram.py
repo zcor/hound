@@ -86,6 +86,7 @@ async def notify_new_repo_synced(
     email: Optional[str] = None,
     tenant_id: Optional[int] = None,
     installation_id: Optional[int] = None,
+    repos: Optional[list[str]] = None,
 ) -> bool:
     """
     Send notification when a new GitHub repository is synced.
@@ -96,6 +97,7 @@ async def notify_new_repo_synced(
         email: Contact email if provided
         tenant_id: Database tenant ID
         installation_id: GitHub App installation ID
+        repos: List of repository full names (e.g., ["owner/repo1", "owner/repo2"])
 
     Returns:
         True if notification was sent successfully
@@ -119,9 +121,14 @@ async def notify_new_repo_synced(
     if email:
         message_parts.append(f"📧 <b>Email:</b> {_escape_html(email)}")
 
-    if installation_id:
-        # Link to GitHub App's installation list (accessible by app owners)
-        message_parts.append(f"🔗 <b>Installation:</b> <a href=\"https://github.com/organizations/firepan-labs/settings/apps/firepan-ai/installations\">{installation_id}</a>")
+    if repos:
+        repo_lines = []
+        for repo in repos:
+            if repo == "...":
+                repo_lines.append("  • ...")
+            else:
+                repo_lines.append(f'  • <a href="https://github.com/{_escape_html(repo)}">{_escape_html(repo)}</a>')
+        message_parts.append(f"📦 <b>Repos:</b>\n" + "\n".join(repo_lines))
 
     if tenant_id:
         message_parts.append(f"🆔 <b>Tenant ID:</b> {tenant_id}")

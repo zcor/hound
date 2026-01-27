@@ -48,6 +48,8 @@ import redis.asyncio as aioredis
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
+
+from integrations.telegram import notify_new_repo_synced
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field, model_validator
 from slowapi import Limiter
@@ -6365,6 +6367,18 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
         tenant.contact_email = email
 
     db.commit()
+
+    # Send Telegram notification (fire-and-forget, don't block response)
+    try:
+        await notify_new_repo_synced(
+            github_account=tenant.github_account_login or f"installation_{body.installation_id}",
+            account_type=tenant.github_account_type or "Unknown",
+            email=email,
+            tenant_id=tenant.id,
+        )
+    except Exception as e:
+        # Don't fail the request if notification fails
+        logger.warning(f"Failed to send Telegram notification: {e}")
 
     return AuthCompleteResponse(
         success=True,

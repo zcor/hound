@@ -66,6 +66,9 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       # Admin Key
       HOUND_ADMIN_KEY: ${HOUND_ADMIN_KEY:-}
+      # Telegram Notifications
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     depends_on:
       db:
         condition: service_healthy

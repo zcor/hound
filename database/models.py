@@ -75,9 +75,13 @@ class Tenant(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(255), nullable=False, unique=True)
     installation_id = Column(BigInteger, nullable=True, unique=True, index=True)  # GitHub App installation ID (one tenant per installation)
+    status = Column(String(50), nullable=False, default="pending")  # pending, approved, active
+    contact_email = Column(String(255), nullable=True)  # Email from signup flow
+    github_account_login = Column(String(255), nullable=True)  # GitHub username or org name
+    github_account_type = Column(String(50), nullable=True)  # "User" or "Organization"
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
+
     # Relationships
     projects = relationship("Project", back_populates="tenant", cascade="all, delete-orphan")
     scan_executions = relationship("ScanExecution", back_populates="tenant", cascade="all, delete-orphan")

@@ -6378,6 +6378,7 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
             account_type=tenant.github_account_type or "Unknown",
             email=email,
             tenant_id=tenant.id,
+            installation_id=body.installation_id,
         )
     except Exception as e:
         # Don't fail the request if notification fails

@@ -85,6 +85,7 @@ async def notify_new_repo_synced(
     account_type: str,
     email: Optional[str] = None,
     tenant_id: Optional[int] = None,
+    installation_id: Optional[int] = None,
 ) -> bool:
     """
     Send notification when a new GitHub repository is synced.
@@ -94,6 +95,7 @@ async def notify_new_repo_synced(
         account_type: "User" or "Organization"
         email: Contact email if provided
         tenant_id: Database tenant ID
+        installation_id: GitHub App installation ID
 
     Returns:
         True if notification was sent successfully
@@ -101,23 +103,28 @@ async def notify_new_repo_synced(
     # Build the notification message
     emoji = "👤" if account_type == "User" else "🏢"
 
+    # Create clickable GitHub link if we have a real account name
+    if github_account.startswith("installation_"):
+        account_display = _escape_html(github_account)
+    else:
+        account_display = f'<a href="https://github.com/{_escape_html(github_account)}">{_escape_html(github_account)}</a>'
+
     message_parts = [
-        f"🔥 <b>New Repo Synced!</b>",
+        f"🔥 <b>New Waitlist Signup!</b>",
         f"",
-        f"{emoji} <b>Account:</b> {_escape_html(github_account)}",
+        f"{emoji} <b>Account:</b> {account_display}",
         f"📋 <b>Type:</b> {account_type}",
     ]
 
     if email:
         message_parts.append(f"📧 <b>Email:</b> {_escape_html(email)}")
 
+    if installation_id:
+        # Link to GitHub App installation settings
+        message_parts.append(f"🔗 <b>Installation:</b> <a href=\"https://github.com/settings/installations/{installation_id}\">{installation_id}</a>")
+
     if tenant_id:
         message_parts.append(f"🆔 <b>Tenant ID:</b> {tenant_id}")
-
-    message_parts.extend([
-        f"",
-        f"<i>Added to waitlist</i>",
-    ])
 
     message = "\n".join(message_parts)
     return await send_telegram_message(message)

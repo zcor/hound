@@ -6358,10 +6358,19 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
         account_type = "Unknown"
 
     # Find or create Tenant (webhook may have already created it)
+    # Check by installation_id first, then by account name (handles reinstalls with new installation_id)
     tenant = db.query(Tenant).filter_by(installation_id=body.installation_id).first()
 
+    if not tenant and account_login and not account_login.startswith("installation_"):
+        # Check if tenant exists by name (reinstall case - new installation_id for same account)
+        tenant = db.query(Tenant).filter_by(name=f"github_{account_login}").first()
+        if tenant:
+            # Update installation_id to the new one
+            tenant.installation_id = body.installation_id
+            logger.info(f"Updated tenant {tenant.id} with new installation_id {body.installation_id}")
+
     if not tenant:
-        # Webhook hasn't arrived yet - create pending tenant now
+        # Create new tenant
         tenant = Tenant(
             name=f"github_{account_login}",
             installation_id=body.installation_id,

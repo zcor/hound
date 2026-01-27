@@ -6334,7 +6334,8 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
     try:
         from integrations.github_app import get_github_app_integration
         integration = get_github_app_integration()
-        installation = integration.get_installation(body.installation_id)
+        # Use get_app_installation() with installation ID
+        installation = integration.get_app_installation(body.installation_id)
         account_login = installation.account.login
         account_type = installation.account.type
     except Exception as e:

@@ -31,26 +31,32 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://localhost/hound")
 def get_github_app_integration() -> GithubIntegration:
     """
     Create a GitHub App integration instance.
-    
+
     Returns:
         GithubIntegration instance for making authenticated requests
-        
+
     Raises:
         ValueError: If GitHub App credentials are not configured
     """
     if not GITHUB_APP_ID:
         raise ValueError("GITHUB_APP_ID environment variable is not set")
-    
-    if not GITHUB_APP_PRIVATE_KEY_PATH:
-        raise ValueError("GITHUB_APP_PRIVATE_KEY_PATH environment variable is not set")
-    
-    private_key_path = Path(GITHUB_APP_PRIVATE_KEY_PATH)
-    if not private_key_path.exists():
-        raise ValueError(f"Private key file not found: {private_key_path}")
-    
-    with open(private_key_path) as key_file:
-        private_key = key_file.read()
-    
+
+    # Try to get private key from file path first, then from env var directly
+    private_key = None
+
+    if GITHUB_APP_PRIVATE_KEY_PATH:
+        private_key_path = Path(GITHUB_APP_PRIVATE_KEY_PATH)
+        if private_key_path.exists():
+            with open(private_key_path) as key_file:
+                private_key = key_file.read()
+
+    # Fall back to inline env var (useful for local dev)
+    if not private_key:
+        private_key = os.environ.get("GITHUB_APP_PRIVATE_KEY")
+
+    if not private_key:
+        raise ValueError("No GitHub App private key configured (set GITHUB_APP_PRIVATE_KEY_PATH or GITHUB_APP_PRIVATE_KEY)")
+
     auth = Auth.AppAuth(int(GITHUB_APP_ID), private_key)
     return GithubIntegration(auth=auth)
 

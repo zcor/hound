@@ -6342,13 +6342,17 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
 
         # Fetch repos (limit to first 10 for notification)
         try:
-            gh = integration.get_github_for_installation(body.installation_id)
-            repos = gh.get_installation(body.installation_id).get_repos()
-            for i, repo in enumerate(repos):
+            import requests
+            access_token = integration.get_access_token(body.installation_id)
+            headers = {"Authorization": f"Bearer {access_token.token}", "Accept": "application/vnd.github+json"}
+            response = requests.get("https://api.github.com/installation/repositories", headers=headers)
+            data = response.json()
+            total_count = data.get("total_count", 0)
+            for i, repo in enumerate(data.get("repositories", [])):
                 if i >= 10:
-                    repos_list.append("...")
+                    repos_list.append(f"... and {total_count - 10} more")
                     break
-                repos_list.append(repo.full_name)
+                repos_list.append(repo["full_name"])
         except Exception as repo_err:
             logger.warning(f"Failed to fetch repos for installation {body.installation_id}: {repo_err}")
     except Exception as e:

@@ -6285,6 +6285,7 @@ async def auth_start(request: Request, body: AuthStartRequest):
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
         await redis_client.setex(f"auth_state:{state_token}", 600, state_data)
+        logger.info(f"AUTH_START: Generated token={state_token[:20]}... email={body.email}")
     finally:
         await redis_client.aclose()
 
@@ -6311,12 +6312,14 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
     - Rate limited to 10 requests/minute per IP
     """
     # Lookup and validate state token in Redis
+    logger.info(f"AUTH_COMPLETE: Received token={body.state_token[:20]}... installation_id={body.installation_id}")
     redis_client = get_auth_redis_client()
     try:
         state_key = f"auth_state:{body.state_token}"
         state_data_raw = await redis_client.get(state_key)
 
         if not state_data_raw:
+            logger.warning(f"AUTH_COMPLETE: Token NOT FOUND in Redis: {body.state_token[:20]}...")
             raise HTTPException(status_code=400, detail="Invalid or expired state token")
 
         # Delete token immediately (one-time use, prevent replay)

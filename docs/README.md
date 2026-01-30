@@ -1,4 +1,4 @@
-# Hound Documentation
+# Firepan Documentation
 
 ## Quick Start
 - [Main README](../README.md) - Installation and basic usage

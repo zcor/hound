@@ -1,6 +1,6 @@
 # API Reference
 
-This document provides a comprehensive reference for Hound's REST API and WebSocket interfaces.
+This document provides a comprehensive reference for Firepan's REST API and WebSocket interfaces.
 
 ## Table of Contents
 

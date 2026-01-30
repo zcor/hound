@@ -1,6 +1,6 @@
 # Developer Guide
 
-This guide covers development setup, architecture, and contribution guidelines for Hound.
+This guide covers development setup, architecture, and contribution guidelines for Firepan.
 
 ## Table of Contents
 

@@ -1,6 +1,6 @@
 # Architecture Deep Dive
 
-This document provides a comprehensive technical overview of Hound's architecture, design decisions, and implementation details.
+This document provides a comprehensive technical overview of Firepan's architecture, design decisions, and implementation details.
 
 ## Table of Contents
 
@@ -17,13 +17,13 @@ This document provides a comprehensive technical overview of Hound's architectur
 
 ## System Overview
 
-Hound is a security analysis platform that combines LLM-powered agents with knowledge graph reasoning to find vulnerabilities in code.
+Firepan is a security analysis platform that combines LLM-powered agents with knowledge graph reasoning to find vulnerabilities in code.
 
 ### High-Level Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          HOUND PLATFORM                             │
+│                         FIREPAN PLATFORM                            │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
 │  ┌─────────────────────┐         ┌──────────────────────┐         │
@@ -334,7 +334,7 @@ OR (for SaaS)
 
 ### Agent Roles
 
-Hound uses a **multi-agent architecture** with specialized roles:
+Firepan uses a **multi-agent architecture** with specialized roles:
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -1054,7 +1054,7 @@ logger.info("Starting audit", extra={"project": project_name})
 
 ## Conclusion
 
-Hound's architecture balances:
+Firepan's architecture balances:
 - **Cost** - Multi-agent with cheap/expensive models
 - **Quality** - Advanced reasoning when needed
 - **Scalability** - Horizontal scaling, async processing

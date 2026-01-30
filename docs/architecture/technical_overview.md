@@ -1,6 +1,6 @@
 # Tech
 
-Hound is a cognitive auditing framework designed to replicate how real expert auditors think, collaborate, and refine their understanding over time. Below we describe the main technical innovations that set Hound apart.
+Firepan is a cognitive auditing framework designed to replicate how real expert auditors think, collaborate, and refine their understanding over time. Below we describe the main technical innovations that set Firepan apart.
 
 ---
 
@@ -8,7 +8,7 @@ Hound is a cognitive auditing framework designed to replicate how real expert au
 
 ![Dynamic graph example](./static/graph.png)
 
-Hound builds dynamic, agent-chosen knowledge graphs that capture structure, flows, and invariants as “living” models of the codebase.
+Firepan builds dynamic, agent-chosen knowledge graphs that capture structure, flows, and invariants as “living” models of the codebase.
 
 * **Flexible abstraction** – Nodes and edges are not hard-coded: the agent decides what to represent. Micro (functions, storage, modifiers), meso (authorization, pausing, staking subsystems), and macro (user flows, asset movements) all coexist in purpose-built graphs.
 * **Agent-driven schema discovery** – In `analysis/graph_builder.py`, `GraphBuilder._discover_graphs` uses the “agent” LLM profile to propose graphs like `SystemArchitecture`, `StateMutationGraph`, `InterContractCallGraph`, and `AuthorizationRolesMap` based on the repository, files, and bundles.
@@ -20,7 +20,7 @@ Hound builds dynamic, agent-chosen knowledge graphs that capture structure, flow
 
 ## 2. Iterative Hypothesis & Belief System
 
-* **Targeted hypothesis formation** – Hound avoids the “spam hundreds of shallow guesses” approach. Instead, hypotheses are formed like a human auditor’s intuition: The most promising aspects are investigated first and the model thinks more deeply to form targeted hypotheses (see also 'dynamic model switching').
+* **Targeted hypothesis formation** – Firepan avoids the “spam hundreds of shallow guesses” approach. Instead, hypotheses are formed like a human auditor’s intuition: The most promising aspects are investigated first and the model thinks more deeply to form targeted hypotheses (see also 'dynamic model switching').
 * **Belief refinement** – Hypotheses are tracked with confidence scores. As new code is explored, confidence is strengthened, weakened, or disproven. Evidence is attached, and findings evolve into either confirmed vulnerabilities or discarded ideas.
 * **Long-horizon audits** – This design means audits scale with runtime: a day-long audit may surface basic issues, but a week-long audit accumulates richer understanding and deeper bugs, just like human auditors.
 
@@ -33,7 +33,7 @@ Hound builds dynamic, agent-chosen knowledge graphs that capture structure, flow
 
   * *Exploration model* → loads graphs, reads code, notes invariants and observations.
   * *Guidance model* → performs “deep think” passes that identify vulnerabilities and propose next directions.
-* **Efficiency with quality** – This lets Hound keep costs low while still accessing heavyweight reasoning where it matters most.
+* **Efficiency with quality** – This lets Firepan keep costs low while still accessing heavyweight reasoning where it matters most.
 
 ---
 

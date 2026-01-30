@@ -1,6 +1,6 @@
 # Quick Start Guide
 
-This quick start guide helps you get up and running with Hound in minutes.
+This quick start guide helps you get up and running with Firepan in minutes.
 
 ## Choose Your Mode
 
@@ -495,7 +495,7 @@ HOUND_ADMIN_KEY        # API admin password
 
 ## Summary
 
-Hound provides:
+Firepan provides:
 ✅ Autonomous security analysis  
 ✅ Knowledge graph reasoning  
 ✅ Multi-agent architecture  

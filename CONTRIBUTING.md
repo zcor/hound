@@ -1,6 +1,6 @@
-# Contributing to Hound
+# Contributing to Firepan
 
-Thank you for your interest in contributing to Hound! This document provides guidelines and instructions for contributing to the project.
+Thank you for your interest in contributing to Firepan! This document provides guidelines and instructions for contributing to the project.
 
 ## Quick Links
 
@@ -422,7 +422,7 @@ Significant contributions may earn:
 
 ## License
 
-By contributing to Hound, you agree that your contributions will be licensed under the Apache 2.0 License. See [LICENSE.txt](LICENSE.txt) for details.
+By contributing to Firepan, you agree that your contributions will be licensed under the Apache 2.0 License. See [LICENSE.txt](LICENSE.txt) for details.
 
 ## Questions?
 
@@ -432,4 +432,4 @@ If you have questions about contributing:
 3. Ask in [GitHub Discussions](https://github.com/firepan-labs/hound/discussions)
 4. Reach out to maintainers
 
-Thank you for contributing to Hound! 🚀
+Thank you for contributing to Firepan! 🚀

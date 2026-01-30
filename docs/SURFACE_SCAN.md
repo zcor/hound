@@ -1,10 +1,10 @@
-# Hound Surface Scan
+# Firepan Surface Scan
 
 A lightweight, cost-effective security scanner for preliminary assessment of Solidity/Vyper smart contract repositories.
 
 ## Overview
 
-Surface Scan is designed for **lead generation** - quickly scanning hundreds of repos to identify potential prospects who might benefit from a full Hound audit. It's NOT a replacement for deep auditing.
+Surface Scan is designed for **lead generation** - quickly scanning hundreds of repos to identify potential prospects who might benefit from a full Firepan audit. It's NOT a replacement for deep auditing.
 
 **Key Characteristics:**
 - Fast: ~2 seconds per repo (static analysis only)

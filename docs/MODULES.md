@@ -1,6 +1,6 @@
 # Module Documentation
 
-This document provides detailed technical documentation for each major module in Hound.
+This document provides detailed technical documentation for each major module in Firepan.
 
 ## Table of Contents
 
@@ -600,7 +600,7 @@ class SessionTracker:
 
 Location: `commands/`
 
-CLI command implementations for all Hound operations.
+CLI command implementations for all Firepan operations.
 
 ### Key Files
 
@@ -610,7 +610,7 @@ Project management commands.
 
 ```python
 class ProjectManager:
-    """Manage Hound projects."""
+    """Manage Firepan projects."""
     
     def create_project(
         self,
@@ -1190,7 +1190,7 @@ class PRBot:
 **Example PR comment:**
 
 ```markdown
-## 🔍 Hound Security Audit Results
+## 🔍 Firepan Security Audit Results
 
 Found **3 high-severity** and **2 medium-severity** issues:
 

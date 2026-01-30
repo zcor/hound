@@ -2,6 +2,7 @@
 
 ## Quick Start
 - [Main README](../README.md) - Installation and basic usage
+- [Quick Start Guide](QUICK_START.md) - Get up and running in minutes
 
 ## Technical Documentation
 - [API Reference](API_REFERENCE.md) - Complete REST and WebSocket API documentation

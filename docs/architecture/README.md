@@ -1,4 +1,4 @@
-# Hound Architecture Documentation
+# Firepan Architecture Documentation
 
 This folder contains detailed technical documentation for Hound's architecture and implementation.
 

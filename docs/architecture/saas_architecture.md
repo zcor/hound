@@ -1,6 +1,6 @@
-# Hound SaaS Architecture
+# Firepan SaaS Architecture
 
-This document describes how Hound transforms from a CLI tool into a production SaaS service.
+This document describes how Firepan transforms from a CLI tool into a production SaaS service.
 
 ## Overview
 
@@ -12,7 +12,7 @@ Hound's SaaS architecture follows a **Server/Worker** pattern where:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Hound SaaS Architecture                        │
+│                            Firepan SaaS Architecture                        │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐                  │

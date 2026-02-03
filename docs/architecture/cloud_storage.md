@@ -229,4 +229,4 @@ Potential future improvements:
 
 ## Conclusion
 
-This implementation successfully adds cloud storage support to Hound while maintaining full backward compatibility. The abstraction layer allows easy integration of additional storage backends in the future.
+This implementation successfully adds cloud storage support to Firepan while maintaining full backward compatibility. The abstraction layer allows easy integration of additional storage backends in the future.

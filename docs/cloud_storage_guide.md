@@ -4,7 +4,7 @@ This document explains how to use the cloud storage adapter to store session dat
 
 ## Overview
 
-The Hound project now supports multiple storage backends for session management and graph storage:
+The Firepan project now supports multiple storage backends for session management and graph storage:
 
 - **Local Filesystem** (default): Traditional file-based storage
 - **S3/MinIO**: Cloud-based storage for distributed deployments

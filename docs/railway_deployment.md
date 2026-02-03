@@ -1,4 +1,4 @@
-# Hound Railway Deployment Guide
+# Firepan Railway Deployment Guide
 
 ## Architecture Overview
 
@@ -7,7 +7,7 @@
 │                      Railway Project                            │
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌──────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────────┐   │
-│  │ Postgres │  │  Redis  │  │ Hound   │  │ Hound Frontend  │   │
+│  │ Postgres │  │  Redis  │  │ Firepan │  │ Firepan Frontend│   │
 │  │ (plugin) │  │ (plugin)│  │ API     │  │ (Next.js)       │   │
 │  └────┬─────┘  └────┬────┘  └────┬────┘  └────────┬────────┘   │
 │       │             │            │                │            │

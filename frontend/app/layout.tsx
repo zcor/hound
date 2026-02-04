@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Hound Dashboard",
-  description: "Professional SaaS dashboard for security auditing",
+  title: "FirePan Dashboard",
+  description: "AI-powered smart contract security platform",
 };
 
 export default function RootLayout({

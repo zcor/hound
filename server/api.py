@@ -47,7 +47,8 @@ load_dotenv()
 import redis.asyncio as aioredis
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from integrations.telegram import notify_new_repo_synced
 from starlette.middleware.sessions import SessionMiddleware
@@ -209,7 +210,18 @@ async def fix_forwarded_headers(request: Request, call_next):
         request.scope["headers"] = new_headers
     
     response = await call_next(request)
-    return response# Mount SQLAdmin dashboard at /admin
+    return response
+
+# Mount static files for generated reports
+reports_base_dir = Path.home() / ".hound" / "reports"
+reports_base_dir.mkdir(parents=True, exist_ok=True)
+
+try:
+    app.mount("/reports", StaticFiles(directory=str(reports_base_dir), html=True), name="reports")
+except Exception as e:
+    logger.warning(f"Failed to mount reports directory: {e}")
+
+# Mount SQLAdmin dashboard at /admin
 from server.admin import setup_admin
 
 # Initialize admin panel (deferred until engine is ready)
@@ -3192,6 +3204,8 @@ class SyncAuditResponse(BaseModel):
     confirmed_count: int
     findings: List[Dict[str, Any]]
     duration_seconds: float
+    report_path: Optional[str] = None
+    report_url: Optional[str] = None
 
 
 @app.post("/audits/run-sync", response_model=SyncAuditResponse)
@@ -3415,17 +3429,113 @@ Analyze the loaded graphs systematically and form hypotheses for any potential i
             audit_session.end_time = datetime.now(timezone.utc)
             db.commit()
             
+            # Auto-generate report if enabled (default: true for sync audits)
+            auto_generate_report = os.environ.get("AUTO_GENERATE_REPORT", "true").lower() == "true"
+            report_path = None
+            
+            if auto_generate_report and confirmed_count > 0:
+                try:
+                    logger.info(f"Auto-generating report for session {session_id}...")
+                    from analysis.report_generator import ReportGenerator
+                    import tempfile
+                    
+                    # Create temporary project directory for report
+                    with tempfile.TemporaryDirectory(prefix="hound_report_") as report_temp_dir:
+                        report_temp_path = Path(report_temp_dir)
+                        
+                        # Create graphs directory
+                        report_graphs_dir = report_temp_path / "graphs"
+                        report_graphs_dir.mkdir()
+                        
+                        # Write knowledge_graphs.json
+                        kg_data = {
+                            "manifest": {"repo_path": str(source_path) if source_path else None},
+                            "card_store_path": None
+                        }
+                        with open(report_graphs_dir / "knowledge_graphs.json", "w") as f:
+                            json.dump(kg_data, f)
+                        
+                        # Write minimal graph file
+                        with open(report_graphs_dir / "graph_analysis.json", "w") as f:
+                            json.dump({"nodes": [], "edges": []}, f)
+                        
+                        # Build hypotheses dict
+                        hyp_dict = {}
+                        for h in hypotheses_saved:
+                            hyp_dict[h["hypothesis_id"]] = {
+                                "title": h["title"],
+                                "description": "",
+                                "vulnerability_type": "",
+                                "status": h["status"],
+                                "confidence": h["confidence"],
+                                "severity": h["severity"],
+                                "node_refs": [],
+                                "evidence": {},
+                                "annotations": [],
+                                "reasoning": "",
+                            }
+                        
+                        # Write hypotheses.json
+                        hyp_data = {
+                            "hypotheses": hyp_dict,
+                            "metadata": {"source": "database", "project_name": project.name}
+                        }
+                        with open(report_temp_path / "hypotheses.json", "w") as f:
+                            json.dump(hyp_data, f)
+                        
+                        # Create reports directory
+                        (report_temp_path / "reports").mkdir(exist_ok=True)
+                        
+                        # Generate report
+                        generator = ReportGenerator(
+                            project_dir=report_temp_path,
+                            config=config,
+                            debug=False,
+                            include_all=False
+                        )
+                        
+                        report_html = generator.generate(
+                            project_name=project.name,
+                            project_source=str(source_path) if source_path else None,
+                            title=f"Security Audit Report: {project.name}",
+                            auditors=["Security Team"],
+                            format="html",
+                            progress_callback=None
+                        )
+                        
+                        # Save report
+                        user_reports_dir = Path.home() / ".hound" / "reports" / project.name
+                        user_reports_dir.mkdir(parents=True, exist_ok=True)
+                        
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        report_path = user_reports_dir / f"audit_report_{timestamp}.html"
+                        
+                        with open(report_path, 'w') as f:
+                            f.write(report_html)
+                        
+                        logger.info(f"Auto-generated report saved to: {report_path}")
+                        
+                except Exception as report_err:
+                    logger.warning(f"Failed to auto-generate report: {report_err}")
+                    # Don't fail the audit if report generation fails
+            
             duration = time.time() - start_time
             
-            return SyncAuditResponse(
-                success=True,
-                message=f"Audit completed for project '{project.name}'",
-                session_id=session_id,
-                hypotheses_found=len(hypotheses_saved),
-                confirmed_count=confirmed_count,
-                findings=hypotheses_saved,
-                duration_seconds=round(duration, 2),
-            )
+            response_data = {
+                "success": True,
+                "message": f"Audit completed for project '{project.name}'",
+                "session_id": session_id,
+                "hypotheses_found": len(hypotheses_saved),
+                "confirmed_count": confirmed_count,
+                "findings": hypotheses_saved,
+                "duration_seconds": round(duration, 2),
+            }
+            
+            if report_path:
+                response_data["report_path"] = str(report_path)
+                response_data["report_url"] = f"/reports/{project.name}/{report_path.name}"
+            
+            return SyncAuditResponse(**response_data)
             
     except Exception as e:
         logger.exception(f"Audit failed: {e}")

@@ -5,6 +5,7 @@ Provides a GUI admin interface for managing database models.
 Access at /admin when mounted to the FastAPI app.
 """
 
+from pathlib import Path
 from sqladmin import Admin, ModelView, action
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
@@ -346,6 +347,92 @@ class ProjectAdmin(ModelView, model=Project):
             f"/admin/project/list?message={message[:200]}",
             status_code=302,
         )
+    
+    @action(
+        name="generate_full_report",
+        label="Generate Report",
+        confirmation_message="Generate comprehensive audit report for selected projects? (Uses all confirmed findings)",
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def generate_full_report_action(self, request: Request) -> RedirectResponse:
+        """Generate report from all confirmed findings in the project (across all audit sessions)."""
+        pks = request.query_params.get("pks", "").split(",")
+        generated = []
+        
+        from server.api import get_engine
+        from database import create_db_session
+        engine = get_engine()
+        db = create_db_session(engine)
+        
+        try:
+            import httpx
+            for pk in pks:
+                if pk:
+                    try:
+                        project = db.query(Project).filter(Project.id == int(pk)).first()
+                        if not project:
+                            continue
+                        
+                        # Find most recent completed audit session for this project
+                        latest_session = db.query(AuditSession).filter(
+                            AuditSession.project_id == project.id,
+                            AuditSession.status == "completed"
+                        ).order_by(AuditSession.start_time.desc()).first()
+                        
+                        if not latest_session:
+                            generated.append(f"⚠️ {project.name}: No completed audit sessions found")
+                            continue
+                        
+                        # Call report generation API
+                        async def generate_report_request():
+                            async with httpx.AsyncClient(timeout=300.0) as client:
+                                host = request.headers.get("host", "localhost:8000")
+                                scheme = request.headers.get("x-forwarded-proto", "http")
+                                base_url = f"{scheme}://{host}"
+                                
+                                response = await client.post(
+                                    f"{base_url}/sessions/{latest_session.session_id}/report",
+                                    json={
+                                        "format": "html",
+                                        "title": f"Security Audit Report: {project.name}",
+                                        "auditors": "Security Team",
+                                        "include_all": False  # Only confirmed findings
+                                    }
+                                )
+                                return response
+                        
+                        response = await generate_report_request()
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            report_path = Path(data['output_path'])
+                            findings_count = data['total_findings']
+                            # Create downloadable URL
+                            report_url = f"/reports/{project.name}/{report_path.name}"
+                            generated.append(f"✅ {project.name}: {findings_count} findings → <a href='{report_url}' target='_blank'>{report_path.name}</a>")
+                        else:
+                            error = response.json().get("detail", "Unknown error")
+                            generated.append(f"❌ {project.name}: {error[:50]}")
+                            
+                    except Exception as e:
+                        print(f"Failed to generate report for project {pk}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        generated.append(f"❌ Project {pk}: {str(e)[:50]}")
+        finally:
+            db.close()
+        
+        if generated:
+            message = " | ".join(generated)
+            request.session["flash"] = Markup(message[:500])
+        else:
+            request.session["flash"] = "No reports generated"
+        
+        return RedirectResponse(
+            request.url_for("admin:list", identity=self.identity),
+            status_code=302,
+        )
 
 
 class AuditSessionAdmin(ModelView, model=AuditSession):
@@ -451,6 +538,82 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
         
         if aborted:
             request.session["flash"] = f"Aborted: {', '.join(aborted)}"
+        
+        return RedirectResponse(
+            request.url_for("admin:list", identity=self.identity),
+            status_code=302,
+        )
+    
+    @action(
+        name="generate_report",
+        label="Generate Report",
+        confirmation_message="Generate audit report for selected sessions? (Confirmed findings only)",
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def generate_report_action(self, request: Request) -> RedirectResponse:
+        """Generate professional HTML audit report for selected sessions."""
+        pks = request.query_params.get("pks", "").split(",")
+        generated = []
+        
+        from server.api import get_engine
+        from database import create_db_session
+        engine = get_engine()
+        db = create_db_session(engine)
+        
+        try:
+            import httpx
+            for pk in pks:
+                if pk:
+                    try:
+                        session = db.query(AuditSession).filter(AuditSession.id == int(pk)).first()
+                        if not session:
+                            continue
+                        
+                        project = db.query(Project).filter(Project.id == session.project_id).first()
+                        if not project:
+                            continue
+                        
+                        # Call report generation API
+                        async def generate_report_request():
+                            async with httpx.AsyncClient(timeout=300.0) as client:
+                                host = request.headers.get("host", "localhost:8000")
+                                scheme = request.headers.get("x-forwarded-proto", "http")
+                                base_url = f"{scheme}://{host}"
+                                
+                                response = await client.post(
+                                    f"{base_url}/sessions/{session.session_id}/report",
+                                    json={
+                                        "format": "html",
+                                        "title": f"Security Audit Report: {project.name}",
+                                        "auditors": "Security Team",
+                                        "include_all": False  # Only confirmed findings
+                                    }
+                                )
+                                return response
+                        
+                        response = await generate_report_request()
+                        
+                        if response.status_code == 200:
+                            data = response.json()
+                            report_path = Path(data['output_path'])
+                            findings_count = data['total_findings']
+                            generated.append(f"{project.name}: {findings_count} findings → {report_path.name}")
+                        else:
+                            error = response.json().get("detail", "Unknown error")
+                            generated.append(f"❌ {project.name}: {error[:50]}")
+                            
+                    except Exception as e:
+                        print(f"Failed to generate report for session {pk}: {e}")
+                        generated.append(f"❌ Session {pk}: {str(e)[:50]}")
+        finally:
+            db.close()
+        
+        if generated:
+            message = " | ".join(generated)
+            request.session["flash"] = message[:500]
+        else:
+            request.session["flash"] = "No reports generated"
         
         return RedirectResponse(
             request.url_for("admin:list", identity=self.identity),
@@ -972,6 +1135,121 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
         
         if rejected:
             request.session["flash"] = f"Rejected: {len(rejected)} findings"
+        
+        return RedirectResponse(
+            request.url_for("admin:list", identity=self.identity),
+            status_code=302,
+        )
+    
+    @action(
+        name="confirm_and_report",
+        label="Confirm & Generate Report",
+        confirmation_message="Confirm selected findings and generate audit report?",
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def confirm_and_report_action(self, request: Request) -> RedirectResponse:
+        """Confirm findings and immediately generate an audit report."""
+        pks = request.query_params.get("pks", "").split(",")
+        
+        from server.api import get_engine
+        from database import create_db_session
+        engine = get_engine()
+        db = create_db_session(engine)
+        
+        confirmed = []
+        project_id = None
+        project_name = None
+        
+        try:
+            # First, confirm all selected findings
+            for pk in pks:
+                if pk:
+                    try:
+                        finding = db.query(Hypothesis).filter(Hypothesis.id == int(pk)).first()
+                        if finding:
+                            finding.status = "confirmed"
+                            finding.confidence = 1.0
+                            db.commit()
+                            confirmed.append(finding.title[:30])
+                            if not project_id:
+                                project_id = finding.project_id
+                    except Exception as e:
+                        print(f"Failed to confirm finding {pk}: {e}")
+            
+            if not confirmed:
+                request.session["flash"] = "No findings to confirm"
+                return RedirectResponse(
+                    request.url_for("admin:list", identity=self.identity),
+                    status_code=302,
+                )
+            
+            # Get project and latest session
+            project = db.query(Project).filter(Project.id == project_id).first()
+            if not project:
+                request.session["flash"] = f"Confirmed {len(confirmed)} findings, but project not found"
+                return RedirectResponse(
+                    request.url_for("admin:list", identity=self.identity),
+                    status_code=302,
+                )
+            
+            project_name = project.name
+            
+            # Find most recent completed audit session
+            latest_session = db.query(AuditSession).filter(
+                AuditSession.project_id == project_id,
+                AuditSession.status == "completed"
+            ).order_by(AuditSession.start_time.desc()).first()
+            
+            if not latest_session:
+                request.session["flash"] = f"Confirmed {len(confirmed)} findings, but no completed audit session found for report"
+                return RedirectResponse(
+                    request.url_for("admin:list", identity=self.identity),
+                    status_code=302,
+                )
+            
+            # Generate report
+            import httpx
+            
+            async def generate_report_request():
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    host = request.headers.get("host", "localhost:8000")
+                    scheme = request.headers.get("x-forwarded-proto", "http")
+                    base_url = f"{scheme}://{host}"
+                    
+                    response = await client.post(
+                        f"{base_url}/sessions/{latest_session.session_id}/report",
+                        json={
+                            "format": "html",
+                            "title": f"Security Audit Report: {project.name}",
+                            "auditors": "Security Team",
+                            "include_all": False
+                        }
+                    )
+                    return response
+            
+            response = await generate_report_request()
+            
+            if response.status_code == 200:
+                data = response.json()
+                report_path = Path(data['output_path'])
+                findings_count = data['total_findings']
+                report_url = f"/reports/{project.name}/{report_path.name}"
+                request.session["flash"] = Markup(
+                    f"✅ Confirmed {len(confirmed)} findings → Generated report with {findings_count} total findings → "
+                    f"<a href='{report_url}' target='_blank'>{report_path.name}</a>"
+                )
+            else:
+                error = response.json().get("detail", "Unknown error")
+                request.session["flash"] = f"Confirmed {len(confirmed)} findings, but report generation failed: {error[:100]}"
+                
+        except Exception as e:
+            print(f"Failed in confirm_and_report action: {e}")
+            import traceback
+            traceback.print_exc()
+            request.session["flash"] = f"Error: {str(e)[:100]}"
+        finally:
+            db.close()
         
         return RedirectResponse(
             request.url_for("admin:list", identity=self.identity),

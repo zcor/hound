@@ -350,13 +350,13 @@ class ProjectAdmin(ModelView, model=Project):
     
     @action(
         name="generate_full_report",
-        label="Generate Report",
-        confirmation_message="Generate comprehensive audit report for selected projects? (Uses all confirmed findings)",
+        label="🤖 Generate Report (AI)",
+        confirmation_message="Generate AI-powered comprehensive audit report? This analyzes all confirmed findings and generates an executive summary using AI. Takes 30-60 seconds.",
         add_in_detail=True,
         add_in_list=True,
     )
     async def generate_full_report_action(self, request: Request) -> RedirectResponse:
-        """Generate report from all confirmed findings in the project (across all audit sessions)."""
+        """Generate report from all confirmed findings with AI-generated executive summary."""
         pks = request.query_params.get("pks", "").split(",")
         generated = []
         
@@ -409,11 +409,15 @@ class ProjectAdmin(ModelView, model=Project):
                             report_path = Path(data['output_path'])
                             findings_count = data['total_findings']
                             # Create downloadable URL
-                            report_url = f"/reports/{project.name}/{report_path.name}"
-                            generated.append(f"✅ {project.name}: {findings_count} findings → <a href='{report_url}' target='_blank'>{report_path.name}</a>")
+                            report_url = data.get('report_url', f"/reports/{project.name}/{report_path.name}")
+                            generated.append(
+                                f"✅ {project.name}: {findings_count} findings → "
+                                f"<a href='{report_url}' target='_blank' class='btn btn-sm btn-success'>📄 View Report</a>"
+                            )
                         else:
-                            error = response.json().get("detail", "Unknown error")
-                            generated.append(f"❌ {project.name}: {error[:50]}")
+                            error_data = response.json() if response.status_code != 500 else {"detail": "Server error"}
+                            error = error_data.get("detail", "Unknown error")
+                            generated.append(f"❌ {project.name}: {error[:100]}")
                             
                     except Exception as e:
                         print(f"Failed to generate report for project {pk}: {e}")
@@ -425,7 +429,7 @@ class ProjectAdmin(ModelView, model=Project):
         
         if generated:
             message = " | ".join(generated)
-            request.session["flash"] = Markup(message[:500])
+            request.session["flash"] = Markup(message[:1000])
         else:
             request.session["flash"] = "No reports generated"
         
@@ -546,13 +550,13 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
     
     @action(
         name="generate_report",
-        label="Generate Report",
-        confirmation_message="Generate audit report for selected sessions? (Confirmed findings only)",
+        label="🤖 Generate Report (AI)",
+        confirmation_message="Generate AI-powered audit report? This will take 30-60 seconds as the AI analyzes findings and compiles the executive summary. Confirmed findings only.",
         add_in_detail=True,
         add_in_list=True,
     )
     async def generate_report_action(self, request: Request) -> RedirectResponse:
-        """Generate professional HTML audit report for selected sessions."""
+        """Generate professional HTML audit report with AI-generated executive summary."""
         pks = request.query_params.get("pks", "").split(",")
         generated = []
         
@@ -598,10 +602,15 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
                             data = response.json()
                             report_path = Path(data['output_path'])
                             findings_count = data['total_findings']
-                            generated.append(f"{project.name}: {findings_count} findings → {report_path.name}")
+                            report_url = data.get('report_url', f"/reports/{project.name}/{report_path.name}")
+                            generated.append(
+                                f"✅ {project.name}: {findings_count} findings → "
+                                f"<a href='{report_url}' target='_blank' class='text-success'><strong>📄 View Report</strong></a>"
+                            )
                         else:
-                            error = response.json().get("detail", "Unknown error")
-                            generated.append(f"❌ {project.name}: {error[:50]}")
+                            error_data = response.json() if response.status_code != 500 else {"detail": "Server error - check logs"}
+                            error = error_data.get("detail", "Unknown error")
+                            generated.append(f"❌ {project.name}: {error[:100]}")
                             
                     except Exception as e:
                         print(f"Failed to generate report for session {pk}: {e}")
@@ -611,7 +620,7 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
         
         if generated:
             message = " | ".join(generated)
-            request.session["flash"] = message[:500]
+            request.session["flash"] = Markup(message[:1000])
         else:
             request.session["flash"] = "No reports generated"
         
@@ -1143,13 +1152,13 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
     
     @action(
         name="confirm_and_report",
-        label="Confirm & Generate Report",
-        confirmation_message="Confirm selected findings and generate audit report?",
+        label="✅ Confirm & Generate Report (AI)",
+        confirmation_message="Confirm selected findings and generate AI-powered audit report? The AI will analyze findings and create an executive summary. Takes 30-60 seconds.",
         add_in_detail=True,
         add_in_list=True,
     )
     async def confirm_and_report_action(self, request: Request) -> RedirectResponse:
-        """Confirm findings and immediately generate an audit report."""
+        """Confirm findings and immediately generate an AI-powered audit report."""
         pks = request.query_params.get("pks", "").split(",")
         
         from server.api import get_engine
@@ -1234,20 +1243,21 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
                 data = response.json()
                 report_path = Path(data['output_path'])
                 findings_count = data['total_findings']
-                report_url = f"/reports/{project.name}/{report_path.name}"
+                report_url = data.get('report_url', f"/reports/{project.name}/{report_path.name}")
                 request.session["flash"] = Markup(
-                    f"✅ Confirmed {len(confirmed)} findings → Generated report with {findings_count} total findings → "
-                    f"<a href='{report_url}' target='_blank'>{report_path.name}</a>"
+                    f"✅ Confirmed {len(confirmed)} findings → AI generated report with {findings_count} total findings → "
+                    f"<a href='{report_url}' target='_blank' class='btn btn-sm btn-success'>📄 View Report</a>"
                 )
             else:
-                error = response.json().get("detail", "Unknown error")
-                request.session["flash"] = f"Confirmed {len(confirmed)} findings, but report generation failed: {error[:100]}"
+                error_data = response.json() if response.status_code != 500 else {"detail": "Server error"}
+                error = error_data.get("detail", "Unknown error")
+                request.session["flash"] = f"Confirmed {len(confirmed)} findings, but report generation failed: {error[:150]}"
                 
         except Exception as e:
             print(f"Failed in confirm_and_report action: {e}")
             import traceback
             traceback.print_exc()
-            request.session["flash"] = f"Error: {str(e)[:100]}"
+            request.session["flash"] = f"Error: {str(e)[:150]}"
         finally:
             db.close()
         

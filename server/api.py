@@ -4825,25 +4825,42 @@ async def generate_report(
     Generate a security audit report for a session's findings.
     
     Creates a professional HTML or Markdown report with:
-    - Executive summary
+    - Executive summary (AI-generated)
     - Vulnerability findings with severity ratings
     - Code snippets and remediation advice
     - Testing methodology
+    
+    This endpoint uses LLM to generate executive summary and takes 30-60 seconds.
     """
     import re
     import tempfile
     import subprocess
     from datetime import datetime
+    import traceback
     
-    # Get the session
-    session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    logger.info(f"Starting report generation for session {session_id}")
     
-    # Get the project
-    project = db.query(Project).filter(Project.id == session.project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    try:
+        # Get the session
+        session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
+        if not session:
+            logger.error(f"Session not found: {session_id}")
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Get the project
+        project = db.query(Project).filter(Project.id == session.project_id).first()
+        if not project:
+            logger.error(f"Project not found for session {session_id}")
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        logger.info(f"Generating report for project: {project.name}")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in report generation setup: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Setup error: {str(e)}")
     
     # Determine repo root
     repo_root = None
@@ -4986,32 +5003,55 @@ async def generate_report(
         (temp_project_dir / "reports").mkdir(exist_ok=True)
         
         # Load config for LLM
-        config_path = Path(__file__).parent.parent / "config.yaml"
-        config = {}
-        if config_path.exists():
-            import yaml
-            with open(config_path) as f:
-                config = yaml.safe_load(f) or {}
+        logger.info("Loading configuration for LLM...")
+        config = None
+        try:
+            config = get_active_config()
+            logger.info(f"Config loaded: {list(config.get('models', {}).keys())}")
+        except Exception as config_err:
+            logger.warning(f"Failed to load config: {config_err}")
+            # Try fallback config
+            config_path = Path(__file__).parent.parent / "config.yaml"
+            if config_path.exists():
+                import yaml
+                with open(config_path) as f:
+                    config = yaml.safe_load(f) or {}
+                logger.info("Loaded config from config.yaml")
+            else:
+                logger.error("No configuration found - report may fail")
+                config = {}
+        
+        if not hypotheses:
+            logger.warning(f"No hypotheses found for session {session_id}")
+            raise HTTPException(status_code=400, detail="No findings to include in report")
         
         # Initialize report generator
+        logger.info(f"Initializing report generator with {len(hypotheses)} hypotheses...")
         from analysis.report_generator import ReportGenerator
         
         generator = ReportGenerator(
             project_dir=temp_project_dir,
             config=config,
-            debug=False,
+            debug=True,  # Enable debug for better error messages
             include_all=request.include_all
         )
         
-        # Generate report
-        report_data = generator.generate(
-            project_name=project.name,
-            project_source=str(repo_root) if repo_root else None,
-            title=request.title or f"Security Audit: {project.name}",
-            auditors=request.auditors.split(','),
-            format=request.format,
-            progress_callback=None
-        )
+        # Generate report (this calls LLM for executive summary)
+        logger.info("Generating report... This will take 30-60 seconds as AI compiles the analysis...")
+        try:
+            report_data = generator.generate(
+                project_name=project.name,
+                project_source=str(repo_root) if repo_root else None,
+                title=request.title or f"Security Audit Report: {project.name}",
+                auditors=request.auditors.split(','),
+                format=request.format,
+                progress_callback=lambda msg: logger.info(f"Report progress: {msg}")
+            )
+            logger.info(f"Report generated successfully: {len(report_data)} bytes")
+        except Exception as gen_err:
+            logger.error(f"Report generation failed: {gen_err}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Report generation failed: {str(gen_err)}")
         
         # Save report to user's home directory
         user_reports_dir = Path.home() / f".hound/reports/{project.name}"
@@ -5027,20 +5067,33 @@ async def generate_report(
         # Count confirmed findings
         confirmed_count = len([h for h in hypotheses if h.status == "confirmed"])
         
+        # Generate accessible URL
+        report_url = f"/reports/{project.name}/{output_path.name}"
+        
+        logger.info(f"Report saved to: {output_path}")
+        logger.info(f"Report URL: {report_url}")
+        
         return ReportGenerateResponse(
             session_id=session_id,
             project_name=project.name,
             format=request.format,
             total_findings=confirmed_count if not request.include_all else len(hypotheses),
             output_path=str(output_path),
-            report_url=None  # Could be a served URL if we add static file serving
+            report_url=report_url
         )
-        
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in report generation: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
     finally:
         # Cleanup temp directories
         import shutil
         try:
-            shutil.rmtree(temp_project_dir, ignore_errors=True)
+            if 'temp_project_dir' in locals():
+                shutil.rmtree(temp_project_dir, ignore_errors=True)
         except Exception:
             pass
         

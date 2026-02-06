@@ -444,22 +444,22 @@ class ReportGenerator:
             "Guidance:\n"
             f"- Application name: Extract the actual protocol/application name from the system graph nodes and contracts. Look for protocol names, diamond names, or main contract names. If unclear, use the project name '{project_name}' capitalized.\n"
             "- Executive summary (2-3 paragraphs with good spacing):\n"
-            "  * First paragraph: State that the Hound security team conducted this comprehensive audit\n"
+            "  * First paragraph: State that the Firepan security team conducted this comprehensive audit\n"
             "  * Second paragraph: List aspects from AUDIT_SCOPE_GRAPHS as readable prose, not class names\n"
             "  * Third paragraph: Brief summary of findings and security posture\n"
             "  * DO NOT mention specific model names in the text - these will be shown in a table below\n"
             "  * DO NOT make up human names like Alex, Jessica, etc.\n"
             "  * DO NOT duplicate model information that's shown in the table\n"
             "  * NEVER use: 'hypothesis', 'AI', 'model', 'automated', 'LLM', or made-up human names\n"
-            "  * ALWAYS write as: 'The Hound team', 'our team', 'we'\n"
+            "  * ALWAYS write as: 'The Firepan team', 'our team', 'we'\n"
             "  * Use line breaks between paragraphs for readability\n"
             "- System overview (4-5 paragraphs with good spacing):\n"
-            "  * Write as the Hound team describing what we analyzed\n"
+            "  * Write as the Firepan team describing what we analyzed\n"
             "  * Use concrete contract/component names from the system graph\n"
             "  * Include line breaks between paragraphs\n"
             "  * Describe architecture, data flows, and security mechanisms\n"
             "  * Focus on technical details relevant to security\n"
-            "  * Use: 'The Hound team identified', 'our analysis revealed', 'we discovered'\n"
+            "  * Use: 'The Firepan team identified', 'our analysis revealed', 'we discovered'\n"
             "  * When mentioning specific findings, ONLY use actual model names from ACTUAL_TEAM_MEMBERS\n"
             "  * DO NOT invent human names - only use the exact model names provided\n"
         )
@@ -495,7 +495,7 @@ class ReportGenerator:
             nodes = len(sa.get('nodes', [])) if isinstance(sa, dict) else 0
             edges = len(sa.get('edges', [])) if isinstance(sa, dict) else 0
             exec_summary = (
-                f"The Hound team conducted a focused audit of {app_name}.\n\n"
+                f"The Firepan team conducted a focused audit of {app_name}.\n\n"
                 f"Scope included {num_graphs} graph(s): {', '.join(graph_names) if graph_names else 'none listed'}. "
                 f"We evaluated architecture, authorization, and value flows where applicable.\n\n"
                 f"No LLM narrative was used for this run; this summary is synthesized from local project data. "
@@ -527,7 +527,7 @@ class ReportGenerator:
         # Gather report data
         report_date = datetime.now().strftime("%B %d, %Y")
         
-        # Build auditors display: Hound team members (AI models as named auditors)
+        # Build auditors display: Firepan team members (AI models as named auditors)
         # Use the helper to extract models properly
         models = self._extract_audit_models()
         
@@ -549,7 +549,7 @@ class ReportGenerator:
         auditor_models = [x for x in auditor_models if not (x in seen or seen.add(x))]
         
         if not auditor_models:
-            auditor_models = ['Hound Security Team']
+            auditor_models = ['Firepan Security Team']
         
         # Preferred: generate both sections via a single LLM call
         self._emit_progress('llm', 'Generating executive summary and system overview')
@@ -668,7 +668,7 @@ Audit Statistics:
 {findings_summary}
 
 Write a professional executive summary (2-3 paragraphs) that:
-1) States that the Hound security team conducted this {'preliminary' if self.include_all else 'comprehensive'} security audit of {project_name}.
+1) States that the Firepan security team conducted this {'preliminary' if self.include_all else 'comprehensive'} security audit of {project_name}.
 2) Describes WHAT the system does (type and core purpose) based on the components above.
 3) Summarizes the security posture and any findings discovered.
 {'4) CRITICAL: Include a clear warning that this report contains UNREVIEWED findings that have not undergone quality assurance and may contain false positives.' if self.include_all else ''}
@@ -677,11 +677,11 @@ CRITICAL INSTRUCTIONS:
 - DO NOT mention any specific model names (GPT-5, Claude, etc.) - a table below will show this
 - DO NOT discuss who did what parts of the analysis
 - DO NOT make up human names like Alex, Jessica, Sarah, etc.
-- Write as "The Hound team", "our team", "we" (first person plural)
+- Write as "The Firepan team", "our team", "we" (first person plural)
 - Focus on the AUDIT RESULTS not the audit process
 - NEVER use: "hypothesis", "AI", "model", "automated", "LLM", or made-up names
 - ALWAYS use: "findings", "security concerns", "team", "analysis"
-- Present this as a professional security audit by the Hound team
+- Present this as a professional security audit by the Firepan team
 {'- MUST include clear warning about unreviewed findings and potential false positives' if self.include_all else ''}"""
 
         try:
@@ -1827,7 +1827,7 @@ External dependencies are limited and clearly defined."""
             <div class="report-meta">
                 <strong>Project:</strong> {kwargs.get('project_name', '')}<br>
                 <strong>Date:</strong> {kwargs['report_date']}<br>
-                <strong>Audit Team:</strong> Hound Security<br>
+                <strong>Audit Team:</strong> Firepan Security<br>
                 <strong>Lead Auditors:</strong> {', '.join(kwargs['auditors'])}
             </div>
         </div>
@@ -1856,8 +1856,8 @@ External dependencies are limited and clearly defined."""
         {self._generate_badge_section_html(kwargs['project_name'], kwargs['report_date'], len(kwargs['findings']))}
         
         <div class="footer">
-            <p>© {datetime.now().year} Hound Security Team<br>
-            Report prepared by: {kwargs.get('report_writer', 'Hound Team')}<br>
+            <p>© {datetime.now().year} Firepan Security Team<br>
+            Report prepared by: {kwargs.get('report_writer', 'Firepan Team')}<br>
         </div>
     </div>
 </body>
@@ -2137,10 +2137,10 @@ External dependencies are limited and clearly defined."""
         safe_project_name = re.sub(r'[-\s]+', '_', safe_project_name).strip('_')
         
         # Create embeddable markdown snippet
-        markdown_badge = f'[![Hound Security Audit](https://img.shields.io/badge/Audited_by-Hound-{hex_color}?style=flat-square&logo=security&logoColor=white)]({safe_project_name}_security_report.html)'
+        markdown_badge = f'[![Firepan Security Audit](https://img.shields.io/badge/Audited_by-Firepan-{hex_color}?style=flat-square&logo=security&logoColor=white)]({safe_project_name}_security_report.html)'
         
         # Create embeddable HTML snippet
-        html_badge = f'<a href="{self._escape_html(safe_project_name)}_security_report.html"><img src="https://img.shields.io/badge/Audited_by-Hound-{hex_color}?style=flat-square&logo=security&logoColor=white" alt="Hound Security Audit" /></a>'
+        html_badge = f'<a href="{self._escape_html(safe_project_name)}_security_report.html"><img src="https://img.shields.io/badge/Audited_by-Firepan-{hex_color}?style=flat-square&logo=security&logoColor=white" alt="Firepan Security Audit" /></a>'
         
         return f"""
         <div class="section">
@@ -2158,8 +2158,8 @@ External dependencies are limited and clearly defined."""
                 
                 <h3 style="color: #81c7f7; margin-top: 0; margin-bottom: 15px;">Badge Preview</h3>
                 <div style="text-align: center; padding: 20px; background: rgba(15,20,25,0.8); border-radius: 8px; margin-bottom: 20px;">
-                    <img src="https://img.shields.io/badge/Audited_by-Hound-{hex_color}?style=flat-square&logo=security&logoColor=white" 
-                         alt="Hound Security Audit" 
+                    <img src="https://img.shields.io/badge/Audited_by-Firepan-{hex_color}?style=flat-square&logo=security&logoColor=white" 
+                         alt="Firepan Security Audit" 
                          style="max-width: 100%; height: auto;" />
                 </div>
                 
@@ -2665,7 +2665,7 @@ The audit employed a comprehensive security assessment methodology including:
 
 ---
 
-*Generated by Hound Security Analysis Platform*  
+*Generated by Firepan Security Analysis Platform*  
 *© {datetime.now().year} - Security Report*
 """
         

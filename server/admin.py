@@ -6,10 +6,12 @@ Access at /admin when mounted to the FastAPI app.
 """
 
 from pathlib import Path
-from sqladmin import Admin, ModelView, action
+from sqladmin import Admin, ModelView, action, BaseView, expose
 from starlette.requests import Request
-from starlette.responses import RedirectResponse
+from starlette.responses import RedirectResponse, HTMLResponse
 from markupsafe import Markup
+import os
+from datetime import datetime
 
 from database.models import (
     AuditSession,
@@ -71,19 +73,51 @@ def confidence_formatter(value):
 
 
 class TenantAdmin(ModelView, model=Tenant):
-    """Admin view for Tenant model."""
+    """Admin view for Tenant model - Organizations/Users."""
     
-    column_list = [Tenant.id, Tenant.name, Tenant.installation_id, Tenant.created_at]
-    column_searchable_list = [Tenant.name]
-    column_sortable_list = [Tenant.id, Tenant.name, Tenant.created_at]
+    page_size = 100
+    page_size_options = [25, 50, 100, 200]
+    
+    column_list = [
+        Tenant.id,
+        Tenant.name,
+        Tenant.status,
+        Tenant.github_account_login,
+        Tenant.installation_id,
+        Tenant.created_at
+    ]
+    column_searchable_list = [Tenant.name, Tenant.github_account_login, Tenant.contact_email]
+    column_sortable_list = [Tenant.id, Tenant.name, Tenant.status, Tenant.created_at]
     column_default_sort = [(Tenant.created_at, True)]
+    column_formatters = {
+        Tenant.status: lambda m, a: status_formatter(m.status),
+        Tenant.name: lambda m, a: Markup(
+            f'<strong style="font-size: 1.1em; color: #64b5f6;">{m.name}</strong>'
+        ),
+    }
+    column_details_list = [
+        Tenant.id,
+        Tenant.name,
+        Tenant.status,
+        Tenant.contact_email,
+        Tenant.github_account_login,
+        Tenant.github_account_type,
+        Tenant.installation_id,
+        Tenant.projects,
+        Tenant.scan_executions,
+        Tenant.created_at,
+        Tenant.updated_at,
+    ]
     icon = "fa-solid fa-building"
-    name = "Tenant"
-    name_plural = "Tenants"
+    name = "Tenant / Organization"
+    name_plural = "Tenants / Organizations"
 
 
 class ProjectAdmin(ModelView, model=Project):
     """Admin view for Project model."""
+    
+    page_size = 100
+    page_size_options = [25, 50, 100, 200]
     
     column_list = [
         Project.id,
@@ -98,6 +132,9 @@ class ProjectAdmin(ModelView, model=Project):
     column_default_sort = [(Project.created_at, True)]
     column_formatters = {
         Project.status: lambda m, a: status_formatter(m.status),
+        Project.tenant: lambda m, a: Markup(
+            f'<span class="badge bg-info" style="font-size: 0.9em;">{m.tenant.name if m.tenant else "No Tenant"}</span>'
+        ) if m.tenant else Markup('<span class="text-muted">No Tenant</span>'),
     }
     icon = "fa-solid fa-code-branch"
     name = "Project"
@@ -442,6 +479,9 @@ class ProjectAdmin(ModelView, model=Project):
 class AuditSessionAdmin(ModelView, model=AuditSession):
     """Admin view for AuditSession model."""
     
+    page_size = 100
+    page_size_options = [25, 50, 100, 200]
+    
     column_list = [
         AuditSession.id,
         AuditSession.session_id,
@@ -460,6 +500,9 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
     column_default_sort = [(AuditSession.start_time, True)]
     column_formatters = {
         AuditSession.status: lambda m, a: status_formatter(m.status),
+        AuditSession.project: lambda m, a: Markup(
+            f'<span class="badge bg-primary" style="font-size: 0.9em;">{m.project.name if m.project else "N/A"}</span>'
+        ) if m.project else Markup('<span class="text-muted">No Project</span>'),
     }
     # Show more fields in detail view
     column_details_list = [
@@ -633,6 +676,9 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
 class ScanExecutionAdmin(ModelView, model=ScanExecution):
     """Admin view for ScanExecution model (Surface Scans)."""
     
+    page_size = 100
+    page_size_options = [25, 50, 100, 200]
+    
     column_list = [
         ScanExecution.id,
         ScanExecution.repo_name,
@@ -661,7 +707,118 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
             f'{m.risk_score or 0}/100</span>'
         ) if m.risk_score is not None else "",
     }
+    column_details_formatters = {
+        ScanExecution.findings: lambda m, a: ScanExecutionAdmin.format_findings(m, a),
+        ScanExecution.quality_metrics: lambda m, a: ScanExecutionAdmin.format_quality_metrics(m, a),
+        ScanExecution.status: lambda m, a: status_formatter(m.status),
+        ScanExecution.risk_level: lambda m, a: severity_formatter(m.risk_level),
+    }
+    # Custom formatter for findings JSON - display as formatted HTML
+    @staticmethod
+    def format_findings(m, a):
+        """Format findings JSON as readable HTML with severity badges."""
+        import json
+        if not m.findings:
+            return Markup('<p class="text-muted">No findings available</p>')
+        
+        try:
+            findings = m.findings if isinstance(m.findings, dict) else json.loads(m.findings)
+            html = '<div class="findings-container" style="max-width: 900px;">'
+            
+            severity_order = [('critical', 'danger'), ('high', 'warning'), ('medium', 'info'), ('low', 'secondary')]
+            total_count = 0
+            
+            for severity, badge_color in severity_order:
+                findings_list = findings.get(severity, [])
+                if not findings_list:
+                    continue
+                    
+                count = len(findings_list)
+                total_count += count
+                html += f'<h5 class="mt-3"><span class="badge bg-{badge_color} text-uppercase">{severity}</span> ({count})</h5>'
+                
+                for finding in findings_list:
+                    confidence_pct = int((finding.get('confidence', 0) * 100))
+                    html += f'''
+                    <div class="card mb-2" style="border-left: 4px solid var(--bs-{badge_color});">
+                        <div class="card-body p-3">
+                            <h6 class="card-title mb-1">
+                                <strong>{finding.get('id', 'N/A')}</strong>: {finding.get('title', 'Untitled')}
+                                <span class="badge bg-secondary ms-2">{confidence_pct}% confidence</span>
+                            </h6>
+                            <p class="mb-1 text-muted small">
+                                <i class="fa-solid fa-file-code"></i> {finding.get('contract', 'Unknown')} 
+                                <i class="fa-solid fa-hashtag ms-2"></i> Line {finding.get('line', 'N/A')}
+                            </p>
+                            <p class="mb-2">{finding.get('description', 'No description')}</p>
+                            <div class="alert alert-info mb-0 py-2">
+                                <strong>💡 Recommendation:</strong> {finding.get('recommendation', 'No recommendation')}
+                            </div>
+                        </div>
+                    </div>
+                    '''
+            
+            if total_count == 0:
+                html += '<p class="text-muted">No findings to display</p>'
+            
+            html += '</div>'
+            return Markup(html)
+        except Exception as e:
+            return Markup(f'<p class="text-danger">Error formatting findings: {str(e)}</p>')
+    
+    # Custom formatter for quality metrics
+    @staticmethod
+    def format_quality_metrics(m, a):
+        """Format quality metrics as progress bars."""
+        import json
+        if not m.quality_metrics:
+            return Markup('<p class="text-muted">No metrics available</p>')
+        
+        try:
+            metrics = m.quality_metrics if isinstance(m.quality_metrics, dict) else json.loads(m.quality_metrics)
+            html = '<div class="metrics-container" style="max-width: 600px;">'
+            
+            metric_labels = {
+                'security_score': '🔒 Security Score',
+                'code_coverage': '📊 Code Coverage',
+                'test_coverage': '✅ Test Coverage',
+                'documentation_score': '📝 Documentation',
+                'dependency_health': '📦 Dependency Health',
+                'maintainability': '🔧 Maintainability'
+            }
+            
+            for key, label in metric_labels.items():
+                value = metrics.get(key, 0)
+                percent = int(value * 100)
+                
+                if percent >= 80:
+                    bar_color = 'success'
+                elif percent >= 60:
+                    bar_color = 'info'
+                elif percent >= 40:
+                    bar_color = 'warning'
+                else:
+                    bar_color = 'danger'
+                
+                html += f'''
+                <div class="mb-2">
+                    <div class="d-flex justify-content-between mb-1">
+                        <span style="font-size: 0.9em;">{label}</span>
+                        <span class="badge bg-{bar_color}">{percent}%</span>
+                    </div>
+                    <div class="progress" style="height: 20px;">
+                        <div class="progress-bar bg-{bar_color}" role="progressbar" style="width: {percent}%"></div>
+                    </div>
+                </div>
+                '''
+            
+            html += '</div>'
+            return Markup(html)
+        except Exception as e:
+            return Markup(f'<p class="text-danger">Error formatting metrics: {str(e)}</p>')
+    
     # Only use column_details_list to specify exactly which fields to show (exclude large JSON fields)
+    # Note: Findings and metrics are available via "View Findings" action button
     column_details_list = [
         ScanExecution.id,
         ScanExecution.execution_id,
@@ -681,6 +838,10 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
         ScanExecution.completed_at,
         ScanExecution.created_at,
     ]
+    # Add helpful note in column labels
+    column_labels = {
+        ScanExecution.summary: "Summary (📋 Use 'View Findings' button for detailed findings)"
+    }
     icon = "fa-solid fa-radar"
     name = "Surface Scan"
     name_plural = "Surface Scans"
@@ -972,6 +1133,9 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
 class GraphAdmin(ModelView, model=Graph):
     """Admin view for Graph model."""
     
+    page_size = 100
+    page_size_options = [25, 50, 100, 200]
+    
     column_list = [
         Graph.id,
         Graph.name,
@@ -983,6 +1147,11 @@ class GraphAdmin(ModelView, model=Graph):
     column_searchable_list = [Graph.name, Graph.internal_name]
     column_sortable_list = [Graph.id, Graph.name, Graph.created_at, Graph.updated_at]
     column_default_sort = [(Graph.updated_at, True)]
+    column_formatters = {
+        Graph.project: lambda m, a: Markup(
+            f'<span class="badge bg-primary" style="font-size: 0.9em;">{m.project.name if m.project else "N/A"}</span>'
+        ) if m.project else Markup('<span class="text-muted">No Project</span>'),
+    }
     # Show data in detail view but formatted
     column_details_list = [
         Graph.id,
@@ -1033,6 +1202,9 @@ class GraphAdmin(ModelView, model=Graph):
 class HypothesisAdmin(ModelView, model=Hypothesis):
     """Admin view for Hypothesis model."""
     
+    page_size = 100
+    page_size_options = [25, 50, 100, 200]
+    
     column_list = [
         Hypothesis.id,
         Hypothesis.title,
@@ -1056,6 +1228,9 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
         Hypothesis.status: lambda m, a: status_formatter(m.status),
         Hypothesis.severity: lambda m, a: severity_formatter(m.severity),
         Hypothesis.confidence: lambda m, a: confidence_formatter(m.confidence),
+        Hypothesis.project: lambda m, a: Markup(
+            f'<span class="badge bg-primary" style="font-size: 0.9em;">{m.project.name if m.project else "N/A"}</span>'
+        ) if m.project else Markup('<span class="text-muted">No Project</span>'),
     }
     column_details_list = [
         Hypothesis.id,
@@ -1325,6 +1500,301 @@ class TokenUsageAdmin(ModelView, model=TokenUsageLog):
     can_delete = True  # Allow cleanup of old logs
 
 
+class ReportsView(BaseView):
+    """Custom view to browse and access generated audit reports."""
+    
+    name = "Reports"
+    icon = "fa-solid fa-file-pdf"
+    
+    @expose("/reports-list", methods=["GET"])
+    async def reports_list(self, request: Request):
+        """Display list of all generated reports."""
+        reports_dir = Path.home() / ".hound" / "reports"
+        
+        reports = []
+        if reports_dir.exists():
+            for project_dir in sorted(reports_dir.iterdir()):
+                if project_dir.is_dir():
+                    for report_file in sorted(project_dir.glob("*.html"), reverse=True):
+                        # Extract date from filename: audit_report_YYYYMMDD_HHMMSS.html
+                        try:
+                            filename = report_file.name
+                            date_part = filename.replace("audit_report_", "").replace(".html", "")
+                            date_str, time_str = date_part.split("_")
+                            report_date = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
+                            report_time = datetime.strptime(time_str, "%H%M%S").strftime("%H:%M:%S")
+                        except:
+                            report_date = datetime.fromtimestamp(report_file.stat().st_mtime).strftime("%Y-%m-%d")
+                            report_time = datetime.fromtimestamp(report_file.stat().st_mtime).strftime("%H:%M:%S")
+                        
+                        # Build URL path
+                        report_url = f"/reports/{project_dir.name}/{report_file.name}"
+                        
+                        # Get file size
+                        size_bytes = report_file.stat().st_size
+                        size_kb = size_bytes / 1024
+                        
+                        reports.append({
+                            "project": project_dir.name,
+                            "filename": report_file.name,
+                            "date": report_date,
+                            "time": report_time,
+                            "size": f"{size_kb:.1f} KB",
+                            "url": report_url,
+                            "path": str(report_file),
+                        })
+        
+        # Generate HTML table
+        html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Audit Reports - Firepan Security</title>
+    <link rel="stylesheet" href="/admin/statics/css/tabler.min.css">
+    <link rel="stylesheet" href="/admin/statics/css/tabler-icons.min.css">
+    <style>
+        body { background: #1a1d22; color: #c8d0db; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .page-header { margin-bottom: 30px; }
+        .card { background: #242d3a; border: 1px solid #2d3748; border-radius: 8px; }
+        .table { color: #c8d0db; }
+        .table thead { background: #1e2531; }
+        .badge { font-size: 0.85em; }
+        a.btn-primary { background: #3b82f6; border-color: #3b82f6; }
+        a.btn-primary:hover { background: #2563eb; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="page-header">
+            <div class="row align-items-center">
+                <div class="col">
+                    <h1 class="page-title">
+                        <i class="ti ti-file-text me-2"></i>
+                        Audit Reports
+                    </h1>
+                    <p class="text-muted">Browse and download generated security audit reports</p>
+                </div>
+                <div class="col-auto">
+                    <a href="/admin" class="btn btn-secondary">
+                        <i class="ti ti-arrow-left me-2"></i>Back to Admin
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-hover table-vcenter">
+                        <thead>
+                            <tr>
+                                <th>Project</th>
+                                <th>Generated</th>
+                                <th>Time</th>
+                                <th>Size</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+"""
+        
+        if not reports:
+            html += """
+                            <tr>
+                                <td colspan="5" class="text-center text-muted py-5">
+                                    <i class="ti ti-inbox" style="font-size: 3em; opacity: 0.3;"></i>
+                                    <p class="mt-3">No reports generated yet</p>
+                                </td>
+                            </tr>
+"""
+        else:
+            for report in reports:
+                html += f"""
+                            <tr>
+                                <td>
+                                    <span class="badge bg-blue">{report['project']}</span>
+                                </td>
+                                <td>{report['date']}</td>
+                                <td><span class="text-muted">{report['time']}</span></td>
+                                <td><span class="badge bg-secondary">{report['size']}</span></td>
+                                <td>
+                                    <a href="{report['url']}" target="_blank" class="btn btn-sm btn-primary">
+                                        <i class="ti ti-eye me-1"></i>View Report
+                                    </a>
+                                </td>
+                            </tr>
+"""
+        
+        html += """
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card-footer text-muted">
+                """ + f"""Total reports: <strong>{len(reports)}</strong>""" + """
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+        
+        return HTMLResponse(html)
+
+
+class ScanFindingsView(BaseView):
+    """Custom view to display scan findings in detail."""
+    
+    name = "Scan Findings"
+    icon = "fa-solid fa-bug"
+    
+    @expose("/scan-findings/<scan_id>", methods=["GET"])
+    async def findings_detail(self, request: Request):
+        """Display findings for a specific scan."""
+        from server.api import get_engine
+        from database import create_db_session
+        import json
+        
+        scan_id = request.path_params.get("scan_id")
+        
+        engine = get_engine()
+        db = create_db_session(engine)
+        
+        try:
+            scan = db.query(ScanExecution).filter(ScanExecution.id == int(scan_id)).first()
+            
+            if not scan:
+                return HTMLResponse("""
+                    <html><body style="background: #1a1d22; color: #c8d0db; padding: 40px; text-align: center;">
+                        <h1>Scan Not Found</h1>
+                        <p>The requested scan does not exist.</p>
+                        <a href="/admin/scan-execution/list" style="color: #3b82f6;">Back to Scans</a>
+                    </body></html>
+                """, status_code=404)
+            
+            # Format findings
+            findings_html = ScanExecutionAdmin.format_findings(scan, None)
+            metrics_html = ScanExecutionAdmin.format_quality_metrics(scan, None)
+            
+            # Build HTML page
+            html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Scan Findings - {scan.repo_name}</title>
+    <link rel="stylesheet" href="/admin/statics/css/tabler.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body {{ background: #1a1d22; color: #c8d0db; padding: 20px; }}
+        .container {{ max-width: 1400px; margin: 0 auto; }}
+        .page-header {{ margin-bottom: 30px; }}
+        .card {{ background: #242d3a; border: 1px solid #2d3748; border-radius: 8px; margin-bottom: 20px; }}
+        .card-header {{ background: #1e2531; padding: 15px 20px; border-bottom: 1px solid #2d3748; font-weight: 600; }}
+        .card-body {{ padding: 20px; }}
+        .badge {{ font-size: 0.85em; padding: 6px 12px; }}
+        .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px; }}
+        .info-item {{ background: #1e2531; padding: 15px; border-radius: 6px; }}
+        .info-label {{ color: #717a87; font-size: 0.85em; margin-bottom: 5px; }}
+        .info-value {{ font-size: 1.1em; font-weight: 600; }}
+        a.btn-primary {{ background: #3b82f6; border-color: #3b82f6; color: white; padding: 8px 16px; text-decoration: none; border-radius: 4px; display: inline-block; }}
+        a.btn-primary:hover {{ background: #2563eb; }}
+        a.btn-secondary {{ background: #4b5563; border-color: #4b5563; color: white; padding: 8px 16px; text-decoration: none; border-radius: 4px; display: inline-block; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="page-header">
+            <div class="row align-items-center">
+                <div class="col">
+                    <h1 class="page-title">
+                        <i class="fa-solid fa-radar me-2"></i>
+                        Surface Scan Findings
+                    </h1>
+                    <p class="text-muted">{scan.repo_name}</p>
+                </div>
+                <div class="col-auto">
+                    <a href="/admin/scan-execution/details/{scan.id}" class="btn-secondary me-2">
+                        <i class="fa-solid fa-arrow-left me-2"></i>Back to Scan
+                    </a>
+                    <a href="/admin/scan-execution/list" class="btn-primary">
+                        <i class="fa-solid fa-list me-2"></i>All Scans
+                    </a>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Scan Overview -->
+        <div class="card">
+            <div class="card-header">Scan Overview</div>
+            <div class="card-body">
+                <div class="info-grid">
+                    <div class="info-item">
+                        <div class="info-label">Execution ID</div>
+                        <div class="info-value"><code>{scan.execution_id}</code></div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Status</div>
+                        <div class="info-value">{status_formatter(scan.status)}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Risk Score</div>
+                        <div class="info-value">
+                            <span class="badge bg-{"danger" if (scan.risk_score or 0) >= 70 else "warning" if (scan.risk_score or 0) >= 40 else "success"}">
+                                {scan.risk_score or 0}/100
+                            </span>
+                        </div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Contracts Scanned</div>
+                        <div class="info-value">{scan.contracts_scanned} / {scan.contracts_total}</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Repository</div>
+                        <div class="info-value">
+                            {"<a href='" + scan.repo_url + "' target='_blank' style='color: #3b82f6;'>" + scan.repo_url + "</a>" if scan.repo_url else "N/A"}
+                        </div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Completed At</div>
+                        <div class="info-value">{scan.completed_at.strftime("%Y-%m-%d %H:%M:%S") if scan.completed_at else "N/A"}</div>
+                    </div>
+                </div>
+                
+                {f"<div class='alert alert-info'><strong>Summary:</strong> {scan.summary}</div>" if scan.summary else ""}
+            </div>
+        </div>
+        
+        <!-- Security Findings -->
+        <div class="card">
+            <div class="card-header">
+                <i class="fa-solid fa-bug me-2"></i>Security Findings
+            </div>
+            <div class="card-body">
+                {findings_html}
+            </div>
+        </div>
+        
+        <!-- Quality Metrics -->
+        <div class="card">
+            <div class="card-header">
+                <i class="fa-solid fa-chart-line me-2"></i>Quality Metrics
+            </div>
+            <div class="card-body">
+                {metrics_html}
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+            
+            return HTMLResponse(html)
+        
+        finally:
+            db.close()
+
+
 def setup_admin(app, engine):
     """
     Set up SQLAdmin with all model views.
@@ -1345,7 +1815,7 @@ def setup_admin(app, engine):
     admin = Admin(
         app,
         engine,
-        title="Hound Admin",
+        title="Firepan Admin",
         base_url=base_url,
     )
     
@@ -1357,5 +1827,7 @@ def setup_admin(app, engine):
     admin.add_view(GraphAdmin)
     admin.add_view(HypothesisAdmin)
     admin.add_view(TokenUsageAdmin)
+    admin.add_view(ReportsView)
+    # Note: ScanFindingsView not added to navigation - accessible only via "View Findings" action
     
     return admin

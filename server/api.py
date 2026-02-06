@@ -2732,6 +2732,8 @@ class AuditStartRequest(BaseModel):
     time_limit_minutes: int = Field(default=120, description="Time limit for the entire audit in minutes")
     mode: str = Field(default="sweep", description="Audit mode: 'sweep' (Phase 1 - broad coverage) or 'intuition' (Phase 2 - deep exploration)")
     plan_n: int = Field(default=5, description="Number of investigations to plan per batch")
+    auto_create_fix_pr: bool = Field(default=False, description="Automatically create a PR with fixes for detected issues")
+    base_branch: str = Field(default="main", description="Base branch for fix PR (default: main)")
 
 
 class AuditStartResponse(BaseModel):
@@ -2871,6 +2873,170 @@ async def get_audit_status(session_id: str, db: Session = Depends(get_db)):
         started_at=session.start_time,
         completed_at=session.end_time,
     )
+
+
+# ============================================================================
+# Auto-Fix PR Creation Endpoint
+# ============================================================================
+
+class AutoFixPRRequest(BaseModel):
+    """Request model for creating auto-fix PR."""
+    
+    installation_id: int = Field(..., description="GitHub App installation ID")
+    repo_full_name: str = Field(..., description="Repository full name (owner/repo)")
+    session_id: Optional[str] = Field(None, description="Audit session ID to get findings from")
+    findings: Optional[List[Dict[str, Any]]] = Field(None, description="Manual list of findings to fix")
+    base_branch: str = Field(default="main", description="Base branch for PR (default: main)")
+    auto_merge: bool = Field(default=False, description="Enable auto-merge if checks pass")
+
+
+class AutoFixPRResponse(BaseModel):
+    """Response model for auto-fix PR creation."""
+    
+    success: bool
+    pr_number: Optional[int] = None
+    pr_url: Optional[str] = None
+    branch_name: Optional[str] = None
+    fixes_applied: int = 0
+    fixes_failed: int = 0
+    errors: List[str] = []
+
+
+@app.post("/audits/{session_id}/create-fix-pr", response_model=AutoFixPRResponse)
+async def create_auto_fix_pr(
+    session_id: str,
+    request: AutoFixPRRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Create a PR with automatic fixes for detected security issues.
+    
+    This endpoint:
+    1. Retrieves findings from the audit session
+    2. Generates fixes for fixable vulnerabilities
+    3. Creates a new branch with the fixes
+    4. Opens a pull request with detailed descriptions
+    
+    Example:
+        POST /audits/audit_abc123/create-fix-pr
+        {
+            "installation_id": 12345,
+            "repo_full_name": "owner/repo",
+            "base_branch": "main",
+            "auto_merge": false
+        }
+    """
+    from integrations.auto_pr_fixer import create_fix_pr_for_findings
+    
+    # Get findings from session or use provided findings
+    findings = request.findings
+    
+    if not findings and session_id:
+        # Retrieve findings from database
+        session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
+        
+        if not session:
+            raise HTTPException(status_code=404, detail="Audit session not found")
+        
+        if not session.project_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Session has no associated project to retrieve findings from"
+            )
+        
+        # Get hypotheses (findings) from the project
+        hypotheses = (
+            db.query(Hypothesis)
+            .filter(Hypothesis.project_id == session.project_id)
+            .filter(Hypothesis.confidence > 0.5)  # Only high-confidence findings
+            .all()
+        )
+        
+        # Convert to finding format
+        findings = []
+        for hyp in hypotheses:
+            finding = {
+                "pattern_id": hyp.type or "UNKNOWN",
+                "title": hyp.title,
+                "severity": hyp.severity or "medium",
+                "location": f"{hyp.file_path}:{hyp.line_number}" if hyp.file_path else "",
+                "description": hyp.description,
+                "confidence": hyp.confidence,
+            }
+            findings.append(finding)
+    
+    if not findings:
+        raise HTTPException(
+            status_code=400,
+            detail="No findings provided and none found in session"
+        )
+    
+    logger.info(f"Creating fix PR for {len(findings)} findings in {request.repo_full_name}")
+    
+    # Create fix PR
+    try:
+        result = create_fix_pr_for_findings(
+            installation_id=request.installation_id,
+            repo_full_name=request.repo_full_name,
+            findings=findings,
+            scan_id=session_id,
+            base_branch=request.base_branch,
+            auto_merge=request.auto_merge,
+        )
+        
+        return AutoFixPRResponse(**result)
+        
+    except Exception as e:
+        logger.exception(f"Failed to create fix PR: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create fix PR: {str(e)}")
+
+
+@app.post("/github/create-fix-pr", response_model=AutoFixPRResponse)
+async def create_fix_pr_standalone(request: AutoFixPRRequest):
+    """
+    Create a fix PR without an audit session (standalone).
+    
+    Use this endpoint when you have findings from another source
+    or want to create a fix PR manually.
+    
+    Example:
+        POST /github/create-fix-pr
+        {
+            "installation_id": 12345,
+            "repo_full_name": "owner/repo",
+            "findings": [
+                {
+                    "pattern_id": "REENTRANCY-001",
+                    "title": "Reentrancy vulnerability",
+                    "severity": "high",
+                    "location": "contracts/Token.sol:42",
+                    "description": "External call before state update"
+                }
+            ]
+        }
+    """
+    from integrations.auto_pr_fixer import create_fix_pr_for_findings
+    
+    if not request.findings:
+        raise HTTPException(status_code=400, detail="No findings provided")
+    
+    logger.info(f"Creating standalone fix PR for {len(request.findings)} findings")
+    
+    try:
+        result = create_fix_pr_for_findings(
+            installation_id=request.installation_id,
+            repo_full_name=request.repo_full_name,
+            findings=request.findings,
+            scan_id=request.session_id,
+            base_branch=request.base_branch,
+            auto_merge=request.auto_merge,
+        )
+        
+        return AutoFixPRResponse(**result)
+        
+    except Exception as e:
+        logger.exception(f"Failed to create fix PR: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create fix PR: {str(e)}")
 
 
 # ============================================================================
@@ -5859,9 +6025,25 @@ def view_scan_findings(scan_id: int, request: Request, db: Session = Depends(get
     if not scan:
         return HTMLResponse(content="<h1>Scan not found</h1>", status_code=404)
     
+    # Handle findings - support both flat list and severity-grouped dict structure
+    findings_list = []
+    if scan.findings:
+        if isinstance(scan.findings, list):
+            # Old format: flat list
+            findings_list = scan.findings
+        elif isinstance(scan.findings, dict):
+            # New format: grouped by severity
+            for severity in ['critical', 'high', 'medium', 'low', 'info']:
+                if severity in scan.findings:
+                    for finding in scan.findings[severity]:
+                        if isinstance(finding, dict):
+                            # Ensure severity is set
+                            finding['severity'] = severity
+                            findings_list.append(finding)
+    
     # Build HTML for findings
     findings_html = ""
-    for i, finding in enumerate(scan.findings or [], 1):
+    for i, finding in enumerate(findings_list, 1):
         severity = finding.get("severity", "info")
         severity_color = {
             "critical": "#dc3545",
@@ -5883,13 +6065,14 @@ def view_scan_findings(scan_id: int, request: Request, db: Session = Depends(get
             </div>
             <p style="margin: 12px 0; color: #666;">{finding.get('description', '')}</p>
             <div style="background: #f8f9fa; padding: 12px; border-radius: 4px; margin: 8px 0;">
-                <strong>Location:</strong> <code>{finding.get('location', 'N/A')}</code>
+                <strong>Location:</strong> <code>{finding.get('contract', finding.get('location', 'N/A'))}</code>
+                {f" - Line {finding.get('line')}" if finding.get('line') else ""}
             </div>
             <div style="margin-top: 8px;">
-                <strong>Impact:</strong> {finding.get('impact', 'N/A')}
+                <strong>Recommendation:</strong> {finding.get('recommendation', finding.get('impact', 'N/A'))}
             </div>
             <div style="margin-top: 8px;">
-                <strong>Category:</strong> {finding.get('category', 'general')}
+                <strong>ID:</strong> {finding.get('id', finding.get('category', 'N/A'))}
             </div>
             <div style="margin-top: 8px;">
                 <strong>Confidence:</strong> {finding.get('confidence', 0) * 100:.0f}%

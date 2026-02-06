@@ -839,12 +839,11 @@ and systematic vulnerability assessment across all identified attack surfaces.""
         
         # Batch generate professional descriptions and remediation advice for all findings
         if findings:
+            # Step 1: Generate professional descriptions
             self._emit_progress('findings_describe', f'Generating professional descriptions for {len(findings)} findings')
             professional_results = self._batch_generate_vulnerability_descriptions(findings)
             
-            self._emit_progress('remediation', f'Generating remediation advice for {len(findings)} findings')
-            remediation_results = self._batch_generate_remediation_advice(findings)
-            
+            # Step 2: Apply descriptions to findings (populate required fields FIRST)
             for i, finding in enumerate(findings):
                 result = professional_results.get(i, {})
                 
@@ -855,9 +854,15 @@ and systematic vulnerability assessment across all identified attack surfaces.""
                 # Use LLM-formatted component description or fallback
                 finding['affected_description'] = result.get('affected_components') or \
                     self._describe_affected_components(finding.get('affected', []))
-                
-                # Add remediation advice
-                finding['remediation'] = remediation_results.get(i, 'No specific remediation advice available.')
+            
+            # Step 3: Generate remediation advice WITH complete context
+            self._emit_progress('remediation', f'Generating remediation advice for {len(findings)} findings')
+            remediation_results = self._batch_generate_remediation_advice(findings)
+            
+            # Step 4: Apply remediation results and extract code samples
+            for i, finding in enumerate(findings):
+                # Add remediation advice with fallback
+                finding['remediation'] = remediation_results.get(i) or self._get_fallback_remediation(finding)
                 
                 # Extract code samples for this finding
                 self._emit_progress('snippets', f"Selecting code snippets: {finding.get('title','')}"[:80])
@@ -2389,6 +2394,17 @@ Rules for affected components:
         if not findings:
             return {}
         
+        # Debug: Validate fields
+        if self.debug:
+            print(f"[DEBUG] Validating finding fields before remediation generation")
+            for i, finding in enumerate(findings):
+                has_desc = bool(finding.get('professional_description') or finding.get('description'))
+                has_affected = bool(finding.get('affected_description'))
+                if not has_desc or not has_affected:
+                    print(f"[WARN] Finding {i} missing fields - desc: {has_desc}, affected: {has_affected}")
+                else:
+                    print(f"[DEBUG] Finding {i} has all required fields")
+        
         # Build a single prompt for all vulnerabilities
         vulnerabilities_json = []
         for i, finding in enumerate(findings):
@@ -2406,33 +2422,53 @@ Rules for affected components:
 Vulnerabilities:
 {json.dumps(vulnerabilities_json, ensure_ascii=False, indent=2)}
 
-For EACH vulnerability, provide clear, actionable remediation advice that includes:
-1. Specific steps to fix the vulnerability
-2. Code-level recommendations or patterns to implement
-3. Best practices to prevent similar issues
+For EACH vulnerability, provide clear, actionable remediation advice with this structure:
+
+**Immediate Fix:** 2-3 concrete, actionable steps referencing the specific affected_components and functions mentioned.
+
+**Code Example:** Provide pseudo-code or a concrete code snippet demonstrating the fix.
+
+**Prevention:** Suggest long-term strategies, architectural patterns, testing approaches, or security tools.
 
 Return a JSON object with this structure:
 {{
-  "0": "Remediation advice for vulnerability 0...",
-  "1": "Remediation advice for vulnerability 1...",
+  "0": "Immediate Fix: ... Code Example: ... Prevention: ...",
+  "1": "Immediate Fix: ... Code Example: ... Prevention: ...",
   ...
 }}
 
 Rules:
-- Be specific and actionable
-- Focus on fixing the root cause, not just symptoms
-- Mention specific functions/contracts that need changes when applicable
-- Keep advice concise (2-4 sentences or bullet points)
-- Use professional, technical language
-- Start with imperative verbs (e.g., "Implement", "Add", "Modify", "Ensure")
+- Be specific and actionable - reference actual component/function names from affected_components
+- Focus on root cause fixes, not just symptoms
+- Tailor advice to the vulnerability type (e.g., reentrancy → checks-effects-interactions pattern)
+- Include concrete code patterns: require() statements, modifiers, guards, access control checks
+- Suggest architectural improvements where applicable
+- Keep advice concise but comprehensive (4-8 sentences total)
+- Use professional technical language with imperative verbs
 """
 
         try:
+            if self.debug:
+                print(f"[DEBUG] Remediation advice prompt (first 1000 chars): {prompt[:1000]}...")
+            
             response = self.llm.raw(
                 system="You are a security expert providing remediation advice. Respond only with valid JSON.",
                 user=prompt
             )
+            
+            if self.debug:
+                print(f"[DEBUG] Remediation advice response (first 1000 chars): {response[:1000]}...")
+            
             results = extract_json_object(response)
+            
+            if self.debug:
+                if results is None:
+                    print(f"[DEBUG] JSON extraction failed. Full response: {response[:2000]}")
+                elif isinstance(results, dict):
+                    print(f"[DEBUG] Successfully generated remediation advice for {len(results)}/{len(findings)} findings")
+                    missing = set(range(len(findings))) - set(int(k) for k in results.keys())
+                    if missing:
+                        print(f"[WARN] Missing remediation for finding indices: {missing}")
             
             if isinstance(results, dict):
                 # Convert string keys to int and return
@@ -2448,8 +2484,139 @@ Rules:
                 return {}
         except Exception as e:
             if self.debug:
+                import traceback
                 print(f"[!] Failed to batch generate remediation advice: {e}")
+                print(traceback.format_exc())
             return {}
+    
+    def _get_fallback_remediation(self, finding: dict) -> str:
+        """Provide type-specific fallback remediation advice when LLM generation fails."""
+        vuln_type = finding.get('type', '').lower()
+        title = finding.get('title', 'this vulnerability')
+        affected = finding.get('affected_description', 'the affected components')
+        
+        # Type-specific remediation templates
+        REMEDIATION_TEMPLATES = {
+            'reentrancy': f"""Immediate Fix: Implement the checks-effects-interactions pattern by updating all state variables before making external calls in {affected}. Apply OpenZeppelin's ReentrancyGuard modifier to vulnerable functions.
+
+Code Example:
+  import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+  contract MyContract is ReentrancyGuard {{
+      function vulnerableFunction() public nonReentrant {{
+          balances[msg.sender] = 0;  // Update state first
+          (bool success, ) = msg.sender.call{{value: amount}}("");
+          require(success);
+      }}
+  }}
+
+Prevention: Review all functions making external calls, move state updates before external interactions, and add comprehensive testing for reentrancy scenarios including cross-function and cross-contract attacks.""",
+            
+            'access_control': f"""Immediate Fix: Implement proper access control checks in {affected} using OpenZeppelin's Ownable or AccessControl contracts. Add require() statements to verify caller permissions before executing sensitive operations.
+
+Code Example:
+  import "@openzeppelin/contracts/access/AccessControl.sol";
+  contract MyContract is AccessControl {{
+      bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+      function sensitiveFunction() public onlyRole(ADMIN_ROLE) {{
+          // Protected code
+      }}
+  }}
+
+Prevention: Audit all privileged functions, implement role-based access control consistently, use modifiers for reusable checks, and test authorization boundaries thoroughly.""",
+            
+            'overflow': f"""Immediate Fix: Upgrade to Solidity 0.8.0+ for automatic overflow/underflow protection in {affected}, or use OpenZeppelin's SafeMath library for arithmetic operations.
+
+Code Example:
+  // Solidity 0.8+: built-in overflow protection
+  uint256 result = a + b;  // Automatically reverts on overflow
+  
+  // Or for < 0.8:
+  using SafeMath for uint256;
+  uint256 result = a.add(b);
+
+Prevention: Always use safe arithmetic, add explicit bounds checking for critical calculations, and include overflow/underflow test cases.""",
+            
+            'underflow': f"""Immediate Fix: Upgrade to Solidity 0.8.0+ for automatic underflow protection in {affected}, or use OpenZeppelin's SafeMath library. Add require() checks to verify sufficient balances.
+
+Code Example:
+  require(balance >= amount, "Insufficient balance");
+  balance -= amount;  // Safe in 0.8+, or use balance.sub(amount) with SafeMath
+
+Prevention: Use safe arithmetic operations consistently, validate all inputs that affect calculations, and test edge cases including zero values and boundary conditions.""",
+            
+            'input_validation': f"""Immediate Fix: Add comprehensive input validation using require() statements in {affected}. Validate all external inputs including addresses, amounts, array lengths, and string formats.
+
+Code Example:
+  function processData(address user, uint256 amount, bytes calldata data) external {{
+      require(user != address(0), "Invalid address");
+      require(amount > 0 && amount <= MAX_AMOUNT, "Invalid amount");
+      require(data.length <= MAX_DATA_LENGTH, "Data too long");
+      // Process validated inputs
+  }}
+
+Prevention: Implement input validation at contract boundaries, use custom errors for gas efficiency, whitelist valid inputs where possible, and fuzz test with invalid inputs.""",
+            
+            'logic_error': f"""Immediate Fix: Review and correct the business logic in {affected}. Add comprehensive require() statements to enforce invariants, validate state transitions, and ensure operations maintain contract consistency.
+
+Code Example:
+  function updateState(uint256 newValue) external {{
+      require(newValue >= minValue && newValue <= maxValue, "Invalid range");
+      require(lastUpdate + COOLDOWN <= block.timestamp, "Cooldown active");
+      previousValue = currentValue;
+      currentValue = newValue;
+      lastUpdate = block.timestamp;
+  }}
+
+Prevention: Document intended behavior clearly, implement state machine patterns where applicable, use formal verification for critical logic, and add extensive unit and integration tests.""",
+            
+            'dos': f"""Immediate Fix: Implement gas limits, circuit breaker patterns, and pull-payment mechanisms in {affected} to prevent denial-of-service attacks. Replace unbounded loops with pagination.
+
+Code Example:
+  // Use pull payments instead of push
+  mapping(address => uint256) public pendingWithdrawals;
+  
+  function withdraw() external {{
+      uint256 amount = pendingWithdrawals[msg.sender];
+      pendingWithdrawals[msg.sender] = 0;
+      (bool success, ) = msg.sender.call{{value: amount}}("");
+      require(success);
+  }}
+
+Prevention: Avoid unbounded loops, implement proper error handling for external calls, use withdrawal pattern for payments, set gas limits, and add emergency pause functionality.""",
+            
+            'denial_of_service': f"""Immediate Fix: Refactor {affected} to avoid unbounded operations. Implement pagination for loops, use withdrawal pattern instead of automatic distributions, and add circuit breaker functionality.
+
+Code Example:
+  bool public paused;
+  modifier whenNotPaused() {{ require(!paused); _; }}
+  
+  function batchProcess(uint256 startIndex, uint256 batchSize) external whenNotPaused {{
+      uint256 end = min(startIndex + batchSize, items.length);
+      for (uint256 i = startIndex; i < end; i++) {{
+          // Process items in batches
+      }}
+  }}
+
+Prevention: Design for graceful degradation, test with maximum expected load, implement rate limiting, and monitor gas usage in production.""",
+        }
+        
+        # Try to find matching template
+        for key, template in REMEDIATION_TEMPLATES.items():
+            if key in vuln_type or vuln_type in key:
+                return template
+        
+        # Generic fallback if no specific template matches
+        return f"""Immediate Fix: Review and address {title} in {affected}. Implement proper input validation, access control checks, and follow security best practices for this vulnerability type.
+
+Code Example:
+  // Add validation
+  require(isValid(input), "Invalid input");
+  require(hasPermission(msg.sender), "Not authorized");
+  
+  // Implement fix based on vulnerability type
+  // ... secure implementation ...
+
+Prevention: Conduct thorough code review, add comprehensive test coverage including edge cases and attack scenarios, use security analysis tools, and follow established security patterns for smart contract development."""
     
     def _generate_vulnerability_description(self, finding: dict) -> str:
         """Generate a professional vulnerability description using LLM."""

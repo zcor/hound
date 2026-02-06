@@ -244,9 +244,8 @@ class ProjectAdmin(ModelView, model=Project):
                         
                         async def build_graphs_request():
                             async with httpx.AsyncClient(timeout=600.0) as client:
-                                host = request.headers.get("host", "localhost:8000")
-                                scheme = request.headers.get("x-forwarded-proto", "http")
-                                base_url = f"{scheme}://{host}"
+                                # Use localhost for internal API calls to avoid proxy authentication
+                                base_url = "http://localhost:8000"
                                 
                                 response = await client.post(
                                     f"{base_url}/graphs/build-sync",
@@ -349,9 +348,8 @@ class ProjectAdmin(ModelView, model=Project):
                         
                         async def run_audit_request():
                             async with httpx.AsyncClient(timeout=3600.0) as client:
-                                host = request.headers.get("host", "localhost:8000")
-                                scheme = request.headers.get("x-forwarded-proto", "http")
-                                base_url = f"{scheme}://{host}"
+                                # Use localhost for internal API calls to avoid proxy authentication
+                                base_url = "http://localhost:8000"
                                 
                                 response = await client.post(
                                     f"{base_url}/audits/run-sync",
@@ -424,9 +422,8 @@ class ProjectAdmin(ModelView, model=Project):
                         # Call report generation API
                         async def generate_report_request():
                             async with httpx.AsyncClient(timeout=300.0) as client:
-                                host = request.headers.get("host", "localhost:8000")
-                                scheme = request.headers.get("x-forwarded-proto", "http")
-                                base_url = f"{scheme}://{host}"
+                                # Use localhost for internal API calls to avoid proxy authentication
+                                base_url = "http://localhost:8000"
                                 
                                 response = await client.post(
                                     f"{base_url}/sessions/{latest_session.session_id}/report",
@@ -624,9 +621,8 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
                         # Call report generation API
                         async def generate_report_request():
                             async with httpx.AsyncClient(timeout=300.0) as client:
-                                host = request.headers.get("host", "localhost:8000")
-                                scheme = request.headers.get("x-forwarded-proto", "http")
-                                base_url = f"{scheme}://{host}"
+                                # Use localhost for internal API calls to avoid proxy authentication
+                                base_url = "http://localhost:8000"
                                 
                                 response = await client.post(
                                     f"{base_url}/sessions/{session.session_id}/report",
@@ -1397,9 +1393,8 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
             
             async def generate_report_request():
                 async with httpx.AsyncClient(timeout=300.0) as client:
-                    host = request.headers.get("host", "localhost:8000")
-                    scheme = request.headers.get("x-forwarded-proto", "http")
-                    base_url = f"{scheme}://{host}"
+                    # Use localhost for internal API calls to avoid proxy authentication
+                    base_url = "http://localhost:8000"
                     
                     response = await client.post(
                         f"{base_url}/sessions/{latest_session.session_id}/report",

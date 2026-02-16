@@ -5,7 +5,7 @@ This module defines the database schema to replace local JSON files and director
 with a PostgreSQL relational database for better scalability and multi-tenancy support.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON,
@@ -85,9 +85,36 @@ class Tenant(Base):
     # Relationships
     projects = relationship("Project", back_populates="tenant", cascade="all, delete-orphan")
     scan_executions = relationship("ScanExecution", back_populates="tenant", cascade="all, delete-orphan")
+    users = relationship("User", back_populates="tenant", cascade="all, delete-orphan")
     
     def __repr__(self):
         return f"<Tenant(id={self.id}, name='{self.name}')>"
+
+
+class User(Base):
+    """
+    User table for GitHub OAuth authentication.
+    
+    Stores user information from GitHub OAuth for authentication
+    and authorization using JWT tokens.
+    """
+    __tablename__ = "users"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    github_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    github_login = Column(String(255), unique=True, index=True, nullable=False)
+    email = Column(String(255), index=True)  # Not unique - users can have null/private emails
+    name = Column(String(255))
+    avatar_url = Column(String(500))
+    
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    tenant = relationship("Tenant", back_populates="users")
+    
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    
+    def __repr__(self):
+        return f"<User(github_login='{self.github_login}', tenant_id={self.tenant_id})>"
 
 
 class Project(Base):

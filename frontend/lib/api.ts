@@ -1,16 +1,54 @@
 /**
  * API client for Hound backend
  */
-import axios from 'axios';
+import axios, { AxiosInstance } from 'axios';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
-export const api = axios.create({
+// Helper functions for authentication
+export function getAccessToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return localStorage.getItem('access_token');
+}
+
+export function getTenantId(): number | null {
+  if (typeof window === 'undefined') return null;
+  const stored = localStorage.getItem('tenant_id');
+  return stored ? parseInt(stored, 10) : null;
+}
+
+// Create axios instance with auth interceptors
+const apiClient: AxiosInstance = axios.create({
   baseURL: API_BASE_URL,
   headers: {
     'Content-Type': 'application/json',
   },
 });
+
+// Add auth token to every request
+apiClient.interceptors.request.use((config) => {
+  const token = getAccessToken();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Handle 401 unauthorized
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      // Redirect to login on unauthorized
+      if (typeof window !== 'undefined') {
+        window.location.href = '/login';
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
+export const api = apiClient;
 
 // Types
 export interface Project {

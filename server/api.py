@@ -68,6 +68,7 @@ from database.models import (
     Project,
     ScanExecution,
     Tenant,
+    User,
     create_db_engine,
     create_db_session,
 )
@@ -245,6 +246,11 @@ async def startup_event():
     get_admin()
 
 
+# Register authentication routes
+from server.auth_routes import router as auth_router
+app.include_router(auth_router)
+
+
 # Redirect for URL compatibility - auditsession -> audit-session
 from starlette.responses import RedirectResponse as StarletteRedirect
 
@@ -399,6 +405,61 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# Authentication dependency for protected endpoints
+async def get_current_tenant_id(request: Request) -> int:
+    """
+    Extract tenant_id from JWT token for authenticated requests.
+    
+    This dependency can be used to protect endpoints that require authentication.
+    It extracts the tenant_id from the JWT token in the Authorization header.
+    
+    Args:
+        request: FastAPI request object
+        
+    Returns:
+        Tenant ID from the JWT token
+        
+    Raises:
+        HTTPException: If token is missing, invalid, or expired
+    """
+    from server.auth_routes import get_token_from_header
+    from server.auth_utils import get_current_user_from_token
+    
+    try:
+        token = get_token_from_header(request)
+        payload = get_current_user_from_token(token)
+        tenant_id = payload.get("tenant_id")
+        
+        if not tenant_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing tenant_id")
+        
+        return tenant_id
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid or expired token: {str(e)}")
+
+
+# Optional authentication - returns None if no token provided
+async def get_optional_tenant_id(request: Request) -> Optional[int]:
+    """
+    Extract tenant_id from JWT token if present, otherwise return None.
+    
+    This is useful for endpoints that work both with and without authentication,
+    but may have different behavior based on authentication status.
+    
+    Args:
+        request: FastAPI request object
+        
+    Returns:
+        Tenant ID from JWT token if present, None otherwise
+    """
+    try:
+        return await get_current_tenant_id(request)
+    except HTTPException:
+        return None
 
 
 # ============================================================================
@@ -4525,15 +4586,15 @@ class FindingListResponse(BaseModel):
 # -------------------- Endpoints --------------------
 
 @app.get("/users/me", response_model=UserProfileResponse)
-async def get_current_user(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+async def get_current_user_profile(
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db)
 ):
     """
-    Get current user profile.
+    Get current user profile from JWT token.
     
     Returns user information including organization details.
-    In the current architecture, tenant_id represents the user/org context from GitHub App installation.
+    Requires JWT authentication via Authorization header.
     """
     tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
     if not tenant:
@@ -6073,25 +6134,26 @@ async def run_surface_scan(
 
 @app.get("/surface/scans", response_model=SurfaceScanListResponse)
 async def list_surface_scans(
+    tenant_id: int = Depends(get_current_tenant_id),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     risk_level: Optional[str] = Query(None, description="Filter by risk level"),
     status: Optional[str] = Query(None, description="Filter by status"),
     search: Optional[str] = Query(None, description="Search repo name"),
-    tenant_id: Optional[int] = Query(None, description="Filter by tenant ID"),
     db: Session = Depends(get_db)
 ):
     """
-    List all surface scans for the admin panel or user dashboard.
+    List all surface scans for the authenticated user.
     
-    Supports pagination and filtering by risk level, status, repo name, and tenant.
-    When tenant_id is provided, only scans for that tenant are returned.
+    Requires JWT authentication. Returns only scans for the authenticated user's tenant.
+    Supports pagination and filtering by risk level, status, and repo name.
     """
     query = db.query(ScanExecution)
     
-    # Apply filters
-    if tenant_id:
-        query = query.filter(ScanExecution.tenant_id == tenant_id)
+    # Apply tenant filter from JWT token
+    query = query.filter(ScanExecution.tenant_id == tenant_id)
+    
+    # Apply additional filters
     if risk_level:
         query = query.filter(ScanExecution.risk_level == risk_level)
     if status:

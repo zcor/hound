@@ -4667,7 +4667,7 @@ async def get_current_month_usage(
         func.sum(TokenUsageLog.cost_usd).label('total_cost')
     ).filter(
         TokenUsageLog.tenant_id == tenant_id,
-        TokenUsageLog.timestamp >= month_start
+        TokenUsageLog.created_at >= month_start
     ).first()
     
     input_tokens = int(token_stats.input_tokens or 0)

@@ -146,7 +146,7 @@ async def github_callback(request: GitHubCallbackRequest, db: Session = Depends(
     
     if not user:
         # New user - create tenant and user
-        tenant = Tenant(name=f"{github_user['login']}'s Organization")
+        tenant = Tenant(name=f"Organization for {github_user['login']}")
         db.add(tenant)
         db.flush()  # Get tenant.id
         

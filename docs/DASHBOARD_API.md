@@ -17,6 +17,74 @@ http://localhost:8000  # Development
 https://api.hound.firepan.com  # Production
 ```
 
+## CORS Configuration
+
+The API uses CORS (Cross-Origin Resource Sharing) middleware to control which domains can access the endpoints from browsers.
+
+### Development Setup
+
+For local development, set the `ALLOWED_ORIGINS` environment variable:
+
+```bash
+export ALLOWED_ORIGINS=http://localhost:3000
+uvicorn server.api:app --reload --port 8000
+```
+
+Or add it to your `.env` file:
+
+```bash
+ALLOWED_ORIGINS=http://localhost:3000
+```
+
+### Production Setup
+
+Configure allowed origins for your deployed frontend:
+
+```bash
+# Single origin
+export ALLOWED_ORIGINS=https://app.firepan.com
+
+# Multiple origins (comma-separated, no spaces)
+export ALLOWED_ORIGINS=https://app.firepan.com,https://dev.firepan.com
+```
+
+### CORS Headers
+
+The middleware automatically adds these headers to all responses:
+- `Access-Control-Allow-Origin: <allowed-origin>`
+- `Access-Control-Allow-Credentials: true`
+- `Access-Control-Allow-Methods: *`
+- `Access-Control-Allow-Headers: *`
+- `Access-Control-Expose-Headers: *`
+
+### Security Notes
+
+- **Never use `allow_origins=["*"]` in production** - this allows any website to access your API
+- Always specify exact domains with protocol (http:// or https://)
+- Do not include trailing slashes in domain names
+- Keep the origin list in an environment variable (not hardcoded)
+
+### Testing CORS
+
+Test with curl to verify CORS headers:
+
+```bash
+curl -i http://localhost:8000/surface/scans?tenant_id=1 \
+  -H "Origin: http://localhost:3000"
+
+# Should see: Access-Control-Allow-Origin: http://localhost:3000
+```
+
+Test preflight OPTIONS request:
+
+```bash
+curl -i -X OPTIONS http://localhost:8000/surface/scans \
+  -H "Origin: http://localhost:3000" \
+  -H "Access-Control-Request-Method: GET"
+
+# Should return 200 with CORS headers
+```
+
 ## Endpoints
 
 ### User & Organization Management
@@ -476,6 +544,58 @@ stats = response.json()
 print(f"Total findings: {stats['total']}")
 print(f"Critical: {stats['by_severity']['critical']}")
 ```
+
+---
+
+## Production Deployment
+
+### CORS Setup
+
+Before deploying to production, ensure proper CORS configuration:
+
+**Environment Variables:**
+
+```bash
+# Required: List of allowed frontend origins
+export ALLOWED_ORIGINS=https://app.firepan.com,https://dev.firepan.com
+
+# Optional: Other configuration
+export DATABASE_URL=postgresql://...
+export REDIS_URL=redis://...
+```
+
+**Nginx/Reverse Proxy:**
+
+If using Nginx as a reverse proxy, CORS is handled by FastAPI middleware.
+**Do NOT add CORS headers in Nginx config** - this causes duplicate headers and conflicts.
+
+**Verification:**
+
+After deployment, test CORS with curl:
+
+```bash
+# Test preflight request
+curl -i -X OPTIONS https://api.hound.firepan.com/surface/scans \
+  -H "Origin: https://app.firepan.com" \
+  -H "Access-Control-Request-Method: GET"
+
+# Should return 200 with Access-Control-Allow-Origin header
+
+# Test actual request
+curl -i https://api.hound.firepan.com/surface/scans?tenant_id=1 \
+  -H "Origin: https://app.firepan.com"
+
+# Should see: Access-Control-Allow-Origin: https://app.firepan.com
+```
+
+**Security Checklist:**
+
+- ✅ Never use `ALLOWED_ORIGINS=*` in production
+- ✅ Always specify exact domains with protocol (https://)
+- ✅ Do not include trailing slashes in domain names
+- ✅ Store origins in environment variable (not hardcoded)
+- ✅ Enable `allow_credentials=True` to support auth cookies/tokens
+- ✅ Test CORS from browser console after deployment
 
 ---
 

@@ -68,6 +68,7 @@ from database.models import (
     Project,
     ScanExecution,
     Tenant,
+    User,
     create_db_engine,
     create_db_session,
 )
@@ -243,6 +244,11 @@ def get_admin():
 async def startup_event():
     """Initialize admin panel on startup."""
     get_admin()
+
+
+# Register authentication routes
+from server.auth_routes import router as auth_router
+app.include_router(auth_router)
 
 
 # Redirect for URL compatibility - auditsession -> audit-session

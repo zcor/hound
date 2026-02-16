@@ -57,7 +57,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, text
 
 from commands.project import ProjectManager
 from database.models import (
@@ -7380,6 +7380,25 @@ async def health_check():
         dict: Status and UTC timestamp
     """
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/health/db")
+async def database_health(db: Session = Depends(get_db)):
+    """
+    Check database connection.
+    
+    Returns the database connection status. Used to verify that the database
+    is accessible and queries can be executed.
+    
+    Returns:
+        dict: Status and database connection state
+    """
+    try:
+        # Try a simple query
+        db.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {"status": "unhealthy", "database": str(e)}
 
 
 if __name__ == "__main__":

@@ -18,14 +18,19 @@ from server.auth_utils import create_access_token, get_current_user_from_token
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
-GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
-GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-
 
 class GitHubCallbackRequest(BaseModel):
     """Request model for GitHub OAuth callback."""
     code: str
+
+
+def get_github_config():
+    """Get GitHub OAuth configuration from environment."""
+    return {
+        "client_id": os.getenv("GITHUB_CLIENT_ID"),
+        "client_secret": os.getenv("GITHUB_CLIENT_SECRET"),
+        "frontend_url": os.getenv("FRONTEND_URL", "http://localhost:3000")
+    }
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -68,7 +73,8 @@ async def github_login():
     Returns:
         Dictionary containing the GitHub OAuth URL
     """
-    if not GITHUB_CLIENT_ID:
+    config = get_github_config()
+    if not config["client_id"]:
         raise HTTPException(
             status_code=500,
             detail="GitHub OAuth not configured. Set GITHUB_CLIENT_ID environment variable."
@@ -76,8 +82,8 @@ async def github_login():
     
     github_auth_url = (
         f"https://github.com/login/oauth/authorize"
-        f"?client_id={GITHUB_CLIENT_ID}"
-        f"&redirect_uri={FRONTEND_URL}/auth/callback"
+        f"?client_id={config['client_id']}"
+        f"&redirect_uri={config['frontend_url']}/auth/callback"
         f"&scope=read:user user:email"
     )
     return {"url": github_auth_url}
@@ -98,7 +104,8 @@ async def github_callback(request: GitHubCallbackRequest, db: Session = Depends(
     Raises:
         HTTPException: If GitHub authentication fails
     """
-    if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
+    config = get_github_config()
+    if not config["client_id"] or not config["client_secret"]:
         raise HTTPException(
             status_code=500,
             detail="GitHub OAuth not configured"
@@ -109,8 +116,8 @@ async def github_callback(request: GitHubCallbackRequest, db: Session = Depends(
         token_response = await client.post(
             "https://github.com/login/oauth/access_token",
             data={
-                "client_id": GITHUB_CLIENT_ID,
-                "client_secret": GITHUB_CLIENT_SECRET,
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
                 "code": request.code
             },
             headers={"Accept": "application/json"}

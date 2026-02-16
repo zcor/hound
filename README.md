@@ -52,6 +52,18 @@ Hound is a Language-agnostic AI auditor that autonomously builds and refines ada
 pip install -r requirements.txt
 ```
 
+## 🚀 Development with GitHub Codespaces
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/firepan-labs/hound)
+
+Codespaces automatically configures the development environment. See [.devcontainer/README.md](.devcontainer/README.md) for details.
+
+**Quick Start:**
+1. Click "Open in Codespaces" above
+2. Wait for setup to complete
+3. Set environment variables (see terminal output)
+4. Run `bash scripts/start-dev.sh`
+
 ## Docker Quickstart (SaaS Mode)
 
 Run Hound as a full SaaS stack with PostgreSQL, Redis, API server, and background workers:

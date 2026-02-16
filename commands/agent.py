@@ -655,8 +655,8 @@ class AgentRunner:
         import logging
         try:
             # Create unique log file name with project ID and timestamp to avoid conflicts
-            from datetime import datetime
             import hashlib
+            from datetime import datetime
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             # Sanitize project_id for filename (replace problematic characters)
             safe_project_id = str(self.project_id).replace('/', '_').replace('\\', '_')
@@ -1932,7 +1932,7 @@ class AgentRunner:
                         self.audit_logger.info(f"Iteration {it} - Hypothesis: {msg}")
                     elif status in {'analyzing', 'executing'}:
                         self.audit_logger.info(f"Iteration {it} - {status.capitalize()}: {msg}")
-                except (OSError, IOError) as e:
+                except OSError as e:
                     # Log I/O errors but don't crash the audit
                     console.print(f"[yellow]Warning: Failed to write to audit log: {e}[/yellow]")
                 except Exception as e:
@@ -2443,7 +2443,7 @@ class AgentRunner:
                         priority = getattr(inv, 'priority', 0)
                         reasoning = getattr(inv, 'reasoning', '')
                         self.audit_logger.info(f"  Priority: {priority}, Reasoning: {reasoning}")
-                    except (OSError, IOError) as e:
+                    except OSError as e:
                         console.print(f"[yellow]Warning: Failed to write to audit log: {e}[/yellow]")
                 
                 # Snapshot coverage at the start of the investigation
@@ -2889,7 +2889,7 @@ class AgentRunner:
                             f"Investigation completed: {inv.goal} - "
                             f"{iterations_done} iterations, {hyp_total} hypotheses ({hyp_confirmed} confirmed)"
                         )
-                    except (OSError, IOError) as e:
+                    except OSError as e:
                         console.print(f"[yellow]Warning: Failed to write to audit log: {e}[/yellow]")
                 
                 # Show updated coverage after completion
@@ -2988,7 +2988,7 @@ class AgentRunner:
                     f"Hypotheses: {hyp_stats['total']} total ({hyp_stats['confirmed']} confirmed, {hyp_stats['rejected']} rejected), "
                     f"Coverage: {coverage_stats['nodes']['percent']:.1f}% nodes, {coverage_stats['cards']['percent']:.1f}% cards"
                 )
-            except (OSError, IOError) as e:
+            except OSError as e:
                 console.print(f"[yellow]Warning: Failed to write final summary to audit log: {e}[/yellow]")
 
         # Finalize debug log if enabled

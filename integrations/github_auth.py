@@ -12,12 +12,9 @@ This module centralizes all GitHub App authentication logic.
 import os
 import time
 from datetime import datetime, timezone
-from functools import lru_cache
-from typing import Optional
 
 import jwt
 from github import Auth, Github, GithubIntegration
-
 
 # Configuration from environment variables
 GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID")
@@ -40,7 +37,7 @@ class InstallationTokenCache:
     def __init__(self):
         self._cache: dict[int, tuple[str, datetime]] = {}
     
-    def get(self, installation_id: int) -> Optional[str]:
+    def get(self, installation_id: int) -> str | None:
         """Get cached token if still valid."""
         if installation_id not in self._cache:
             return None
@@ -64,7 +61,7 @@ class InstallationTokenCache:
         """Cache a token with its expiration time."""
         self._cache[installation_id] = (token, expires_at)
     
-    def clear(self, installation_id: Optional[int] = None):
+    def clear(self, installation_id: int | None = None):
         """Clear cached token(s)."""
         if installation_id:
             self._cache.pop(installation_id, None)
@@ -107,7 +104,7 @@ def get_private_key() -> str:
             raise GitHubAppAuthError(
                 f"Private key file not found: {GITHUB_APP_PRIVATE_KEY_PATH}"
             )
-        except IOError as e:
+        except OSError as e:
             raise GitHubAppAuthError(
                 f"Failed to read private key file: {e}"
             )
@@ -358,7 +355,7 @@ def get_app_installations() -> list[dict]:
         raise GitHubAppAuthError(f"Failed to list installations: {e}")
 
 
-def clear_token_cache(installation_id: Optional[int] = None):
+def clear_token_cache(installation_id: int | None = None):
     """
     Clear cached installation tokens.
     

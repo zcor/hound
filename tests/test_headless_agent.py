@@ -4,7 +4,6 @@ Unit tests for headless agent adaptation features.
 Tests rate limit handling, budget tracking, and database-driven abort mechanism.
 """
 
-import json
 import os
 import sys
 import unittest

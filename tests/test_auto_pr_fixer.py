@@ -4,11 +4,11 @@ Test suite for auto-fix PR creation functionality.
 Tests the AutoPRFixer class and related functionality.
 """
 
-import pytest
 import tempfile
-import shutil
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch
+
+import pytest
 
 from integrations.auto_pr_fixer import AutoPRFixer, create_fix_pr_for_findings
 
@@ -199,7 +199,7 @@ def test_fix_integer_overflow():
         assert "0.8.0" in fixed_content
 
 
-@patch('integrations.auto_pr_fixer.subprocess.run')
+@patch('subprocess.run')
 def test_clone_and_fix_creates_branch(mock_run, sample_findings):
     """Test that clone_and_fix creates a new branch."""
     fixer = AutoPRFixer(12345, "owner/repo")

@@ -36,31 +36,40 @@ import logging
 import os
 import secrets
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
+
 load_dotenv()
 
-import redis.asyncio as aioredis
-from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+import redis.asyncio as aioredis  # noqa: E402
+from fastapi import (  # noqa: E402
+    BackgroundTasks,
+    Cookie,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import HTMLResponse, RedirectResponse  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+from pydantic import BaseModel, ConfigDict, Field, model_validator  # noqa: E402
+from slowapi import Limiter  # noqa: E402
+from slowapi.errors import RateLimitExceeded  # noqa: E402
+from slowapi.util import get_remote_address  # noqa: E402
+from sqlalchemy import func, text  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
+from starlette.middleware.sessions import SessionMiddleware  # noqa: E402
 
-from integrations.telegram import notify_new_repo_synced
-from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel, Field, model_validator
-from slowapi import Limiter
-from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
-from sqlalchemy.orm import Session
-from sqlalchemy import func, text
-
-from commands.project import ProjectManager
-from database.models import (
+from commands.project import ProjectManager  # noqa: E402
+from database.models import (  # noqa: E402
     AuditSession,
     Base,
     Graph,
@@ -68,10 +77,10 @@ from database.models import (
     Project,
     ScanExecution,
     Tenant,
-    User,
     create_db_engine,
     create_db_session,
 )
+from integrations.telegram import notify_new_repo_synced  # noqa: E402
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -105,7 +114,7 @@ def generate_session_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def verify_admin_auth(request: Request, admin_session: Optional[str] = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)) -> bool:
+def verify_admin_auth(request: Request, admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)) -> bool:
     """
     Verify admin authentication.
     Returns True if authenticated, raises HTTPException if not.
@@ -131,7 +140,7 @@ def verify_admin_auth(request: Request, admin_session: Optional[str] = Cookie(de
     return False
 
 
-def require_admin(request: Request, admin_session: Optional[str] = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)):
+def require_admin(request: Request, admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)):
     """Dependency to require admin authentication."""
     if not verify_admin_auth(request, admin_session):
         # For HTML pages, redirect to login
@@ -226,7 +235,7 @@ except Exception as e:
     logger.warning(f"Failed to mount reports directory: {e}")
 
 # Mount SQLAdmin dashboard at /admin
-from server.admin import setup_admin
+from server.admin import setup_admin  # noqa: E402
 
 # Initialize admin panel (deferred until engine is ready)
 _admin = None
@@ -249,12 +258,14 @@ async def startup_event():
 
 
 # Register authentication routes
-from server.auth_routes import router as auth_router
+from server.auth_routes import router as auth_router  # noqa: E402
+
 app.include_router(auth_router)
 
 
 # Redirect for URL compatibility - auditsession -> audit-session
-from starlette.responses import RedirectResponse as StarletteRedirect
+from starlette.responses import RedirectResponse as StarletteRedirect  # noqa: E402
+
 
 @app.get("/admin/auditsession/{path:path}")
 async def redirect_auditsession(path: str):
@@ -267,7 +278,7 @@ async def redirect_auditsession(path: str):
 # =============================================================================
 
 @app.get("/admin/login", response_class=HTMLResponse)
-def admin_login_page(request: Request, error: Optional[str] = None):
+def admin_login_page(request: Request, error: str | None = None):
     """Admin login page."""
     # If no admin key is set, redirect to home (no auth needed)
     if not ADMIN_API_KEY:
@@ -388,7 +399,7 @@ async def admin_login(request: Request):
 
 
 @app.get("/admin/logout")
-def admin_logout(admin_session: Optional[str] = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)):
+def admin_logout(admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)):
     """Logout and clear session."""
     if admin_session and admin_session in _admin_sessions:
         _admin_sessions.discard(admin_session)
@@ -445,7 +456,7 @@ async def get_current_tenant_id(request: Request) -> int:
 
 
 # Optional authentication - returns None if no token provided
-async def get_optional_tenant_id(request: Request) -> Optional[int]:
+async def get_optional_tenant_id(request: Request) -> int | None:
     """
     Extract tenant_id from JWT token if present, otherwise return None.
     
@@ -474,6 +485,7 @@ def admin_home(request: Request, db: Session = Depends(get_db), _auth: bool = De
     Admin home page with quick links to all features.
     """
     from sqlalchemy import func
+
     from database.models import TokenUsageLog
     
     # Get quick stats
@@ -486,7 +498,7 @@ def admin_home(request: Request, db: Session = Depends(get_db), _auth: bool = De
     total_cost = db.query(func.sum(TokenUsageLog.cost_usd)).filter(
         TokenUsageLog.created_at >= since
     ).scalar() or 0
-    total_tokens = db.query(func.sum(TokenUsageLog.total_tokens)).filter(
+    db.query(func.sum(TokenUsageLog.total_tokens)).filter(
         TokenUsageLog.created_at >= since
     ).scalar() or 0
     
@@ -2699,9 +2711,9 @@ class ProjectCreate(BaseModel):
     """Request model for creating a project."""
 
     name: str = Field(..., description="Project name")
-    git_url: Optional[str] = Field(None, description="Git repository URL")
-    source_path: Optional[str] = Field(None, description="Local source path")
-    description: Optional[str] = Field(None, description="Project description")
+    git_url: str | None = Field(None, description="Git repository URL")
+    source_path: str | None = Field(None, description="Local source path")
+    description: str | None = Field(None, description="Project description")
 
 
 class ProjectResponse(BaseModel):
@@ -2709,9 +2721,9 @@ class ProjectResponse(BaseModel):
 
     id: int
     name: str
-    source_path: Optional[str]
-    git_url: Optional[str]
-    description: Optional[str]
+    source_path: str | None
+    git_url: str | None
+    description: str | None
     status: str
     created_at: datetime
     last_accessed: datetime
@@ -2720,8 +2732,7 @@ class ProjectResponse(BaseModel):
     hypotheses_count: int = 0
     confirmed_count: int = 0
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SessionResponse(BaseModel):
@@ -2731,14 +2742,13 @@ class SessionResponse(BaseModel):
     session_id: str
     status: str
     start_time: datetime
-    end_time: Optional[datetime]
-    models: Optional[Dict[str, Any]]
-    token_usage: Optional[Dict[str, Any]]
-    coverage: Optional[Dict[str, Any]]
+    end_time: datetime | None
+    models: dict[str, Any] | None
+    token_usage: dict[str, Any] | None
+    coverage: dict[str, Any] | None
     investigations_count: int = 0
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class GraphResponse(BaseModel):
@@ -2746,13 +2756,12 @@ class GraphResponse(BaseModel):
 
     id: int
     name: str
-    internal_name: Optional[str]
-    data: Dict[str, Any]
+    internal_name: str | None
+    data: dict[str, Any]
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class FindingResponse(BaseModel):
@@ -2766,16 +2775,15 @@ class FindingResponse(BaseModel):
     status: str
     confidence: float
     severity: str
-    node_refs: Optional[List[str]]
-    evidence: Optional[Any] = None  # Can be dict or list
-    reported_by_model: Optional[str]
-    junior_model: Optional[str]
-    senior_model: Optional[str]
+    node_refs: list[str] | None
+    evidence: Any | None = None  # Can be dict or list
+    reported_by_model: str | None
+    junior_model: str | None
+    senior_model: str | None
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # ============================================================================
@@ -2787,12 +2795,12 @@ class AuditStartRequest(BaseModel):
     
     repo_url: str = Field(..., description="Git repository URL or local path")
     tenant_id: int = Field(default=1, description="Tenant ID for multi-tenancy")
-    project_id: Optional[int] = Field(None, description="Link to existing project")
+    project_id: int | None = Field(None, description="Link to existing project")
     max_iterations: int = Field(default=30, description="Maximum agent iterations per investigation")
-    investigation_prompt: Optional[str] = Field(None, description="Custom investigation prompt")
-    installation_id: Optional[int] = Field(None, description="GitHub App installation ID")
-    pr_number: Optional[int] = Field(None, description="PR number to post findings to")
-    repo_full_name: Optional[str] = Field(None, description="Repository full name (owner/repo)")
+    investigation_prompt: str | None = Field(None, description="Custom investigation prompt")
+    installation_id: int | None = Field(None, description="GitHub App installation ID")
+    pr_number: int | None = Field(None, description="PR number to post findings to")
+    repo_full_name: str | None = Field(None, description="Repository full name (owner/repo)")
     time_limit_minutes: int = Field(default=120, description="Time limit for the entire audit in minutes")
     mode: str = Field(default="sweep", description="Audit mode: 'sweep' (Phase 1 - broad coverage) or 'intuition' (Phase 2 - deep exploration)")
     plan_n: int = Field(default=5, description="Number of investigations to plan per batch")
@@ -2814,11 +2822,11 @@ class AuditStatusResponse(BaseModel):
     
     session_id: str
     status: str
-    progress: Optional[Dict[str, Any]] = None
+    progress: dict[str, Any] | None = None
     findings_count: int = 0
-    error_message: Optional[str] = None
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
+    error_message: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
 
 
 # ============================================================================
@@ -2948,8 +2956,8 @@ class AutoFixPRRequest(BaseModel):
     
     installation_id: int = Field(..., description="GitHub App installation ID")
     repo_full_name: str = Field(..., description="Repository full name (owner/repo)")
-    session_id: Optional[str] = Field(None, description="Audit session ID to get findings from")
-    findings: Optional[List[Dict[str, Any]]] = Field(None, description="Manual list of findings to fix")
+    session_id: str | None = Field(None, description="Audit session ID to get findings from")
+    findings: list[dict[str, Any]] | None = Field(None, description="Manual list of findings to fix")
     base_branch: str = Field(default="main", description="Base branch for PR (default: main)")
     auto_merge: bool = Field(default=False, description="Enable auto-merge if checks pass")
 
@@ -2958,12 +2966,12 @@ class AutoFixPRResponse(BaseModel):
     """Response model for auto-fix PR creation."""
     
     success: bool
-    pr_number: Optional[int] = None
-    pr_url: Optional[str] = None
-    branch_name: Optional[str] = None
+    pr_number: int | None = None
+    pr_url: str | None = None
+    branch_name: str | None = None
     fixes_applied: int = 0
     fixes_failed: int = 0
-    errors: List[str] = []
+    errors: list[str] = []
 
 
 @app.post("/audits/{session_id}/create-fix-pr", response_model=AutoFixPRResponse)
@@ -3110,12 +3118,12 @@ async def create_fix_pr_standalone(request: AutoFixPRRequest):
 class GraphBuildRequest(BaseModel):
     """Request model for building graphs."""
     repo_url: str = Field(..., description="Git repository URL or local path")
-    tenant_id: Optional[int] = Field(None, description="Tenant ID")
-    project_id: Optional[int] = Field(None, description="Project ID to link graphs to")
+    tenant_id: int | None = Field(None, description="Tenant ID")
+    project_id: int | None = Field(None, description="Project ID to link graphs to")
     max_iterations: int = Field(3, description="Max graph refinement iterations")
     num_graphs: int = Field(2, description="Number of graphs to build")
     init_only: bool = Field(False, description="Only build SystemArchitecture graph")
-    installation_id: Optional[int] = Field(None, description="GitHub App installation ID")
+    installation_id: int | None = Field(None, description="GitHub App installation ID")
 
 
 class GraphBuildResponse(BaseModel):
@@ -3252,7 +3260,7 @@ class SyncGraphBuildResponse(BaseModel):
     success: bool
     message: str
     graphs_built: int
-    graphs: List[Dict[str, Any]]
+    graphs: list[dict[str, Any]]
     total_nodes: int
     total_edges: int
     duration_seconds: float
@@ -3278,8 +3286,8 @@ async def build_graphs_sync(request: SyncGraphBuildRequest, db: Session = Depend
     
     Returns when complete (may take 1-10 minutes depending on codebase size).
     """
-    import time
     import tempfile
+    import time
     from pathlib import Path
     
     start_time = time.time()
@@ -3318,8 +3326,8 @@ async def build_graphs_sync(request: SyncGraphBuildRequest, db: Session = Depend
         config = get_active_config()
         
         # Create manifest using RepositoryManifest class
-        from ingest.manifest import RepositoryManifest
         from ingest.bundles import AdaptiveBundler
+        from ingest.manifest import RepositoryManifest
         
         with tempfile.TemporaryDirectory(prefix="hound_manifest_") as manifest_dir:
             manifest_path = Path(manifest_dir)
@@ -3348,7 +3356,7 @@ async def build_graphs_sync(request: SyncGraphBuildRequest, db: Session = Depend
             num_graphs = 1 if request.init_only else request.num_graphs
             
             # Build graphs - note: repo_root is not a param, it's read from manifest
-            results = builder.build(
+            builder.build(
                 manifest_dir=manifest_path,
                 output_dir=manifest_path / "graphs",
                 max_iterations=request.max_iterations,
@@ -3432,10 +3440,10 @@ class SyncAuditResponse(BaseModel):
     session_id: str
     hypotheses_found: int
     confirmed_count: int
-    findings: List[Dict[str, Any]]
+    findings: list[dict[str, Any]]
     duration_seconds: float
-    report_path: Optional[str] = None
-    report_url: Optional[str] = None
+    report_path: str | None = None
+    report_url: str | None = None
 
 
 @app.post("/audits/run-sync", response_model=SyncAuditResponse)
@@ -3458,8 +3466,8 @@ async def run_audit_sync(request: SyncAuditRequest, db: Session = Depends(get_db
     
     Returns when complete (may take 5-60 minutes depending on settings).
     """
-    import time
     import tempfile
+    import time
     from pathlib import Path
     
     start_time = time.time()
@@ -3591,7 +3599,7 @@ async def run_audit_sync(request: SyncAuditRequest, db: Session = Depends(get_db
             )
             
             # Create investigation prompt
-            investigation_prompt = f"""Perform a comprehensive security audit of this codebase.
+            investigation_prompt = """Perform a comprehensive security audit of this codebase.
 Focus on identifying:
 1. Critical vulnerabilities (reentrancy, access control, overflow)
 2. Logic bugs and edge cases
@@ -3666,8 +3674,9 @@ Analyze the loaded graphs systematically and form hypotheses for any potential i
             if auto_generate_report and confirmed_count > 0:
                 try:
                     logger.info(f"Auto-generating report for session {session_id}...")
-                    from analysis.report_generator import ReportGenerator
                     import tempfile
+
+                    from analysis.report_generator import ReportGenerator
                     
                     # Create temporary project directory for report
                     with tempfile.TemporaryDirectory(prefix="hound_report_") as report_temp_dir:
@@ -3969,7 +3978,7 @@ async def handle_github_webhook(request: Request, db: Session = Depends(get_db))
         
         # Only trigger on main/master branch pushes
         default_branch = repo.get("default_branch", "main")
-        if ref not in (f"refs/heads/{default_branch}", f"refs/heads/main", f"refs/heads/master"):
+        if ref not in (f"refs/heads/{default_branch}", "refs/heads/main", "refs/heads/master"):
             return {"status": "ok", "event": "push", "skipped": True, "reason": "Not default branch"}
         
         # TODO: Optionally trigger audit on main branch pushes
@@ -4016,7 +4025,7 @@ async def root():
     }
 
 
-@app.get("/projects", response_model=List[ProjectResponse])
+@app.get("/projects", response_model=list[ProjectResponse])
 async def list_projects(db: Session = Depends(get_db)):
     """
     List all projects from the database.
@@ -4154,7 +4163,7 @@ async def create_project(project_data: ProjectCreate, db: Session = Depends(get_
         raise HTTPException(status_code=500, detail=f"Failed to create project: {str(e)}")
 
 
-@app.get("/projects/{project_id}/sessions", response_model=List[SessionResponse])
+@app.get("/projects/{project_id}/sessions", response_model=list[SessionResponse])
 async def list_project_sessions(project_id: int, db: Session = Depends(get_db)):
     """
     List all audit sessions for a project.
@@ -4246,7 +4255,7 @@ async def get_session_graph(session_id: str, db: Session = Depends(get_db)):
 
     if system_graph_file.exists():
         try:
-            with open(system_graph_file, "r") as f:
+            with open(system_graph_file) as f:
                 graph_data = json.load(f)
             return graph_data
         except Exception as e:
@@ -4255,10 +4264,10 @@ async def get_session_graph(session_id: str, db: Session = Depends(get_db)):
     raise HTTPException(status_code=404, detail="System graph not found")
 
 
-@app.get("/projects/{project_id}/hypotheses", response_model=List[FindingResponse])
+@app.get("/projects/{project_id}/hypotheses", response_model=list[FindingResponse])
 async def get_project_hypotheses(
     project_id: int, 
-    status: Optional[str] = None,
+    status: str | None = None,
     db: Session = Depends(get_db)
 ):
     """
@@ -4305,7 +4314,7 @@ async def get_project_hypotheses(
     return response
 
 
-@app.get("/sessions/{session_id}/findings", response_model=List[FindingResponse])
+@app.get("/sessions/{session_id}/findings", response_model=list[FindingResponse])
 async def get_session_findings(session_id: str, db: Session = Depends(get_db)):
     """
     Return the list of confirmed hypotheses (findings).
@@ -4460,40 +4469,37 @@ class UserProfileResponse(BaseModel):
     """Response model for user profile."""
     id: int
     name: str
-    email: Optional[str]
+    email: str | None
     org_id: int
     org_name: str
     org_type: str  # "User" or "Organization"
     role: str = "member"  # For future role-based access control
-    
-    class Config:
-        from_attributes = True
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OrganizationResponse(BaseModel):
     """Response model for organization details."""
     id: int
     name: str
-    github_account_login: Optional[str]
-    github_account_type: Optional[str]
+    github_account_login: str | None
+    github_account_type: str | None
     status: str
-    contact_email: Optional[str]
+    contact_email: str | None
     created_at: datetime
     updated_at: datetime
-    
-    class Config:
-        from_attributes = True
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OrganizationMemberResponse(BaseModel):
     """Response model for organization member."""
     id: int
     name: str
-    email: Optional[str]
+    email: str | None
     role: str = "member"
-    
-    class Config:
-        from_attributes = True
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SubscriptionResponse(BaseModel):
@@ -4503,9 +4509,8 @@ class SubscriptionResponse(BaseModel):
     plan: str = "free"  # free, pro, enterprise
     status: str  # active, pending, suspended
     created_at: datetime
-    
-    class Config:
-        from_attributes = True
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class UsageStatsResponse(BaseModel):
@@ -4515,32 +4520,30 @@ class UsageStatsResponse(BaseModel):
     scans_count: int
     findings_count: int
     total_cost_usd: float
-    token_usage: Dict[str, Any]
-    
-    class Config:
-        from_attributes = True
+    token_usage: dict[str, Any]
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class RepositoryResponse(BaseModel):
     """Response model for repository details."""
     id: int
     name: str
-    git_url: Optional[str]
-    github_repo_id: Optional[int]
-    description: Optional[str]
+    git_url: str | None
+    github_repo_id: int | None
+    description: str | None
     status: str
-    last_scan_at: Optional[datetime] = None
+    last_scan_at: datetime | None = None
     scans_count: int = 0
     findings_count: int = 0
     created_at: datetime
-    
-    class Config:
-        from_attributes = True
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class RepositoryListResponse(BaseModel):
     """Response model for paginated repository list."""
-    repositories: List[RepositoryResponse]
+    repositories: list[RepositoryResponse]
     total: int
     page: int
     page_size: int
@@ -4550,20 +4553,19 @@ class ScanHistoryItem(BaseModel):
     """Response model for scan history item."""
     execution_id: str
     status: str
-    risk_score: Optional[int]
-    risk_level: Optional[str]
+    risk_score: int | None
+    risk_level: str | None
     findings_count: int
-    started_at: Optional[datetime]
-    completed_at: Optional[datetime]
-    
-    class Config:
-        from_attributes = True
+    started_at: datetime | None
+    completed_at: datetime | None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ScanHistoryResponse(BaseModel):
     """Response model for scan history."""
     repository_id: int
-    scans: List[ScanHistoryItem]
+    scans: list[ScanHistoryItem]
     total: int
     page: int
     page_size: int
@@ -4572,14 +4574,14 @@ class ScanHistoryResponse(BaseModel):
 class FindingStatsResponse(BaseModel):
     """Response model for finding statistics."""
     total: int
-    by_severity: Dict[str, int]  # critical, high, medium, low
-    by_status: Dict[str, int]  # proposed, investigating, confirmed, rejected, resolved
-    by_repository: Dict[str, int]  # repo_name -> count
+    by_severity: dict[str, int]  # critical, high, medium, low
+    by_status: dict[str, int]  # proposed, investigating, confirmed, rejected, resolved
+    by_repository: dict[str, int]  # repo_name -> count
 
 
 class FindingListResponse(BaseModel):
     """Response model for paginated findings list."""
-    findings: List[FindingResponse]
+    findings: list[FindingResponse]
     total: int
     page: int
     page_size: int
@@ -4636,7 +4638,7 @@ async def get_organization(org_id: int, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/organizations/{org_id}/members", response_model=List[OrganizationMemberResponse])
+@app.get("/organizations/{org_id}/members", response_model=list[OrganizationMemberResponse])
 async def list_organization_members(org_id: int, db: Session = Depends(get_db)):
     """
     List members of an organization.
@@ -4755,7 +4757,7 @@ async def list_repositories(
     tenant_id: int = Query(..., description="Tenant ID from authentication context"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
-    search: Optional[str] = Query(None, description="Search repository name"),
+    search: str | None = Query(None, description="Search repository name"),
     db: Session = Depends(get_db)
 ):
     """
@@ -4915,9 +4917,9 @@ async def list_all_findings(
     tenant_id: int = Query(..., description="Tenant ID from authentication context"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
-    severity: Optional[str] = Query(None, description="Filter by severity (critical, high, medium, low)"),
-    status: Optional[str] = Query(None, description="Filter by status"),
-    repository_id: Optional[int] = Query(None, description="Filter by repository ID"),
+    severity: str | None = Query(None, description="Filter by severity (critical, high, medium, low)"),
+    status: str | None = Query(None, description="Filter by status"),
+    repository_id: int | None = Query(None, description="Filter by repository ID"),
     db: Session = Depends(get_db)
 ):
     """
@@ -5064,7 +5066,7 @@ class QAFinalizeResponse(BaseModel):
     confirmed: int
     rejected: int
     uncertain: int
-    results: List[QAReviewResult]
+    results: list[QAReviewResult]
 
 
 @app.post("/sessions/{session_id}/finalize", response_model=QAFinalizeResponse)
@@ -5389,7 +5391,7 @@ Be conservative - only confirm if evidence clearly shows the vulnerability.
 
 class PoCGenerateRequest(BaseModel):
     """Request model for PoC prompt generation."""
-    hypothesis_id: Optional[str] = Field(None, description="Specific hypothesis ID to generate PoC for")
+    hypothesis_id: str | None = Field(None, description="Specific hypothesis ID to generate PoC for")
     max_hypotheses: int = Field(default=10, description="Maximum hypotheses to process")
     min_confidence: float = Field(default=0.7, description="Minimum confidence threshold")
 
@@ -5400,7 +5402,7 @@ class PoCPromptResult(BaseModel):
     title: str
     vulnerability_type: str
     severity: str
-    affected_files: List[str]
+    affected_files: list[str]
     prompt: str
     output_path: str
 
@@ -5410,7 +5412,7 @@ class PoCGenerateResponse(BaseModel):
     session_id: str
     project_name: str
     total_generated: int
-    results: List[PoCPromptResult]
+    results: list[PoCPromptResult]
 
 
 @app.post("/sessions/{session_id}/poc", response_model=PoCGenerateResponse)
@@ -5470,7 +5472,7 @@ async def generate_poc_prompts(
     # Initialize LLM for strategist - handle missing API keys
     try:
         from llm.unified_client import UnifiedLLMClient
-        llm = UnifiedLLMClient(cfg=config, profile="strategist")
+        UnifiedLLMClient(cfg=config, profile="strategist")
     except ValueError as e:
         if "API key not found" in str(e):
             raise HTTPException(
@@ -5519,7 +5521,7 @@ async def generate_poc_prompts(
                 pass
     
     # Import PoC generation utilities
-    from commands.poc import load_affected_files, generate_poc_with_strategist, PoCContext
+    from commands.poc import PoCContext, generate_poc_with_strategist, load_affected_files
     
     # Create output directory
     output_dir = Path.home() / f".hound/poc_prompts/{project.name}"
@@ -5627,7 +5629,7 @@ async def generate_poc_prompts(
 class ReportGenerateRequest(BaseModel):
     """Request model for report generation."""
     format: str = Field(default="html", description="Report format: html, markdown, or pdf")
-    title: Optional[str] = Field(None, description="Custom report title")
+    title: str | None = Field(None, description="Custom report title")
     auditors: str = Field(default="Security Team", description="Comma-separated auditor names")
     include_all: bool = Field(default=False, description="Include all hypotheses, not just confirmed")
 
@@ -5639,7 +5641,7 @@ class ReportGenerateResponse(BaseModel):
     format: str
     total_findings: int
     output_path: str
-    report_url: Optional[str] = None
+    report_url: str | None = None
 
 
 @app.post("/sessions/{session_id}/report", response_model=ReportGenerateResponse)
@@ -5660,10 +5662,10 @@ async def generate_report(
     This endpoint uses LLM to generate executive summary and takes 30-60 seconds.
     """
     import re
-    import tempfile
     import subprocess
-    from datetime import datetime
+    import tempfile
     import traceback
+    from datetime import datetime
     
     logger.info(f"Starting report generation for session {session_id}")
     
@@ -5940,7 +5942,7 @@ class SurfaceScanRequest(BaseModel):
     target: str = Field(default=None, description="GitHub URL or repository path to scan")
     repo_url: str = Field(default=None, description="Alias for target - GitHub URL to scan")
     llm_budget: int = Field(default=5, description="Maximum LLM calls per scan (0 to disable)")
-    model: Optional[str] = Field(default=None, description="Override LLM model")
+    model: str | None = Field(default=None, description="Override LLM model")
     
     @model_validator(mode='after')
     def validate_target_or_repo_url(self):
@@ -5964,13 +5966,13 @@ class SurfaceFinding(BaseModel):
     code_snippet: str
     description: str
     llm_verified: bool = False
-    llm_notes: Optional[str] = None
+    llm_notes: str | None = None
 
 
 class SurfaceQualityMetrics(BaseModel):
     """Code quality metrics from surface scan."""
-    solidity_version: Optional[str] = None
-    vyper_version: Optional[str] = None
+    solidity_version: str | None = None
+    vyper_version: str | None = None
     has_tests: bool = False
     test_count: int = 0
     has_natspec: bool = False
@@ -5984,36 +5986,36 @@ class SurfaceQualityMetrics(BaseModel):
 class SurfaceScanResponse(BaseModel):
     """Response from surface scan."""
     execution_id: str
-    repo_url: Optional[str] = None
+    repo_url: str | None = None
     repo_name: str
     risk_score: int
     risk_level: str
-    findings: List[SurfaceFinding]
+    findings: list[SurfaceFinding]
     quality_metrics: SurfaceQualityMetrics
     contracts_scanned: int
     llm_calls_used: int
     scan_duration_seconds: float
     summary: str
-    error: Optional[str] = None
+    error: str | None = None
 
 
 class SurfaceScanListItem(BaseModel):
     """Summary item for scan listing."""
     execution_id: str
     repo_name: str
-    repo_url: Optional[str] = None
+    repo_url: str | None = None
     risk_score: int
     risk_level: str
     finding_count: int
     contracts_scanned: int
     status: str
     created_at: datetime
-    summary: Optional[str] = None
+    summary: str | None = None
 
 
 class SurfaceScanListResponse(BaseModel):
     """Response for listing surface scans."""
-    scans: List[SurfaceScanListItem]
+    scans: list[SurfaceScanListItem]
     total: int
     page: int
     page_size: int
@@ -6139,9 +6141,9 @@ async def list_surface_scans(
     tenant_id: int = Depends(get_current_tenant_id),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
-    risk_level: Optional[str] = Query(None, description="Filter by risk level"),
-    status: Optional[str] = Query(None, description="Filter by status"),
-    search: Optional[str] = Query(None, description="Search repo name"),
+    risk_level: str | None = Query(None, description="Filter by risk level"),
+    status: str | None = Query(None, description="Filter by status"),
+    search: str | None = Query(None, description="Search repo name"),
     db: Session = Depends(get_db)
 ):
     """
@@ -6342,6 +6344,7 @@ async def get_token_usage_stats(
     Returns aggregated statistics by model, provider, profile, and project.
     """
     from sqlalchemy import func
+
     from database.models import TokenUsageLog
     
     # Date filter
@@ -6509,6 +6512,7 @@ def cost_dashboard(request: Request, db: Session = Depends(get_db), _auth: bool 
     Shows token usage and cost statistics with charts and breakdowns.
     """
     from sqlalchemy import func
+
     from database.models import TokenUsageLog
     
     # Get stats for last 30 days
@@ -6889,7 +6893,7 @@ class ConnectionManager:
     """Manage WebSocket connections for live audit log streaming."""
 
     def __init__(self):
-        self.active_connections: Dict[str, List[WebSocket]] = {}
+        self.active_connections: dict[str, list[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, session_id: str):
         """Accept a new WebSocket connection for a session."""
@@ -7063,6 +7067,7 @@ _config_cache: dict = {}
 def get_available_config_profiles() -> list[dict]:
     """Get list of available config profiles."""
     from pathlib import Path
+
     import yaml
     
     hound_dir = Path(__file__).parent.parent
@@ -7115,6 +7120,7 @@ def get_available_config_profiles() -> list[dict]:
 def load_config_profile(profile_id: str) -> dict:
     """Load a specific config profile."""
     from pathlib import Path
+
     import yaml
     
     # Check cache
@@ -7248,7 +7254,7 @@ async def get_active_config_info():
 
 class AuthStartRequest(BaseModel):
     """Request model for starting OAuth flow."""
-    email: Optional[str] = None
+    email: str | None = None
 
 
 class AuthStartResponse(BaseModel):

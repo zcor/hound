@@ -3,9 +3,8 @@ Tests for GitHub App Authentication module.
 """
 
 import os
-import time
-from datetime import datetime, timezone, timedelta
-from unittest.mock import Mock, patch, MagicMock
+from datetime import datetime, timedelta, timezone
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -131,7 +130,7 @@ class TestGetPrivateKey:
     
     def test_loads_from_environment(self):
         """Test loading private key from environment variable."""
-        from integrations.github_auth import get_private_key, GitHubAppAuthError
+        from integrations.github_auth import GitHubAppAuthError
         test_key = "-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----"
         
         with patch.dict(os.environ, {
@@ -139,6 +138,7 @@ class TestGetPrivateKey:
         }, clear=False):
             # Reload module to pick up env var
             import importlib
+
             import integrations.github_auth as auth_module
             importlib.reload(auth_module)
             

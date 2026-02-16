@@ -9,14 +9,12 @@ When Hound detects errors in code during scans, this module can:
 """
 
 import logging
-import os
-import tempfile
 import shutil
-from pathlib import Path
-from typing import Optional
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
-from github import Github, GithubException
+from github import Github
 from github.Repository import Repository
 
 from integrations.github_auth import get_authenticated_github_client, get_clone_url_with_token
@@ -62,8 +60,8 @@ class AutoPRFixer:
         self.repo_full_name = repo_full_name
         self.base_branch = base_branch
         
-        self._github: Optional[Github] = None
-        self._repo: Optional[Repository] = None
+        self._github: Github | None = None
+        self._repo: Repository | None = None
     
     @property
     def github(self) -> Github:
@@ -95,7 +93,7 @@ class AutoPRFixer:
     def create_fix_pr(
         self,
         findings: list[dict],
-        scan_id: Optional[str] = None,
+        scan_id: str | None = None,
         auto_merge: bool = False,
     ) -> dict:
         """
@@ -442,7 +440,7 @@ class AutoPRFixer:
         lines = content.split('\n')
         
         # Check current Solidity version
-        version_line = next((l for l in lines if "pragma solidity" in l), None)
+        version_line = next((line for line in lines if "pragma solidity" in line), None)
         
         if version_line:
             # Update to ^0.8.0 if using older version
@@ -472,7 +470,7 @@ class AutoPRFixer:
             
             return f"🐕 Fix {len(findings)} security issues"
     
-    def _generate_pr_body(self, findings: list[dict], scan_id: Optional[str] = None) -> str:
+    def _generate_pr_body(self, findings: list[dict], scan_id: str | None = None) -> str:
         """Generate PR body with fix details."""
         lines = [
             "# 🐕 Automated Security Fixes by Hound",
@@ -577,7 +575,7 @@ def create_fix_pr_for_findings(
     installation_id: int,
     repo_full_name: str,
     findings: list[dict],
-    scan_id: Optional[str] = None,
+    scan_id: str | None = None,
     base_branch: str = "main",
     auto_merge: bool = False,
 ) -> dict:

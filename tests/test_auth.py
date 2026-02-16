@@ -3,12 +3,12 @@ Tests for GitHub OAuth authentication and JWT token management.
 """
 
 import os
+from unittest.mock import AsyncMock, patch
+
 import pytest
-from datetime import datetime, timezone
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from unittest.mock import patch, AsyncMock
 
 from database.models import Base, Tenant, User
 from server.auth_utils import create_access_token, decode_access_token, get_current_user_from_token
@@ -16,7 +16,7 @@ from server.auth_utils import create_access_token, decode_access_token, get_curr
 # Set test database URL before importing app
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
-from server.api import app, get_db, get_engine
+from server.api import app, get_db
 
 
 # Test database setup

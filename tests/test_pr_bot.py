@@ -2,8 +2,7 @@
 Tests for GitHub PR Comment Bot.
 """
 
-import pytest
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock, patch
 
 
 class TestFindingLocation:

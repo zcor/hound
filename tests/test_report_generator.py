@@ -70,7 +70,7 @@ class TestReportGenerator(unittest.TestCase):
             self.assertIn('Remediation', html)
             # Verify badge section is included
             self.assertIn('README Badge', html)
-            self.assertIn('Audited_by-Hound', html)  # Badge URL format uses underscores
+            self.assertIn('Audited_by-Firepan', html)  # Badge URL format uses underscores
     
     def test_remediation_advice_generation(self):
         """Test that remediation advice is generated for findings."""
@@ -115,8 +115,8 @@ class TestReportGenerator(unittest.TestCase):
             badge_html = rg._generate_badge_section_html('TestProject', 'January 1, 2025', 0)
             self.assertIn('README Badge', badge_html)
             self.assertIn('28a745', badge_html)  # Green color for no issues
-            self.assertIn('Audited_by-Hound', badge_html)  # Check for badge URL format
-            self.assertIn('Hound Security Audit', badge_html)  # Check for alt text
+            self.assertIn('Audited_by-Firepan', badge_html)  # Check for badge URL format
+            self.assertIn('Firepan Security Audit', badge_html)  # Check for alt text
             self.assertIn('Copy', badge_html)
             
             # Test with findings

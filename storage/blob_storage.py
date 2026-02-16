@@ -6,7 +6,6 @@ on local filesystem, S3, MinIO, or other cloud storage services.
 """
 
 import json
-import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any

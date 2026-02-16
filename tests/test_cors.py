@@ -3,10 +3,13 @@ Tests for CORS (Cross-Origin Resource Sharing) middleware configuration.
 """
 
 import os
+
 import pytest
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from starlette.middleware import Middleware
 
 from database.models import Base, Tenant
 
@@ -39,7 +42,7 @@ def test_db(tmp_path):
 
 @pytest.fixture(scope="function")
 def client(test_db):
-    """Create a test client with dependency override."""
+    """Create a test client with dependency override and properly isolated CORS."""
 
     def override_get_db():
         try:
@@ -62,13 +65,42 @@ def client(test_db):
     api_module._engine = test_db.get_bind()
     api_module.get_engine = override_get_engine
 
+    # Re-initialise CORS middleware with the origins required by this test
+    # module.  When another test imports server.api first, the middleware is
+    # already baked with whatever ALLOWED_ORIGINS was set at that time.
+    # We directly manipulate user_middleware instead of calling add_middleware()
+    # because Starlette raises RuntimeError if the app has already started.
+    origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    saved_user_middleware = list(app.user_middleware)
+    saved_middleware_stack = app.middleware_stack
+
+    # Strip existing CORSMiddleware entries and prepend one with correct origins
+    app.user_middleware = [
+        m for m in app.user_middleware if m.cls is not CORSMiddleware
+    ]
+    app.user_middleware.insert(
+        0,
+        Middleware(
+            CORSMiddleware,
+            allow_origins=origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+            expose_headers=["*"],
+        ),
+    )
+    # Force Starlette to rebuild the middleware stack on the next request
+    app.middleware_stack = None
+
     with TestClient(app) as test_client:
         yield test_client
 
-    # Restore original
+    # Restore original state
     app.dependency_overrides.clear()
     api_module.get_engine = original_get_engine
     api_module._engine = original_engine
+    app.user_middleware = saved_user_middleware
+    app.middleware_stack = saved_middleware_stack
 
 
 @pytest.fixture
@@ -173,9 +205,9 @@ def test_cors_expose_headers(client, sample_tenant):
     assert "access-control-expose-headers" in response.headers
 
 
-def test_request_without_origin(client, sample_tenant):
+def test_request_without_origin(client):
     """Verify requests without Origin header still work (not a browser request)."""
-    response = client.get(f"/surface/scans?tenant_id={sample_tenant.id}")
+    response = client.get("/health")
 
     # Request should succeed even without Origin header
     assert response.status_code == 200

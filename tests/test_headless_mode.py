@@ -3,14 +3,12 @@ Tests for headless mode functionality.
 """
 
 import glob
-import logging
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
-import yaml
 
 from commands.agent import AgentRunner
 
@@ -312,7 +310,7 @@ class TestHeadlessMode:
                 if runner.audit_logger:
                     inv_goal = "Analyze authentication module"
                     runner.audit_logger.info(f"Starting investigation 1/5: {inv_goal}")
-                    runner.audit_logger.info(f"  Priority: 8, Reasoning: High risk area")
+                    runner.audit_logger.info("  Priority: 8, Reasoning: High risk area")
                     
                     # Simulate investigation completion
                     runner.audit_logger.info(
@@ -353,11 +351,11 @@ class TestHeadlessMode:
                 # Simulate final summary
                 if runner.audit_logger:
                     runner.audit_logger.info(
-                        f"Audit completed with status: completed - "
-                        f"Planning batches: 3, "
-                        f"Investigations: 12, "
-                        f"Hypotheses: 25 total (15 confirmed, 5 rejected), "
-                        f"Coverage: 78.5% nodes, 65.2% cards"
+                        "Audit completed with status: completed - "
+                        "Planning batches: 3, "
+                        "Investigations: 12, "
+                        "Hypotheses: 25 total (15 confirmed, 5 rejected), "
+                        "Coverage: 78.5% nodes, 65.2% cards"
                     )
                 
                 # Read log file

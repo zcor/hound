@@ -43,7 +43,8 @@ export async function handleGitHubCallback(code: string): Promise<{
     });
 
     if (!response.ok) {
-      throw new Error('GitHub authentication failed');
+      const errorData = await response.json().catch(() => null);
+      throw new Error(errorData?.detail || `GitHub authentication failed (${response.status})`);
     }
 
     const data = await response.json();
@@ -51,8 +52,12 @@ export async function handleGitHubCallback(code: string): Promise<{
     // Store token and tenant_id in localStorage
     if (typeof window !== 'undefined') {
       localStorage.setItem('access_token', data.access_token);
-      localStorage.setItem('tenant_id', data.tenant_id.toString());
-      localStorage.setItem('user', JSON.stringify(data.user));
+      if (data.tenant_id != null) {
+        localStorage.setItem('tenant_id', data.tenant_id.toString());
+      }
+      if (data.user) {
+        localStorage.setItem('user', JSON.stringify(data.user));
+      }
     }
 
     return data;

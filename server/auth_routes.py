@@ -5,15 +5,15 @@ This module provides FastAPI endpoints for GitHub OAuth authentication
 and JWT token management.
 """
 
-from fastapi import APIRouter, HTTPException, Depends, Request
-from fastapi.responses import RedirectResponse
-from sqlalchemy.orm import Session
-import httpx
 import os
-from pydantic import BaseModel
-from typing import Generator
+from collections.abc import Generator
 
-from database.models import User, Tenant
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from database.models import Tenant, User
 from server.auth_utils import create_access_token, get_current_user_from_token
 
 router = APIRouter(prefix="/auth", tags=["authentication"])

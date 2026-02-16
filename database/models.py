@@ -438,16 +438,22 @@ def create_db_engine(database_url: str, echo: bool = False):
     Returns:
         SQLAlchemy Engine instance
     """
-    return create_engine(
-        database_url, 
+    kwargs = dict(
         echo=echo,
-        # Connection pool settings to prevent exhausting DB connections
-        pool_size=5,           # Base pool size
-        max_overflow=10,       # Allow up to 15 total connections (5 + 10)
-        pool_timeout=30,       # Wait up to 30s for a connection
-        pool_recycle=1800,     # Recycle connections after 30 minutes
         pool_pre_ping=True,    # Verify connections before use
+        pool_recycle=1800,     # Recycle connections after 30 minutes
     )
+
+    # SQLite uses SingletonThreadPool which doesn't support these parameters;
+    # they are only valid for QueuePool (used by PostgreSQL, MySQL, etc.)
+    if not database_url.startswith("sqlite"):
+        kwargs.update(
+            pool_size=5,       # Base pool size
+            max_overflow=10,   # Allow up to 15 total connections (5 + 10)
+            pool_timeout=30,   # Wait up to 30s for a connection
+        )
+
+    return create_engine(database_url, **kwargs)
 
 
 def create_db_session(engine):

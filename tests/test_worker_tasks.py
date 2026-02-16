@@ -6,9 +6,7 @@ import json
 import os
 import sys
 import unittest
-from datetime import datetime, timezone
-from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -223,8 +221,9 @@ class TestAgentCoreRedisIntegration(unittest.TestCase):
 
     def test_agent_accepts_redis_publisher(self):
         """Test that AutonomousAgent accepts redis_publisher parameter."""
-        from analysis.agent_core import AutonomousAgent
         import inspect
+
+        from analysis.agent_core import AutonomousAgent
         
         # Check that redis_publisher is in the __init__ signature
         sig = inspect.signature(AutonomousAgent.__init__)

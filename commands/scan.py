@@ -24,6 +24,7 @@ def _save_scan_to_database(result, tenant_id: int = 1) -> str | None:
     try:
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
+
         from database.models import ScanExecution
         
         engine = create_engine(database_url)
@@ -143,7 +144,7 @@ def scan(
         batch_path = Path(batch)
         output_path = Path(output) if output else batch_path.with_suffix('.results.csv')
 
-        console.print(f"[bold cyan]Hound Surface Scan - Batch Mode[/bold cyan]")
+        console.print("[bold cyan]Hound Surface Scan - Batch Mode[/bold cyan]")
         console.print(f"[dim]Input: {batch_path}[/dim]")
         console.print(f"[dim]Output: {output_path}[/dim]")
         console.print()
@@ -180,7 +181,7 @@ def scan(
 
     # Single repo mode
     if not quiet:
-        console.print(f"[bold cyan]Hound Surface Scan[/bold cyan]")
+        console.print("[bold cyan]Hound Surface Scan[/bold cyan]")
         console.print()
 
     # Run scan
@@ -236,7 +237,7 @@ def _print_summary(result):
     counts = result.finding_counts
 
     summary_text = Text()
-    summary_text.append(f"\nRisk Score: ", style="bold")
+    summary_text.append("\nRisk Score: ", style="bold")
     summary_text.append(f"{result.risk_score}/100", style=f"bold {risk_color}")
     summary_text.append(f" ({result.risk_level.upper()})\n\n", style=risk_color)
 

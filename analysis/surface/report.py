@@ -1,13 +1,10 @@
 """Report generation for surface scan results."""
 
 import csv
-import json
-from datetime import datetime
 from io import StringIO
-from pathlib import Path
 from typing import Literal
 
-from .models import ScanResult, BatchResult, Finding
+from .models import BatchResult, ScanResult
 
 
 class ScanReportGenerator:
@@ -74,7 +71,6 @@ class ScanReportGenerator:
 
         quality_html = ""
         for label, value, is_good in quality_items:
-            icon = "check" if is_good else "x"
             color = "#28a745" if is_good else "#dc3545"
             quality_html += f"""
             <div class="quality-item">

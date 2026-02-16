@@ -7,7 +7,6 @@ important events occur (e.g., new repository synced, waitlist signup).
 
 import logging
 import os
-from typing import Optional
 
 import httpx
 
@@ -23,7 +22,7 @@ TELEGRAM_API_BASE = "https://api.telegram.org"
 
 async def send_telegram_message(
     message: str,
-    chat_id: Optional[str] = None,
+    chat_id: str | None = None,
     parse_mode: str = "HTML",
     disable_notification: bool = False,
 ) -> bool:
@@ -83,10 +82,10 @@ async def send_telegram_message(
 async def notify_new_repo_synced(
     github_account: str,
     account_type: str,
-    email: Optional[str] = None,
-    tenant_id: Optional[int] = None,
-    installation_id: Optional[int] = None,
-    repos: Optional[list[str]] = None,
+    email: str | None = None,
+    tenant_id: int | None = None,
+    installation_id: int | None = None,
+    repos: list[str] | None = None,
 ) -> bool:
     """
     Send notification when a new GitHub repository is synced.
@@ -112,8 +111,8 @@ async def notify_new_repo_synced(
         account_display = f'<a href="https://github.com/{_escape_html(github_account)}">{_escape_html(github_account)}</a>'
 
     message_parts = [
-        f"🔥 <b>New Waitlist Signup!</b>",
-        f"",
+        "🔥 <b>New Waitlist Signup!</b>",
+        "",
         f"{emoji} <b>Account:</b> {account_display}",
         f"📋 <b>Type:</b> {account_type}",
     ]
@@ -128,7 +127,7 @@ async def notify_new_repo_synced(
                 repo_lines.append("  • ...")
             else:
                 repo_lines.append(f'  • <a href="https://github.com/{_escape_html(repo)}">{_escape_html(repo)}</a>')
-        message_parts.append(f"📦 <b>Repos:</b>\n" + "\n".join(repo_lines))
+        message_parts.append("📦 <b>Repos:</b>\n" + "\n".join(repo_lines))
 
     if tenant_id:
         message_parts.append(f"🆔 <b>Tenant ID:</b> {tenant_id}")

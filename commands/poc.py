@@ -249,6 +249,7 @@ def _load_hypotheses_from_db(project_name: str, hypothesis_id: str | None = None
     Returns: (hypotheses_dict, manifest_data, repo_root)
     """
     import os
+
     from sqlalchemy import create_engine, text
     
     database_url = os.environ.get("DATABASE_URL", "")
@@ -304,7 +305,7 @@ def _load_hypotheses_from_db(project_name: str, hypothesis_id: str | None = None
                         )
                         if result.returncode == 0 and clone_path.exists():
                             repo_root = clone_path
-                            console.print(f"[dim]Cloned successfully[/dim]")
+                            console.print("[dim]Cloned successfully[/dim]")
                         else:
                             console.print(f"[yellow]Clone failed: {result.stderr[:100]}[/yellow]")
                     except Exception as e:
@@ -379,7 +380,7 @@ def make_prompt(project_name: str, hypothesis_id: str | None = None, config: dic
     
     if db_hypotheses is not None:
         # Use database data
-        console.print(f"[dim]Loading from database...[/dim]")
+        console.print("[dim]Loading from database...[/dim]")
         hypotheses = db_hypotheses
         
         # Create output directory - use project_dir if exists, else temp

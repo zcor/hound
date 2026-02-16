@@ -17,7 +17,6 @@ Example:
     python examples/github_pr_comment.py my-project owner/repo 42 --token ghp_...
 """
 
-import os
 import sys
 from pathlib import Path
 

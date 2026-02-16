@@ -1,7 +1,8 @@
 """Data models for surface scan results."""
 
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -17,14 +18,14 @@ class Finding(BaseModel):
     code_snippet: str = Field(description="Relevant code snippet")
     description: str = Field(description="Detailed description of the issue")
     llm_verified: bool = Field(default=False, description="Whether LLM has verified this finding")
-    llm_notes: Optional[str] = Field(default=None, description="Notes from LLM verification")
+    llm_notes: str | None = Field(default=None, description="Notes from LLM verification")
 
 
 class QualityMetrics(BaseModel):
     """Code quality metrics for a repository."""
 
-    solidity_version: Optional[str] = Field(default=None, description="Detected Solidity version")
-    vyper_version: Optional[str] = Field(default=None, description="Detected Vyper version")
+    solidity_version: str | None = Field(default=None, description="Detected Solidity version")
+    vyper_version: str | None = Field(default=None, description="Detected Vyper version")
     has_tests: bool = Field(default=False, description="Whether tests were detected")
     test_count: int = Field(default=0, description="Number of test files found")
     has_natspec: bool = Field(default=False, description="Whether NatSpec documentation exists")
@@ -38,7 +39,7 @@ class QualityMetrics(BaseModel):
 class ScanResult(BaseModel):
     """Result of scanning a single repository."""
 
-    repo_url: Optional[str] = Field(default=None, description="GitHub URL if applicable")
+    repo_url: str | None = Field(default=None, description="GitHub URL if applicable")
     repo_path: str = Field(description="Local path to repository")
     repo_name: str = Field(description="Repository name for display")
     scan_timestamp: datetime = Field(default_factory=datetime.now, description="When scan was performed")
@@ -51,7 +52,7 @@ class ScanResult(BaseModel):
     llm_calls_used: int = Field(default=0, description="Number of LLM calls made")
     scan_duration_seconds: float = Field(default=0.0, description="Scan duration in seconds")
     summary: str = Field(default="", description="LLM-generated summary")
-    error: Optional[str] = Field(default=None, description="Error message if scan failed")
+    error: str | None = Field(default=None, description="Error message if scan failed")
 
     @property
     def finding_counts(self) -> dict[str, int]:
@@ -91,7 +92,7 @@ class BatchResult(BaseModel):
     successful: int = Field(default=0, description="Successfully scanned")
     failed: int = Field(default=0, description="Failed to scan")
     total_duration_seconds: float = Field(default=0.0, description="Total batch duration")
-    checkpoint_path: Optional[str] = Field(default=None, description="Path to checkpoint file")
+    checkpoint_path: str | None = Field(default=None, description="Path to checkpoint file")
 
     def add_result(self, result: ScanResult) -> None:
         """Add a scan result to the batch."""

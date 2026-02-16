@@ -2,14 +2,18 @@
 """
 Seed database with test data for development and testing
 """
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from database.models import Tenant, Project, ScanExecution, Hypothesis, Graph, Base, create_db_engine, create_db_session
-from sqlalchemy.orm import Session
-from datetime import datetime, timedelta, timezone
 import random
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy.orm import Session
+
+from database.models import Base, Hypothesis, Project, ScanExecution, Tenant, create_db_engine, create_db_session
+
 
 def create_test_data(db: Session):
     """Create comprehensive test data"""
@@ -149,8 +153,8 @@ def create_test_data(db: Session):
             print(f"✓ Created scan: {scan.execution_id} ({status}) with {num_findings} findings")
     
     db.commit()
-    print(f"\n✅ Test data created successfully!")
-    print(f"   - 1 tenant")
+    print("\n✅ Test data created successfully!")
+    print("   - 1 tenant")
     print(f"   - {len(projects)} projects")
     print(f"   - {scan_count} scans")
     print(f"   - {finding_count} findings")

@@ -32,7 +32,7 @@ class TestDeepSeekProvider(unittest.TestCase):
         
         with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test_key"}):
             with patch('llm.deepseek_provider.OpenAI') as mock_openai:
-                provider = DeepSeekProvider(
+                DeepSeekProvider(
                     config=config,
                     model_name="deepseek-chat"
                 )
@@ -74,7 +74,7 @@ class TestDeepSeekProvider(unittest.TestCase):
             "DEEPSEEK_BASE_URL": "https://custom.deepseek.com"
         }):
             with patch('llm.deepseek_provider.OpenAI') as mock_openai:
-                provider = DeepSeekProvider(
+                DeepSeekProvider(
                     config=config,
                     model_name="deepseek-chat"
                 )
@@ -93,7 +93,7 @@ class TestDeepSeekProvider(unittest.TestCase):
         
         with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test_key"}):
             with patch('llm.deepseek_provider.OpenAI') as mock_openai:
-                provider = DeepSeekProvider(
+                DeepSeekProvider(
                     config=config,
                     model_name="deepseek-chat"
                 )

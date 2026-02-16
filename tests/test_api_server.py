@@ -2,10 +2,8 @@
 Tests for the FastAPI server endpoints.
 """
 
-import json
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,7 +22,8 @@ from database.models import (
 # Set test database URL before importing app
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
-from server.api import app, get_db, get_engine
+from server.api import app, get_db
+from server.auth_utils import create_access_token
 
 
 # Test database setup
@@ -496,7 +495,8 @@ def test_github_webhook_push_event(client):
 
 def test_get_current_user(client, sample_tenant):
     """Test getting current user profile."""
-    response = client.get(f"/users/me?tenant_id={sample_tenant.id}")
+    token = create_access_token({"tenant_id": sample_tenant.id, "user_id": sample_tenant.id, "github_login": "test"})
+    response = client.get("/users/me", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     data = response.json()
     assert data["id"] == sample_tenant.id
@@ -507,7 +507,8 @@ def test_get_current_user(client, sample_tenant):
 
 def test_get_current_user_not_found(client):
     """Test getting current user with invalid tenant ID."""
-    response = client.get("/users/me?tenant_id=999")
+    token = create_access_token({"tenant_id": 999, "user_id": 999, "github_login": "ghost"})
+    response = client.get("/users/me", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 404
     assert "not found" in response.json()["detail"].lower()
 
@@ -566,8 +567,9 @@ def test_get_current_subscription_not_found(client):
 
 def test_get_current_month_usage(client, sample_tenant, test_db):
     """Test getting usage statistics for current month."""
-    from database.models import TokenUsageLog, ScanExecution
     from datetime import datetime, timezone
+
+    from database.models import ScanExecution, TokenUsageLog
     
     # Create some usage data
     token_log = TokenUsageLog(
@@ -626,8 +628,9 @@ def test_list_repositories_with_data(client, sample_project):
 
 def test_list_repositories_pagination(client, sample_tenant, test_db):
     """Test repository list pagination."""
-    from database.models import Project
     from datetime import datetime, timezone
+
+    from database.models import Project
     
     # Create multiple projects
     for i in range(5):
@@ -688,8 +691,9 @@ def test_list_repository_scans_empty(client, sample_project):
 
 def test_list_repository_scans_with_data(client, sample_project, test_db):
     """Test listing scans for repository with existing scans."""
-    from database.models import ScanExecution
     from datetime import datetime, timezone
+
+    from database.models import ScanExecution
     
     # Create scan executions
     scan = ScanExecution(
@@ -776,8 +780,9 @@ def test_list_all_findings_filter_repository(client, sample_hypothesis):
 
 def test_list_all_findings_pagination(client, sample_tenant, sample_project, test_db):
     """Test findings list pagination."""
-    from database.models import Hypothesis
     from datetime import datetime, timezone
+
+    from database.models import Hypothesis
     
     # Create multiple hypotheses
     for i in range(5):
@@ -829,8 +834,9 @@ def test_get_findings_statistics_with_data(client, sample_hypothesis):
 
 def test_surface_scans_with_tenant_filter(client, sample_tenant, test_db):
     """Test surface scans endpoint with tenant_id filter."""
-    from database.models import ScanExecution
     from datetime import datetime, timezone
+
+    from database.models import ScanExecution
     
     # Create scan for specific tenant
     scan = ScanExecution(
@@ -844,7 +850,8 @@ def test_surface_scans_with_tenant_filter(client, sample_tenant, test_db):
     test_db.add(scan)
     test_db.commit()
     
-    response = client.get(f"/surface/scans?tenant_id={sample_tenant.id}")
+    token = create_access_token({"tenant_id": sample_tenant.id, "user_id": sample_tenant.id, "github_login": "test"})
+    response = client.get("/surface/scans", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     data = response.json()
     assert "scans" in data

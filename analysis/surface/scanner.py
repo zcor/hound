@@ -1,6 +1,5 @@
 """Core surface scanning engine."""
 
-import asyncio
 import csv
 import json
 import os
@@ -11,14 +10,13 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
-from .models import Finding, QualityMetrics, ScanResult, BatchResult
+from .models import BatchResult, Finding, QualityMetrics, ScanResult
 from .patterns import PatternDetector, PatternMatch
 
 console = Console()
@@ -241,7 +239,7 @@ class SurfaceScanner:
                     completed_urls.add(repo_url)
 
                     # Update progress
-                    status = f"[green]✓[/green]" if not result.error else f"[red]✗[/red]"
+                    status = "[green]✓[/green]" if not result.error else "[red]✗[/red]"
                     progress.update(task, advance=1, description=f"{status} {repo_name[:30]}")
 
                 except Exception as e:
@@ -269,14 +267,14 @@ class SurfaceScanner:
         if output_path:
             self._write_batch_csv(batch_result, output_path)
 
-        console.print(f"\n[green]Scan complete![/green]")
+        console.print("\n[green]Scan complete![/green]")
         console.print(f"  Successful: {batch_result.successful}")
         console.print(f"  Failed: {batch_result.failed}")
         console.print(f"  Duration: {batch_result.total_duration_seconds:.1f}s")
 
         return batch_result
 
-    def _resolve_target(self, target: str) -> tuple[Path, Optional[str], Optional[callable]]:
+    def _resolve_target(self, target: str) -> tuple[Path, str | None, callable | None]:
         """Resolve target to local path, downloading if needed.
 
         Returns:

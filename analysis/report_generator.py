@@ -9,7 +9,6 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from llm.unified_client import UnifiedLLMClient
 from utils.json_utils import extract_json_object
@@ -2396,7 +2395,7 @@ Rules for affected components:
         
         # Debug: Validate fields
         if self.debug:
-            print(f"[DEBUG] Validating finding fields before remediation generation")
+            print("[DEBUG] Validating finding fields before remediation generation")
             for i, finding in enumerate(findings):
                 has_desc = bool(finding.get('professional_description') or finding.get('description'))
                 has_affected = bool(finding.get('affected_description'))

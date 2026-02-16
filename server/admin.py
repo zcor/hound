@@ -5,13 +5,14 @@ Provides a GUI admin interface for managing database models.
 Access at /admin when mounted to the FastAPI app.
 """
 
-from pathlib import Path
-from sqladmin import Admin, ModelView, action, BaseView, expose
-from starlette.requests import Request
-from starlette.responses import RedirectResponse, HTMLResponse
-from markupsafe import Markup
 import os
 from datetime import datetime
+from pathlib import Path
+
+from markupsafe import Markup
+from sqladmin import Admin, BaseView, ModelView, action, expose
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse
 
 from database.models import (
     AuditSession,
@@ -204,8 +205,8 @@ class ProjectAdmin(ModelView, model=Project):
             use_celery = False
         
         # Get database session
-        from server.api import get_engine
         from database import create_db_session
+        from server.api import get_engine
         engine = get_engine()
         db = create_db_session(engine)
         
@@ -306,8 +307,8 @@ class ProjectAdmin(ModelView, model=Project):
             use_celery = False
         
         # Get database session
-        from server.api import get_engine
         from database import create_db_session
+        from server.api import get_engine
         engine = get_engine()
         db = create_db_session(engine)
         
@@ -395,8 +396,8 @@ class ProjectAdmin(ModelView, model=Project):
         pks = request.query_params.get("pks", "").split(",")
         generated = []
         
-        from server.api import get_engine
         from database import create_db_session
+        from server.api import get_engine
         engine = get_engine()
         db = create_db_session(engine)
         
@@ -529,8 +530,8 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
         
         if pks and pks[0]:
             # Query the session directly
-            from server.api import get_engine
             from database import create_db_session
+            from server.api import get_engine
             engine = get_engine()
             db = create_db_session(engine)
             try:
@@ -561,8 +562,8 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
         pks = request.query_params.get("pks", "").split(",")
         aborted = []
         
-        from server.api import get_engine
         from database import create_db_session
+        from server.api import get_engine
         engine = get_engine()
         db = create_db_session(engine)
         try:
@@ -600,8 +601,8 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
         pks = request.query_params.get("pks", "").split(",")
         generated = []
         
-        from server.api import get_engine
         from database import create_db_session
+        from server.api import get_engine
         engine = get_engine()
         db = create_db_session(engine)
         
@@ -734,7 +735,7 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
                 html += f'<h5 class="mt-3"><span class="badge bg-{badge_color} text-uppercase">{severity}</span> ({count})</h5>'
                 
                 for finding in findings_list:
-                    confidence_pct = int((finding.get('confidence', 0) * 100))
+                    confidence_pct = int(finding.get('confidence', 0) * 100)
                     html += f'''
                     <div class="card mb-2" style="border-left: 4px solid var(--bs-{badge_color});">
                         <div class="card-body p-3">
@@ -891,11 +892,12 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
                 status_code=302,
             )
         
-        from analysis.surface import SurfaceScanner
-        from utils.config_loader import load_config
         from datetime import datetime
-        from server.api import get_engine
+
+        from analysis.surface import SurfaceScanner
         from database import create_db_session
+        from server.api import get_engine
+        from utils.config_loader import load_config
         
         engine = get_engine()
         db = create_db_session(engine)
@@ -973,8 +975,8 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
                 status_code=302,
             )
         
-        from server.api import get_engine
         from database import create_db_session
+        from server.api import get_engine
         engine = get_engine()
         db = create_db_session(engine)
         created_projects = []
@@ -1062,11 +1064,12 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
                 status_code=302,
             )
         
-        from server.api import get_engine
-        from database import create_db_session
-        from analysis.surface.report import ScanReportGenerator
-        from analysis.surface.models import ScanResult, Finding, QualityMetrics
         from pathlib import Path
+
+        from analysis.surface.models import Finding, QualityMetrics, ScanResult
+        from analysis.surface.report import ScanReportGenerator
+        from database import create_db_session
+        from server.api import get_engine
         
         engine = get_engine()
         db = create_db_session(engine)
@@ -1174,8 +1177,8 @@ class GraphAdmin(ModelView, model=Graph):
         
         if pks and pks[0]:
             # Query the graph directly to get project_id
-            from server.api import get_engine
             from database import create_db_session
+            from server.api import get_engine
             engine = get_engine()
             db = create_db_session(engine)
             try:
@@ -1255,8 +1258,8 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
         pks = request.query_params.get("pks", "").split(",")
         confirmed = []
         
-        from server.api import get_engine
         from database import create_db_session
+        from server.api import get_engine
         engine = get_engine()
         db = create_db_session(engine)
         try:
@@ -1294,8 +1297,8 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
         pks = request.query_params.get("pks", "").split(",")
         rejected = []
         
-        from server.api import get_engine
         from database import create_db_session
+        from server.api import get_engine
         engine = get_engine()
         db = create_db_session(engine)
         try:
@@ -1332,14 +1335,13 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
         """Confirm findings and immediately generate an AI-powered audit report."""
         pks = request.query_params.get("pks", "").split(",")
         
-        from server.api import get_engine
         from database import create_db_session
+        from server.api import get_engine
         engine = get_engine()
         db = create_db_session(engine)
         
         confirmed = []
         project_id = None
-        project_name = None
         
         try:
             # First, confirm all selected findings
@@ -1373,7 +1375,6 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
                     status_code=302,
                 )
             
-            project_name = project.name
             
             # Find most recent completed audit session
             latest_session = db.query(AuditSession).filter(
@@ -1518,7 +1519,7 @@ class ReportsView(BaseView):
                             date_str, time_str = date_part.split("_")
                             report_date = datetime.strptime(date_str, "%Y%m%d").strftime("%Y-%m-%d")
                             report_time = datetime.strptime(time_str, "%H%M%S").strftime("%H:%M:%S")
-                        except:
+                        except Exception:
                             report_date = datetime.fromtimestamp(report_file.stat().st_mtime).strftime("%Y-%m-%d")
                             report_time = datetime.fromtimestamp(report_file.stat().st_mtime).strftime("%H:%M:%S")
                         
@@ -1647,9 +1648,9 @@ class ScanFindingsView(BaseView):
     @expose("/scan-findings/<scan_id>", methods=["GET"])
     async def findings_detail(self, request: Request):
         """Display findings for a specific scan."""
-        from server.api import get_engine
+
         from database import create_db_session
-        import json
+        from server.api import get_engine
         
         scan_id = request.path_params.get("scan_id")
         
@@ -1801,7 +1802,6 @@ def setup_admin(app, engine):
     Returns:
         Admin instance
     """
-    import os
     
     # Get base URL from environment or use default
     # This is important for port forwarding scenarios (Codespaces, ngrok, etc.)

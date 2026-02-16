@@ -6,7 +6,7 @@ Tests the GitHubPRReporter class that posts security findings to GitHub PRs.
 
 import os
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock, patch
 
 from analysis.reporters.github_pr import GitHubPRReporter
 
@@ -224,7 +224,7 @@ class TestGitHubPRReporter(unittest.TestCase):
             token=self.token
         )
         
-        result = reporter.report(self.sample_findings)
+        reporter.report(self.sample_findings)
         
         # Check that comments were created
         call_kwargs = mock_pr.create_review.call_args[1]
@@ -395,7 +395,7 @@ class TestGitHubPRReporter(unittest.TestCase):
         # Only medium severity finding
         medium_findings = [self.sample_findings[2]]
         
-        result = reporter.report(medium_findings)
+        reporter.report(medium_findings)
         
         call_kwargs = mock_pr.create_review.call_args[1]
         self.assertEqual(call_kwargs["event"], "COMMENT")

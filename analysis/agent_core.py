@@ -329,8 +329,9 @@ class AutonomousAgent:
         
         try:
             # Import database models only when needed
-            from database.models import AuditSession, create_db_engine, create_db_session
             import os
+
+            from database.models import AuditSession, create_db_engine, create_db_session
             
             # Get database URL from environment
             db_url = os.environ.get('DATABASE_URL')
@@ -869,7 +870,7 @@ class AutonomousAgent:
                 
                 # Check if complete
                 if decision.action == 'complete':
-                    print(f"[DEBUG] Agent decided to COMPLETE - exiting loop")
+                    print("[DEBUG] Agent decided to COMPLETE - exiting loop")
                     if progress_callback:
                         progress_callback({
                             'status': 'complete',
@@ -1103,14 +1104,14 @@ class AutonomousAgent:
         if loaded_nodes_count >= 5 and deep_think_calls == 0:
             context_parts.append("=== ⚠️  ANALYSIS REMINDER ===")
             context_parts.append(f"You have loaded {loaded_nodes_count} nodes and {total_graphs} graph(s).")
-            context_parts.append(f"You have NOT called deep_think yet to analyze for vulnerabilities!")
+            context_parts.append("You have NOT called deep_think yet to analyze for vulnerabilities!")
             context_parts.append("Consider calling deep_think NOW to get vulnerability analysis from the strategist.")
             context_parts.append("The strategist can only find vulnerabilities if you call deep_think.")
             context_parts.append("")
         elif loaded_nodes_count >= 3 and action_count >= 5 and load_actions >= 4 and hypotheses_count == 0:
             context_parts.append("=== ⚠️  ANALYSIS REMINDER ===")
             context_parts.append(f"You've performed {action_count} actions with {load_actions} recent load actions.")
-            context_parts.append(f"No vulnerabilities found yet. Consider calling deep_think to analyze the loaded code.")
+            context_parts.append("No vulnerabilities found yet. Consider calling deep_think to analyze the loaded code.")
             context_parts.append("")
         
         # Actions performed (recent) - summary only since full data is in RECENT ACTIONS

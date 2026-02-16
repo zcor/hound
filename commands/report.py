@@ -79,7 +79,7 @@ def _load_report_data_from_db(project_name: str, include_all: bool = False) -> t
                         )
                         if result.returncode == 0 and clone_path.exists():
                             repo_root = clone_path
-                            console.print(f"[dim]Cloned successfully[/dim]")
+                            console.print("[dim]Cloned successfully[/dim]")
                     except Exception as e:
                         console.print(f"[yellow]Clone warning: {e}[/yellow]")
             
@@ -270,7 +270,7 @@ def report(project_name: str, output: str | None, format: str,
     
     if db_hypotheses is not None and temp_project_dir:
         # Use database mode
-        console.print(f"[dim]Using database mode...[/dim]")
+        console.print("[dim]Using database mode...[/dim]")
         project_dir = temp_project_dir
         project_source = str(repo_root) if repo_root else None
         cleanup_temp = True

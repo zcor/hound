@@ -8,12 +8,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from analysis.session_manager import SessionInfo, SessionManager
+from analysis.session_manager import SessionManager
 from storage.blob_storage import LocalStorageBackend
 
 
@@ -32,7 +32,7 @@ class TestSessionManagerLocal(unittest.TestCase):
 
     def test_init_creates_sessions_dir(self):
         """Test that SessionManager creates sessions directory."""
-        manager = SessionManager(self.project_dir)
+        SessionManager(self.project_dir)
         
         # Verify sessions directory was created
         sessions_dir = self.project_dir / "sessions"

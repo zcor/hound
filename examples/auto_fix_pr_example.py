@@ -139,7 +139,7 @@ def example_2_filter_fixable_findings():
     fixable = [f for f in all_findings if fixer.can_fix(f)]
     unfixable = [f for f in all_findings if not fixer.can_fix(f)]
     
-    print(f"\n📊 Finding Analysis:")
+    print("\n📊 Finding Analysis:")
     print(f"   Total findings: {len(all_findings)}")
     print(f"   Fixable: {len(fixable)}")
     print(f"   Not fixable: {len(unfixable)}")
@@ -189,7 +189,7 @@ def example_3_scan_and_auto_fix():
             print(f"\n❌ Scan failed: {scan_result.error}")
             return
         
-        print(f"\n📊 Scan complete!")
+        print("\n📊 Scan complete!")
         print(f"   Risk score: {scan_result.risk_score}/100 ({scan_result.risk_level})")
         print(f"   Findings: {len(scan_result.findings)}")
         

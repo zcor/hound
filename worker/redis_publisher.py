@@ -8,7 +8,6 @@ to the SaaS frontend in real-time.
 import json
 import os
 from datetime import datetime, timezone
-from typing import Any, Optional
 
 
 class RedisPublisher:
@@ -29,7 +28,7 @@ class RedisPublisher:
     }
     """
     
-    def __init__(self, scan_id: str, redis_url: Optional[str] = None):
+    def __init__(self, scan_id: str, redis_url: str | None = None):
         """
         Initialize Redis publisher.
         
@@ -98,7 +97,7 @@ class RedisPublisher:
             print(f"[Redis] Publish error: {e}", file=sys.stderr)
             return False
     
-    def publish_thought(self, thought: str, iteration: int = 0, context: Optional[dict] = None):
+    def publish_thought(self, thought: str, iteration: int = 0, context: dict | None = None):
         """
         Publish agent's current thinking/reasoning.
         
@@ -237,7 +236,7 @@ class RedisPublisher:
             }
         })
     
-    def publish_status(self, status: str, message: str = "", details: Optional[dict] = None):
+    def publish_status(self, status: str, message: str = "", details: dict | None = None):
         """
         Publish a status change.
         

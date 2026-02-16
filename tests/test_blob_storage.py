@@ -2,7 +2,6 @@
 Unit tests for blob storage backends.
 """
 
-import json
 import os
 import shutil
 import sys

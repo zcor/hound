@@ -1,8 +1,8 @@
 """Surface scan module for lightweight security scanning."""
 
-from .models import Finding, QualityMetrics, ScanResult, BatchResult
-from .scanner import SurfaceScanner
+from .models import BatchResult, Finding, QualityMetrics, ScanResult
 from .patterns import PatternDetector
+from .scanner import SurfaceScanner
 
 __all__ = [
     "Finding",

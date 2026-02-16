@@ -1220,6 +1220,7 @@ def scan(
         hound scan https://github.com/org/repo --save  # Save to admin panel
     """
     import click
+
     from commands.scan import scan as scan_command
     
     # Create Click context and invoke

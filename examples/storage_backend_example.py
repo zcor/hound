@@ -6,8 +6,9 @@ and S3/MinIO storage backends.
 """
 
 from pathlib import Path
+
 from analysis.session_manager import SessionManager
-from storage.blob_storage import LocalStorageBackend, S3StorageBackend
+from storage.blob_storage import LocalStorageBackend
 
 
 def example_local_storage():

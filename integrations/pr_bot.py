@@ -9,14 +9,14 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from github import Github
 from github.GithubException import GithubException
 from github.PullRequest import PullRequest
 from github.Repository import Repository
 
-from .github_auth import get_authenticated_github_client, get_installation_token
+from .github_auth import get_authenticated_github_client
 
 
 @dataclass
@@ -24,7 +24,7 @@ class FindingLocation:
     """Represents a finding's location in code."""
     file_path: str
     line_number: int
-    end_line: Optional[int] = None
+    end_line: int | None = None
     
     @classmethod
     def from_node_ref(cls, node_ref: str) -> Optional["FindingLocation"]:
@@ -67,8 +67,8 @@ class FindingLocation:
 class PRComment:
     """Represents a comment to post on a PR."""
     body: str
-    file_path: Optional[str] = None
-    line_number: Optional[int] = None
+    file_path: str | None = None
+    line_number: int | None = None
     is_inline: bool = False
     side: str = "RIGHT"  # LEFT for deletions, RIGHT for additions
 
@@ -113,10 +113,10 @@ class PRCommentBot:
         self.repo_full_name = repo_full_name
         self.pr_number = pr_number
         
-        self._github: Optional[Github] = None
-        self._repo: Optional[Repository] = None
-        self._pr: Optional[PullRequest] = None
-        self._diff_files: Optional[dict] = None
+        self._github: Github | None = None
+        self._repo: Repository | None = None
+        self._pr: PullRequest | None = None
+        self._diff_files: dict | None = None
     
     @property
     def github(self) -> Github:
@@ -216,7 +216,7 @@ class PRCommentBot:
         self,
         file_path: str,
         line_number: int
-    ) -> Optional[tuple[str, int]]:
+    ) -> tuple[str, int] | None:
         """
         Find a line in the PR diff and return its position.
         

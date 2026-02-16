@@ -11,19 +11,19 @@ def __getattr__(name):
         "get_authenticated_github_client",
         "InstallationTokenCache",
     ):
-        from .github_auth import (
-            get_installation_token,
-            get_clone_url_with_token,
-            get_authenticated_github_client,
+        from .github_auth import (  # noqa: F401
             InstallationTokenCache,
+            get_authenticated_github_client,
+            get_clone_url_with_token,
+            get_installation_token,
         )
         return locals()[name]
     
     if name in ("PRCommentBot", "post_findings_to_pr", "FindingLocation"):
-        from .pr_bot import (
+        from .pr_bot import (  # noqa: F401
+            FindingLocation,
             PRCommentBot,
             post_findings_to_pr,
-            FindingLocation,
         )
         return locals()[name]
     

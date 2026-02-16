@@ -5,24 +5,22 @@ Contains the main background tasks for running audits and surface scans.
 These tasks are executed by the Celery worker fleet, separate from the web server.
 """
 
+import json
 import os
 import sys
-import json
-import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
 
 # Ensure the app root is in Python path for imports (needed for Celery fork workers)
 _app_root = Path(__file__).parent.parent
 if str(_app_root) not in sys.path:
     sys.path.insert(0, str(_app_root))
 
-from celery import Task
-from celery.exceptions import SoftTimeLimitExceeded
+from celery import Task  # noqa: E402
+from celery.exceptions import SoftTimeLimitExceeded  # noqa: E402
 
-from .celery_app import celery_app
-from .redis_publisher import RedisPublisher
+from .celery_app import celery_app  # noqa: E402
+from .redis_publisher import RedisPublisher  # noqa: E402
 
 
 class AuditTask(Task):
@@ -75,12 +73,12 @@ class AuditTask(Task):
         self,
         scan_id: str,
         status: str,
-        error_message: Optional[str] = None,
+        error_message: str | None = None,
         **extra_fields
     ):
         """Update scan execution status in database."""
         try:
-            from database.models import ScanExecution, AuditSession
+            from database.models import AuditSession, ScanExecution
             
             db = self.get_db_session()
             try:
@@ -118,13 +116,13 @@ def execute_audit_task(
     repo_url: str,
     scan_id: str,
     tenant_id: int,
-    project_id: Optional[int] = None,
-    config: Optional[dict] = None,
+    project_id: int | None = None,
+    config: dict | None = None,
     max_iterations: int = 30,
-    investigation_prompt: Optional[str] = None,
-    installation_id: Optional[int] = None,
-    pr_number: Optional[int] = None,
-    repo_full_name: Optional[str] = None,
+    investigation_prompt: str | None = None,
+    installation_id: int | None = None,
+    pr_number: int | None = None,
+    repo_full_name: str | None = None,
     time_limit_minutes: int = 120,
     mode: str = "sweep",
     plan_n: int = 5,
@@ -155,8 +153,8 @@ def execute_audit_task(
     Returns:
         dict with audit results summary
     """
-    import tempfile
     import shutil
+    import tempfile
     
     publisher = RedisPublisher(scan_id)
     temp_dir = None
@@ -218,8 +216,8 @@ def execute_audit_task(
         graphs_dir.mkdir(exist_ok=True)
         manifest_dir.mkdir(exist_ok=True)
         
-        from utils.config_loader import load_config
         from database.models import Graph, create_db_engine, create_db_session
+        from utils.config_loader import load_config
         
         # Load config
         if config is None:
@@ -240,8 +238,8 @@ def execute_audit_task(
         knowledge_graphs_path = graphs_dir / "knowledge_graphs.json"
         
         # Always create manifest first - we need it for code access
-        from ingest.manifest import RepositoryManifest
         from ingest.bundles import AdaptiveBundler
+        from ingest.manifest import RepositoryManifest
         
         publisher.publish_thought("Creating repository manifest...", iteration=0)
         manifest = RepositoryManifest(repo_path, config)
@@ -334,7 +332,7 @@ def execute_audit_task(
                     db = create_db_session(engine)
                     
                     for gf in graph_files:
-                        with open(gf, "r") as f:
+                        with open(gf) as f:
                             graph_data = json.load(f)
                         
                         graph_name = gf.stem.replace("graph_", "")
@@ -552,11 +550,11 @@ def execute_audit_task(
                 # Time check before each investigation
                 elapsed_minutes = (time_module.time() - start_overall) / 60.0
                 if elapsed_minutes >= time_limit_minutes:
-                    publisher.publish_thought(f"Time limit reached during investigation", iteration=total_iterations)
+                    publisher.publish_thought("Time limit reached during investigation", iteration=total_iterations)
                     break
                 
                 goal = item.get('goal', '') if isinstance(item, dict) else getattr(item, 'goal', '')
-                priority = item.get('priority', 0) if isinstance(item, dict) else getattr(item, 'priority', 0)
+                item.get('priority', 0) if isinstance(item, dict) else getattr(item, 'priority', 0)
                 
                 if goal in completed_investigations:
                     continue  # Skip already completed
@@ -633,7 +631,7 @@ def execute_audit_task(
             hypotheses,
             scan_id,
         )
-        print(f"[DEBUG] Hypothesis storage complete")
+        print("[DEBUG] Hypothesis storage complete")
         
         # Step 6: Post findings to PR if requested
         pr_result = None
@@ -726,7 +724,7 @@ def execute_scan_task(
     scan_id: str,
     tenant_id: int,
     llm_budget: int = 5,
-    model: Optional[str] = None,
+    model: str | None = None,
 ) -> dict:
     """
     Execute a lightweight surface scan.
@@ -806,7 +804,7 @@ def execute_scan_task(
 
 def _store_hypotheses_in_db(
     get_db_session,
-    project_id: Optional[int],
+    project_id: int | None,
     hypotheses: list,
     session_id: str,
 ):
@@ -907,12 +905,12 @@ def build_graphs_task(
     repo_url: str,
     scan_id: str,
     tenant_id: int,
-    project_id: Optional[int] = None,
-    config: Optional[dict] = None,
+    project_id: int | None = None,
+    config: dict | None = None,
     max_iterations: int = 5,
     num_graphs: int = 3,
     init_only: bool = False,
-    installation_id: Optional[int] = None,
+    installation_id: int | None = None,
 ) -> dict:
     """
     Build knowledge graphs for a repository without running the full audit.
@@ -937,7 +935,6 @@ def build_graphs_task(
     Returns:
         dict with status, graphs_path, and graph_count
     """
-    import shutil
     import subprocess
     import tempfile
     
@@ -997,10 +994,10 @@ def build_graphs_task(
         publisher.publish_status("running", "Scanning repository")
         publisher.publish_thought("Creating repository manifest...", iteration=0)
         
-        from utils.config_loader import load_config
-        from ingest.manifest import RepositoryManifest
-        from ingest.bundles import AdaptiveBundler
         from analysis.graph_builder import GraphBuilder
+        from ingest.bundles import AdaptiveBundler
+        from ingest.manifest import RepositoryManifest
+        from utils.config_loader import load_config
         
         if config is None:
             config = load_config()
@@ -1033,7 +1030,7 @@ def build_graphs_task(
         
         builder = GraphBuilder(config=config)
         
-        build_result = builder.build(
+        builder.build(
             manifest_dir=manifest_dir,
             output_dir=graphs_dir,
             max_iterations=max_iterations,

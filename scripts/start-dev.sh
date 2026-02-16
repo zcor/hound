@@ -1,7 +1,7 @@
 #!/bin/bash
 
-echo "🚀 Starting Firepan Development Environment"
-echo "==========================================="
+echo "🚀 Starting Hound Development Environment"
+echo "=========================================="
 
 # Check if database exists
 if [ ! -f "hound.db" ]; then

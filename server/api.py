@@ -7398,7 +7398,9 @@ async def database_health(db: Session = Depends(get_db)):
         db.execute(text("SELECT 1"))
         return {"status": "healthy", "database": "connected"}
     except Exception as e:
-        return {"status": "unhealthy", "database": str(e)}
+        # Log the full exception but return generic message to client
+        logger.error(f"Database health check failed: {str(e)}")
+        return {"status": "unhealthy", "database": "connection_failed"}
 
 
 if __name__ == "__main__":

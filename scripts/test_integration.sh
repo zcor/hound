@@ -34,6 +34,7 @@ else
 fi
 
 # Test 3: Test data exists
+# Note: API returns .scans field; fallback to .results for compatibility
 echo -n "Testing: Test data exists... "
 SCAN_COUNT=$(curl -s $API_URL/surface/scans?tenant_id=1 | jq '.scans | length // .results | length // 0')
 if [ "$SCAN_COUNT" -gt 0 ]; then
@@ -43,6 +44,7 @@ else
 fi
 
 # Test 4: Repositories endpoint
+# Note: API returns .repositories field; fallback to .results for compatibility
 echo -n "Testing: Repositories endpoint... "
 REPO_COUNT=$(curl -s $API_URL/repositories?tenant_id=1 | jq '.repositories | length // .results | length // 0')
 if [ "$REPO_COUNT" -gt 0 ]; then

@@ -126,9 +126,11 @@ def create_test_data(db: Session):
                     }
                 ]
                 
+                # Generate timestamp once per scan to avoid duplicates
+                scan_timestamp = int(datetime.now(timezone.utc).timestamp())
                 for j in range(num_findings):
                     template = findings_templates[j % len(findings_templates)]
-                    hypothesis_id = f"hyp_{scan.execution_id}_{j}_{int(datetime.now(timezone.utc).timestamp())}"
+                    hypothesis_id = f"hyp_{scan.execution_id}_{j}_{scan_timestamp}"
                     hypothesis = Hypothesis(
                         hypothesis_id=hypothesis_id,
                         project_id=project.id,

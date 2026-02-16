@@ -57,6 +57,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from commands.project import ProjectManager
 from database.models import (
@@ -3937,6 +3938,17 @@ async def root():
             "start_audit": "POST /audits/start",
             "audit_status": "GET /audits/{session_id}/status",
             "github_webhook": "POST /webhooks/github",
+            "user_profile": "GET /users/me",
+            "organization": "GET /organizations/{id}",
+            "organization_members": "GET /organizations/{id}/members",
+            "subscription": "GET /subscriptions/current",
+            "usage": "GET /usage/current-month",
+            "repositories": "GET /repositories",
+            "trigger_scan": "POST /repositories/{id}/scan",
+            "repository_scans": "GET /repositories/{id}/scans",
+            "all_findings": "GET /findings",
+            "findings_stats": "GET /findings/stats",
+            "surface_scans": "GET /surface/scans",
         },
     }
 
@@ -4373,6 +4385,591 @@ async def update_finding_status_by_hyp_id(
         "confidence": finding.confidence,
         "updated_at": finding.updated_at.isoformat(),
     }
+
+
+# ============================================================================
+# Dashboard API Endpoints - Users, Organizations, Repositories, Findings
+# ============================================================================
+
+# -------------------- Response Models --------------------
+
+class UserProfileResponse(BaseModel):
+    """Response model for user profile."""
+    id: int
+    name: str
+    email: Optional[str]
+    org_id: int
+    org_name: str
+    org_type: str  # "User" or "Organization"
+    role: str = "member"  # For future role-based access control
+    
+    class Config:
+        from_attributes = True
+
+
+class OrganizationResponse(BaseModel):
+    """Response model for organization details."""
+    id: int
+    name: str
+    github_account_login: Optional[str]
+    github_account_type: Optional[str]
+    status: str
+    contact_email: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+
+class OrganizationMemberResponse(BaseModel):
+    """Response model for organization member."""
+    id: int
+    name: str
+    email: Optional[str]
+    role: str = "member"
+    
+    class Config:
+        from_attributes = True
+
+
+class SubscriptionResponse(BaseModel):
+    """Response model for subscription details."""
+    tenant_id: int
+    org_name: str
+    plan: str = "free"  # free, pro, enterprise
+    status: str  # active, pending, suspended
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+
+class UsageStatsResponse(BaseModel):
+    """Response model for usage statistics."""
+    tenant_id: int
+    period: str  # e.g., "2024-02"
+    scans_count: int
+    findings_count: int
+    total_cost_usd: float
+    token_usage: Dict[str, Any]
+    
+    class Config:
+        from_attributes = True
+
+
+class RepositoryResponse(BaseModel):
+    """Response model for repository details."""
+    id: int
+    name: str
+    git_url: Optional[str]
+    github_repo_id: Optional[int]
+    description: Optional[str]
+    status: str
+    last_scan_at: Optional[datetime] = None
+    scans_count: int = 0
+    findings_count: int = 0
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+
+
+class RepositoryListResponse(BaseModel):
+    """Response model for paginated repository list."""
+    repositories: List[RepositoryResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+class ScanHistoryItem(BaseModel):
+    """Response model for scan history item."""
+    execution_id: str
+    status: str
+    risk_score: Optional[int]
+    risk_level: Optional[str]
+    findings_count: int
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    
+    class Config:
+        from_attributes = True
+
+
+class ScanHistoryResponse(BaseModel):
+    """Response model for scan history."""
+    repository_id: int
+    scans: List[ScanHistoryItem]
+    total: int
+    page: int
+    page_size: int
+
+
+class FindingStatsResponse(BaseModel):
+    """Response model for finding statistics."""
+    total: int
+    by_severity: Dict[str, int]  # critical, high, medium, low
+    by_status: Dict[str, int]  # proposed, investigating, confirmed, rejected, resolved
+    by_repository: Dict[str, int]  # repo_name -> count
+
+
+class FindingListResponse(BaseModel):
+    """Response model for paginated findings list."""
+    findings: List[FindingResponse]
+    total: int
+    page: int
+    page_size: int
+
+
+# -------------------- Endpoints --------------------
+
+@app.get("/users/me", response_model=UserProfileResponse)
+async def get_current_user(
+    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get current user profile.
+    
+    Returns user information including organization details.
+    In the current architecture, tenant_id represents the user/org context from GitHub App installation.
+    """
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="User/Organization not found")
+    
+    return UserProfileResponse(
+        id=tenant.id,
+        name=tenant.github_account_login or tenant.name,
+        email=tenant.contact_email,
+        org_id=tenant.id,
+        org_name=tenant.name,
+        org_type=tenant.github_account_type or "User",
+        role="admin",  # In current model, installation owner is admin
+    )
+
+
+@app.get("/organizations/{org_id}", response_model=OrganizationResponse)
+async def get_organization(org_id: int, db: Session = Depends(get_db)):
+    """
+    Get organization details by ID.
+    
+    Returns organization metadata including GitHub account information.
+    """
+    org = db.query(Tenant).filter(Tenant.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    
+    return OrganizationResponse(
+        id=org.id,
+        name=org.name,
+        github_account_login=org.github_account_login,
+        github_account_type=org.github_account_type,
+        status=org.status,
+        contact_email=org.contact_email,
+        created_at=org.created_at,
+        updated_at=org.updated_at,
+    )
+
+
+@app.get("/organizations/{org_id}/members", response_model=List[OrganizationMemberResponse])
+async def list_organization_members(org_id: int, db: Session = Depends(get_db)):
+    """
+    List members of an organization.
+    
+    Note: In the current GitHub App installation model, we don't track individual members.
+    This returns the organization itself as a single member. Future enhancement could
+    integrate with GitHub API to fetch actual org members.
+    """
+    org = db.query(Tenant).filter(Tenant.id == org_id).first()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    
+    # Return org owner as single member (current architecture limitation)
+    return [
+        OrganizationMemberResponse(
+            id=org.id,
+            name=org.github_account_login or org.name,
+            email=org.contact_email,
+            role="owner",
+        )
+    ]
+
+
+@app.get("/subscriptions/current", response_model=SubscriptionResponse)
+async def get_current_subscription(
+    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get current subscription for user/organization.
+    
+    Returns subscription plan and status. Currently returns basic info;
+    can be enhanced with actual billing integration.
+    """
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    
+    # Map tenant status to subscription status
+    subscription_status = "active" if tenant.status == "active" else "pending"
+    plan = "free"  # Default plan; can be enhanced with actual subscription data
+    
+    return SubscriptionResponse(
+        tenant_id=tenant.id,
+        org_name=tenant.name,
+        plan=plan,
+        status=subscription_status,
+        created_at=tenant.created_at,
+    )
+
+
+@app.get("/usage/current-month", response_model=UsageStatsResponse)
+async def get_current_month_usage(
+    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get usage and billing statistics for current billing period.
+    
+    Returns scan counts, finding counts, and token usage costs for the current month.
+    """
+    from database.models import TokenUsageLog
+    from sqlalchemy import func
+    
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    
+    # Get current month start
+    now = datetime.now(timezone.utc)
+    month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    
+    # Count scans for this tenant in current month
+    scans_count = db.query(func.count(ScanExecution.id)).filter(
+        ScanExecution.tenant_id == tenant_id,
+        ScanExecution.created_at >= month_start
+    ).scalar() or 0
+    
+    # Count findings (hypotheses from projects belonging to tenant)
+    findings_count = db.query(func.count(Hypothesis.id)).join(
+        Project, Hypothesis.project_id == Project.id
+    ).filter(
+        Project.tenant_id == tenant_id,
+        Hypothesis.created_at >= month_start
+    ).scalar() or 0
+    
+    # Get token usage and cost
+    token_stats = db.query(
+        func.sum(TokenUsageLog.input_tokens).label('input_tokens'),
+        func.sum(TokenUsageLog.output_tokens).label('output_tokens'),
+        func.sum(TokenUsageLog.cost_usd).label('total_cost')
+    ).filter(
+        TokenUsageLog.tenant_id == tenant_id,
+        TokenUsageLog.timestamp >= month_start
+    ).first()
+    
+    input_tokens = int(token_stats.input_tokens or 0)
+    output_tokens = int(token_stats.output_tokens or 0)
+    total_cost = float(token_stats.total_cost or 0.0)
+    
+    return UsageStatsResponse(
+        tenant_id=tenant_id,
+        period=now.strftime("%Y-%m"),
+        scans_count=scans_count,
+        findings_count=findings_count,
+        total_cost_usd=total_cost,
+        token_usage={
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+    )
+
+
+@app.get("/repositories", response_model=RepositoryListResponse)
+async def list_repositories(
+    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    search: Optional[str] = Query(None, description="Search repository name"),
+    db: Session = Depends(get_db)
+):
+    """
+    List all connected GitHub repositories for tenant/user.
+    
+    Returns paginated list of repositories (projects) with scan statistics.
+    """
+    query = db.query(Project).filter(Project.tenant_id == tenant_id)
+    
+    # Apply search filter
+    if search:
+        query = query.filter(Project.name.ilike(f"%{search}%"))
+    
+    # Get total count
+    total = query.count()
+    
+    # Apply pagination
+    offset = (page - 1) * page_size
+    projects = query.order_by(Project.created_at.desc()).offset(offset).limit(page_size).all()
+    
+    # Build response with statistics
+    repositories = []
+    for project in projects:
+        # Get last scan time from scan_executions
+        last_scan = db.query(ScanExecution).filter(
+            ScanExecution.project_id == project.id
+        ).order_by(ScanExecution.created_at.desc()).first()
+        
+        last_scan_at = last_scan.created_at if last_scan else None
+        
+        # Count scans and findings
+        scans_count = db.query(func.count(ScanExecution.id)).filter(
+            ScanExecution.project_id == project.id
+        ).scalar() or 0
+        
+        findings_count = db.query(func.count(Hypothesis.id)).filter(
+            Hypothesis.project_id == project.id
+        ).scalar() or 0
+        
+        repositories.append(RepositoryResponse(
+            id=project.id,
+            name=project.name,
+            git_url=project.git_url,
+            github_repo_id=project.github_repo_id,
+            description=project.description,
+            status=project.status,
+            last_scan_at=last_scan_at,
+            scans_count=scans_count,
+            findings_count=findings_count,
+            created_at=project.created_at,
+        ))
+    
+    return RepositoryListResponse(
+        repositories=repositories,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.post("/repositories/{repository_id}/scan")
+async def trigger_repository_scan(
+    repository_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    Trigger a new scan for a repository.
+    
+    Creates a surface scan execution for the specified repository.
+    Returns the execution ID for tracking.
+    """
+    # Verify repository exists
+    project = db.query(Project).filter(Project.id == repository_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    
+    # Generate scan execution ID
+    execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
+    
+    # Create scan execution
+    scan = ScanExecution(
+        execution_id=execution_id,
+        project_id=project.id,
+        tenant_id=project.tenant_id,
+        repo_name=project.name,
+        repo_url=project.git_url,
+        status="pending",
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(scan)
+    db.commit()
+    db.refresh(scan)
+    
+    # TODO: Integrate with actual scan execution (Celery task or similar)
+    # For now, just create the record
+    
+    return {
+        "execution_id": execution_id,
+        "repository_id": repository_id,
+        "status": "pending",
+        "message": "Scan queued successfully",
+    }
+
+
+@app.get("/repositories/{repository_id}/scans", response_model=ScanHistoryResponse)
+async def list_repository_scans(
+    repository_id: int,
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    db: Session = Depends(get_db)
+):
+    """
+    List scan history for a repository.
+    
+    Returns paginated list of all scan executions for the specified repository.
+    """
+    # Verify repository exists
+    project = db.query(Project).filter(Project.id == repository_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    
+    # Query scans for this repository
+    query = db.query(ScanExecution).filter(ScanExecution.project_id == repository_id)
+    
+    # Get total count
+    total = query.count()
+    
+    # Apply pagination
+    offset = (page - 1) * page_size
+    scans = query.order_by(ScanExecution.created_at.desc()).offset(offset).limit(page_size).all()
+    
+    # Build response
+    scan_items = []
+    for scan in scans:
+        findings_count = len(scan.findings) if scan.findings else 0
+        scan_items.append(ScanHistoryItem(
+            execution_id=scan.execution_id,
+            status=scan.status,
+            risk_score=scan.risk_score,
+            risk_level=scan.risk_level,
+            findings_count=findings_count,
+            started_at=scan.started_at,
+            completed_at=scan.completed_at,
+        ))
+    
+    return ScanHistoryResponse(
+        repository_id=repository_id,
+        scans=scan_items,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/findings", response_model=FindingListResponse)
+async def list_all_findings(
+    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    severity: Optional[str] = Query(None, description="Filter by severity (critical, high, medium, low)"),
+    status: Optional[str] = Query(None, description="Filter by status"),
+    repository_id: Optional[int] = Query(None, description="Filter by repository ID"),
+    db: Session = Depends(get_db)
+):
+    """
+    List all findings (hypotheses) for organization/user.
+    
+    Supports filtering by severity, status, and repository.
+    Returns paginated list with full finding details.
+    """
+    # Build query - join with projects to filter by tenant
+    query = db.query(Hypothesis).join(
+        Project, Hypothesis.project_id == Project.id
+    ).filter(Project.tenant_id == tenant_id)
+    
+    # Apply filters
+    if severity:
+        query = query.filter(Hypothesis.severity == severity)
+    if status:
+        query = query.filter(Hypothesis.status == status)
+    if repository_id:
+        query = query.filter(Hypothesis.project_id == repository_id)
+    
+    # Get total count
+    total = query.count()
+    
+    # Apply pagination
+    offset = (page - 1) * page_size
+    findings = query.order_by(Hypothesis.created_at.desc()).offset(offset).limit(page_size).all()
+    
+    # Build response
+    findings_list = []
+    for finding in findings:
+        findings_list.append(FindingResponse(
+            id=finding.id,
+            hypothesis_id=finding.hypothesis_id,
+            title=finding.title,
+            description=finding.description,
+            vulnerability_type=finding.vulnerability_type,
+            status=finding.status,
+            confidence=finding.confidence,
+            severity=finding.severity,
+            node_refs=finding.node_refs,
+            evidence=finding.evidence,
+            reported_by_model=finding.reported_by_model,
+            junior_model=finding.junior_model,
+            senior_model=finding.senior_model,
+            created_at=finding.created_at,
+            updated_at=finding.updated_at,
+        ))
+    
+    return FindingListResponse(
+        findings=findings_list,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@app.get("/findings/stats", response_model=FindingStatsResponse)
+async def get_findings_statistics(
+    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get summary statistics for findings.
+    
+    Returns aggregate counts by severity, status, and repository.
+    """
+    # Get all findings for tenant
+    findings = db.query(Hypothesis).join(
+        Project, Hypothesis.project_id == Project.id
+    ).filter(Project.tenant_id == tenant_id).all()
+    
+    # Calculate statistics
+    total = len(findings)
+    
+    by_severity = {
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+    }
+    
+    by_status = {
+        "proposed": 0,
+        "investigating": 0,
+        "confirmed": 0,
+        "rejected": 0,
+        "resolved": 0,
+    }
+    
+    by_repository = {}
+    
+    for finding in findings:
+        # Count by severity
+        if finding.severity in by_severity:
+            by_severity[finding.severity] += 1
+        
+        # Count by status
+        if finding.status in by_status:
+            by_status[finding.status] += 1
+        
+        # Count by repository
+        if finding.project_id:
+            project = db.query(Project).filter(Project.id == finding.project_id).first()
+            if project:
+                repo_name = project.name
+                by_repository[repo_name] = by_repository.get(repo_name, 0) + 1
+    
+    return FindingStatsResponse(
+        total=total,
+        by_severity=by_severity,
+        by_status=by_status,
+        by_repository=by_repository,
+    )
 
 
 # ============================================================================
@@ -5480,16 +6077,20 @@ async def list_surface_scans(
     risk_level: Optional[str] = Query(None, description="Filter by risk level"),
     status: Optional[str] = Query(None, description="Filter by status"),
     search: Optional[str] = Query(None, description="Search repo name"),
+    tenant_id: Optional[int] = Query(None, description="Filter by tenant ID"),
     db: Session = Depends(get_db)
 ):
     """
-    List all surface scans for the admin panel.
+    List all surface scans for the admin panel or user dashboard.
     
-    Supports pagination and filtering by risk level, status, and repo name.
+    Supports pagination and filtering by risk level, status, repo name, and tenant.
+    When tenant_id is provided, only scans for that tenant are returned.
     """
     query = db.query(ScanExecution)
     
     # Apply filters
+    if tenant_id:
+        query = query.filter(ScanExecution.tenant_id == tenant_id)
     if risk_level:
         query = query.filter(ScanExecution.risk_level == risk_level)
     if status:

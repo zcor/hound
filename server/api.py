@@ -163,13 +163,15 @@ app = FastAPI(
 
 # Configure CORS
 # In production, configure with specific allowed origins via environment variable
-allowed_origins = os.environ.get("HOUND_ALLOWED_ORIGINS", "*").split(",")
+# Default to localhost:3000 for development (never use "*" in production)
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Session middleware for flash messages in admin panel

@@ -4636,7 +4636,6 @@ async def get_current_month_usage(
     Returns scan counts, finding counts, and token usage costs for the current month.
     """
     from database.models import TokenUsageLog
-    from sqlalchemy import func
     
     tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
     if not tenant:
@@ -4923,10 +4922,14 @@ async def get_findings_statistics(
     
     Returns aggregate counts by severity, status, and repository.
     """
-    # Get all findings for tenant
+    from sqlalchemy.orm import joinedload
+    
+    # Get all findings for tenant with project data eagerly loaded
     findings = db.query(Hypothesis).join(
         Project, Hypothesis.project_id == Project.id
-    ).filter(Project.tenant_id == tenant_id).all()
+    ).options(joinedload(Hypothesis.project)).filter(
+        Project.tenant_id == tenant_id
+    ).all()
     
     # Calculate statistics
     total = len(findings)
@@ -4957,12 +4960,10 @@ async def get_findings_statistics(
         if finding.status in by_status:
             by_status[finding.status] += 1
         
-        # Count by repository
-        if finding.project_id:
-            project = db.query(Project).filter(Project.id == finding.project_id).first()
-            if project:
-                repo_name = project.name
-                by_repository[repo_name] = by_repository.get(repo_name, 0) + 1
+        # Count by repository (project is now eagerly loaded)
+        if finding.project:
+            repo_name = finding.project.name
+            by_repository[repo_name] = by_repository.get(repo_name, 0) + 1
     
     return FindingStatsResponse(
         total=total,

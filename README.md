@@ -84,6 +84,52 @@ curl http://localhost:8000/health
 
 See [docs/architecture/saas_architecture.md](docs/architecture/saas_architecture.md) for detailed architecture documentation.
 
+## Quick Start (Development)
+
+For local development and testing with pre-seeded data:
+
+### 1. Setup Database and Test Data
+
+```bash
+# Create database and seed test data
+python scripts/seed_test_data.py
+```
+
+### 2. Start Development Server
+
+```bash
+# Start Hound API
+bash scripts/start-dev.sh
+
+# In another terminal, start frontend (if available)
+cd frontend
+npm install
+npm run dev
+```
+
+### 3. Run Integration Tests
+
+```bash
+# Verify everything works
+bash scripts/test_integration.sh
+```
+
+### 4. Access the Dashboard
+
+- Frontend: http://localhost:3000 (if running)
+- API Docs: http://localhost:8000/docs
+- Health Check: http://localhost:8000/health
+
+### Test Data
+
+The seed script creates:
+- 1 test organization (tenant_id=1)
+- 3 projects (DeFi Protocol, NFT Marketplace, Token Bridge)
+- 9 scans across all projects (various statuses: completed, running, failed, queued)
+- Multiple findings for completed scans
+
+Use `tenant_id=1` for testing API endpoints.
+
 ## Configuration
 
 Set up your API keys for the LLM provider you want to use:

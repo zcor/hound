@@ -45,6 +45,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import httpx  # noqa: E402
 import redis.asyncio as aioredis  # noqa: E402
 from fastapi import (  # noqa: E402
     BackgroundTasks,
@@ -58,7 +59,7 @@ from fastapi import (  # noqa: E402
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import HTMLResponse, RedirectResponse  # noqa: E402
+from fastapi.responses import HTMLResponse, RedirectResponse, Response  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel, ConfigDict, Field, model_validator  # noqa: E402
 from slowapi import Limiter  # noqa: E402
@@ -77,10 +78,12 @@ from database.models import (  # noqa: E402
     Project,
     ScanExecution,
     Tenant,
+    User,
     create_db_engine,
     create_db_session,
 )
 from integrations.telegram import notify_new_repo_synced  # noqa: E402
+from server.token_crypto import decrypt_token  # noqa: E402
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -4529,14 +4532,19 @@ class RepositoryResponse(BaseModel):
     """Response model for repository details."""
     id: int
     name: str
-    git_url: str | None
-    github_repo_id: int | None
-    description: str | None
-    status: str
+    full_name: str | None = None
+    git_url: str | None = None
+    github_repo_id: int | None = None
+    description: str | None = None
+    is_private: bool = False
+    default_branch: str | None = None
+    status: str = "active"
     last_scan_at: datetime | None = None
     scans_count: int = 0
     findings_count: int = 0
+    tenant_id: int | None = None
     created_at: datetime
+    updated_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -4547,6 +4555,49 @@ class RepositoryListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class RepositoryCreateRequest(BaseModel):
+    """Request model for adding a new repository."""
+    tenant_id: int
+    github_repo_id: int | None = None
+    name: str
+    full_name: str
+    git_url: str
+    default_branch: str = "main"
+    description: str | None = None
+    is_private: bool = False
+
+
+class GitHubRepoItem(BaseModel):
+    """A single GitHub repository from the user's account."""
+    id: int
+    name: str
+    full_name: str
+    description: str | None = None
+    private: bool = False
+    default_branch: str | None = "main"
+    html_url: str
+    language: str | None = None
+    updated_at: str | None = None
+    already_added: bool = False
+
+
+class GitHubRepoListResponse(BaseModel):
+    """Paginated list of GitHub repositories."""
+    repos: list[GitHubRepoItem]
+    total_count: int
+    page: int
+    per_page: int
+
+
+class GitHubStatusResponse(BaseModel):
+    """GitHub connection status."""
+    connected: bool
+    username: str | None = None
+    avatar_url: str | None = None
+    scopes: list[str] = []
+    connected_at: str | None = None
 
 
 class ScanHistoryItem(BaseModel):
@@ -4765,7 +4816,10 @@ async def list_repositories(
     
     Returns paginated list of repositories (projects) with scan statistics.
     """
-    query = db.query(Project).filter(Project.tenant_id == tenant_id)
+    query = db.query(Project).filter(
+        Project.tenant_id == tenant_id,
+        Project.status != "removed",
+    )
     
     # Apply search filter
     if search:
@@ -4800,14 +4854,19 @@ async def list_repositories(
         repositories.append(RepositoryResponse(
             id=project.id,
             name=project.name,
+            full_name=project.full_name,
             git_url=project.git_url,
             github_repo_id=project.github_repo_id,
             description=project.description,
+            is_private=project.is_private,
+            default_branch=project.default_branch,
             status=project.status,
             last_scan_at=last_scan_at,
             scans_count=scans_count,
             findings_count=findings_count,
+            tenant_id=project.tenant_id,
             created_at=project.created_at,
+            updated_at=project.last_accessed,
         ))
     
     return RepositoryListResponse(
@@ -4815,6 +4874,367 @@ async def list_repositories(
         total=total,
         page=page,
         page_size=page_size,
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# GitHub Integration & Repository Management endpoints
+# ---------------------------------------------------------------------------
+
+
+async def _get_current_user_with_token(
+    request: Request, db: Session
+) -> User:
+    """
+    Resolve the current user from the JWT and ensure a GitHub token exists.
+
+    Returns the SQLAlchemy User object.
+    Raises HTTPException 401 if no valid token is available.
+    """
+    from server.auth_routes import get_token_from_header
+    from server.auth_utils import get_current_user_from_token
+
+    token = get_token_from_header(request)
+    payload = get_current_user_from_token(token)
+    user = db.query(User).filter(User.id == payload["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    if not user.github_token_encrypted:
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub token expired. Please reconnect your GitHub account.",
+        )
+    return user
+
+
+@app.get("/github/repos", response_model=GitHubRepoListResponse, tags=["github"])
+async def list_github_repos(
+    request: Request,
+    tenant_id: int = Query(..., description="Tenant ID"),
+    page: int = Query(1, ge=1, description="Page number"),
+    per_page: int = Query(30, ge=1, le=100, description="Results per page"),
+    search: str | None = Query(None, description="Filter repos by name"),
+    sort: str = Query("updated", description="Sort field: updated, name, created"),
+    db: Session = Depends(get_db),
+):
+    """
+    List the authenticated user's GitHub repositories.
+
+    Uses the stored GitHub OAuth token to call the GitHub API.
+    Powers the repo-picker UI where users select repos to monitor.
+    """
+    user = await _get_current_user_with_token(request, db)
+
+    try:
+        github_token = decrypt_token(user.github_token_encrypted)
+    except ValueError:
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub token expired. Please reconnect your GitHub account.",
+        )
+
+    # Map sort parameter to GitHub API values
+    gh_sort_map = {"updated": "updated", "name": "full_name", "created": "created"}
+    gh_sort = gh_sort_map.get(sort, "updated")
+    gh_direction = "desc" if gh_sort != "full_name" else "asc"
+
+    # When searching, we need to fetch more repos and filter server-side
+    # because GitHub /user/repos doesn't support name substring search.
+    if search:
+        fetch_per_page = 100
+        fetch_page = 1
+        all_repos: list[dict] = []
+        headers = {
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Fetch pages until we have enough filtered results or exhaust repos
+            while True:
+                resp = await client.get(
+                    "https://api.github.com/user/repos",
+                    params={
+                        "sort": gh_sort,
+                        "direction": gh_direction,
+                        "per_page": fetch_per_page,
+                        "page": fetch_page,
+                        "type": "all",
+                    },
+                    headers=headers,
+                )
+                if resp.status_code == 401:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="GitHub token expired. Please reconnect your GitHub account.",
+                    )
+                resp.raise_for_status()
+                batch = resp.json()
+                if not batch:
+                    break
+                # Filter by search term (case-insensitive contains)
+                search_lower = search.lower()
+                for repo in batch:
+                    if search_lower in repo.get("name", "").lower():
+                        all_repos.append(repo)
+                # If GitHub returned less than a full page, no more pages
+                if len(batch) < fetch_per_page:
+                    break
+                fetch_page += 1
+                # Safety: don't fetch more than 10 pages when searching
+                if fetch_page > 10:
+                    break
+
+        total_count = len(all_repos)
+        start = (page - 1) * per_page
+        repos_page = all_repos[start : start + per_page]
+    else:
+        # Direct passthrough to GitHub API with pagination
+        headers = {
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                "https://api.github.com/user/repos",
+                params={
+                    "sort": gh_sort,
+                    "direction": gh_direction,
+                    "per_page": per_page,
+                    "page": page,
+                    "type": "all",
+                },
+                headers=headers,
+            )
+            if resp.status_code == 401:
+                raise HTTPException(
+                    status_code=401,
+                    detail="GitHub token expired. Please reconnect your GitHub account.",
+                )
+            resp.raise_for_status()
+            repos_page = resp.json()
+
+        # GitHub doesn't return total_count for /user/repos; approximate from
+        # the number of results on this page.
+        total_count = len(repos_page) + (page - 1) * per_page
+        if len(repos_page) == per_page:
+            # There are likely more pages
+            total_count += 1  # signals "at least one more page"
+
+    # Build set of already-added github_repo_ids for this tenant
+    added_ids: set[int] = set()
+    existing = (
+        db.query(Project.github_repo_id)
+        .filter(
+            Project.tenant_id == tenant_id,
+            Project.github_repo_id.isnot(None),
+            Project.status != "removed",
+        )
+        .all()
+    )
+    for (repo_id,) in existing:
+        added_ids.add(repo_id)
+
+    items = []
+    for repo in repos_page:
+        items.append(
+            GitHubRepoItem(
+                id=repo["id"],
+                name=repo.get("name", ""),
+                full_name=repo.get("full_name", ""),
+                description=repo.get("description"),
+                private=repo.get("private", False),
+                default_branch=repo.get("default_branch", "main"),
+                html_url=repo.get("html_url", ""),
+                language=repo.get("language"),
+                updated_at=repo.get("updated_at"),
+                already_added=repo["id"] in added_ids,
+            )
+        )
+
+    return GitHubRepoListResponse(
+        repos=items,
+        total_count=total_count,
+        page=page,
+        per_page=per_page,
+    )
+
+
+@app.post("/repositories", status_code=201, response_model=RepositoryResponse, tags=["repositories"])
+async def create_repository(
+    body: RepositoryCreateRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Add a GitHub repository to the tenant's monitored repositories.
+
+    Can be called from the repo picker (with github_repo_id) or from
+    manual URL input (with git_url).
+    """
+    import re
+
+    # Validate git_url format
+    git_url_pattern = re.compile(
+        r"^https?://[a-zA-Z0-9._-]+(:[0-9]+)?/[a-zA-Z0-9._/-]+(\.git)?/?$"
+    )
+    if not git_url_pattern.match(body.git_url):
+        raise HTTPException(status_code=400, detail="Invalid repository URL")
+
+    # Check for duplicates (github_repo_id OR git_url within tenant, excluding removed)
+    dup_query = db.query(Project).filter(
+        Project.tenant_id == body.tenant_id,
+        Project.status != "removed",
+    )
+    if body.github_repo_id:
+        existing = dup_query.filter(
+            Project.github_repo_id == body.github_repo_id
+        ).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Repository already added")
+
+    existing_url = dup_query.filter(Project.git_url == body.git_url).first()
+    if existing_url:
+        raise HTTPException(status_code=409, detail="Repository already added")
+
+    now = datetime.now(timezone.utc)
+    project = Project(
+        tenant_id=body.tenant_id,
+        name=body.name,
+        full_name=body.full_name,
+        git_url=body.git_url,
+        github_repo_id=body.github_repo_id,
+        default_branch=body.default_branch,
+        description=body.description,
+        is_private=body.is_private,
+        status="active",
+        created_at=now,
+        last_accessed=now,
+    )
+    db.add(project)
+    db.commit()
+    db.refresh(project)
+
+    # Send Telegram notification for new repo (fire-and-forget)
+    try:
+        await notify_new_repo_synced(project.name, project.git_url or "")
+    except Exception:
+        pass  # non-critical
+
+    return RepositoryResponse(
+        id=project.id,
+        name=project.name,
+        full_name=project.full_name,
+        git_url=project.git_url,
+        github_repo_id=project.github_repo_id,
+        description=project.description,
+        is_private=project.is_private,
+        default_branch=project.default_branch,
+        status=project.status,
+        last_scan_at=None,
+        scans_count=0,
+        findings_count=0,
+        tenant_id=project.tenant_id,
+        created_at=project.created_at,
+        updated_at=project.last_accessed,
+    )
+
+
+@app.delete("/repositories/{repository_id}", status_code=204, tags=["repositories"])
+async def delete_repository(
+    repository_id: int,
+    tenant_id: int = Query(..., description="Tenant ID"),
+    db: Session = Depends(get_db),
+):
+    """
+    Remove a repository from monitoring (soft delete).
+
+    Sets the repository status to 'removed'. Scan history and findings
+    are preserved for the audit trail.
+    """
+    project = (
+        db.query(Project)
+        .filter(
+            Project.id == repository_id,
+            Project.tenant_id == tenant_id,
+            Project.status != "removed",
+        )
+        .first()
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    project.status = "removed"
+    project.last_accessed = datetime.now(timezone.utc)
+    db.commit()
+
+    return Response(status_code=204)
+
+
+@app.get("/github/status", response_model=GitHubStatusResponse, tags=["github"])
+async def github_status(
+    request: Request,
+    tenant_id: int = Query(..., description="Tenant ID"),
+    db: Session = Depends(get_db),
+):
+    """
+    Check if the user's GitHub connection is still valid.
+
+    Makes a test call to the GitHub API to verify the stored token.
+    Used on the profile/settings page.
+    """
+    from server.auth_routes import get_token_from_header
+    from server.auth_utils import get_current_user_from_token
+
+    try:
+        token = get_token_from_header(request)
+        payload = get_current_user_from_token(token)
+    except (HTTPException, ValueError):
+        return GitHubStatusResponse(connected=False)
+
+    user = db.query(User).filter(User.id == payload.get("user_id")).first()
+    if not user or not user.github_token_encrypted:
+        return GitHubStatusResponse(connected=False)
+
+    try:
+        github_token = decrypt_token(user.github_token_encrypted)
+    except ValueError:
+        return GitHubStatusResponse(connected=False)
+
+    # Validate token against GitHub API
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            "https://api.github.com/user",
+            headers={
+                "Authorization": f"Bearer {github_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+
+    if resp.status_code != 200:
+        # Token is revoked or invalid — clear it from the database
+        user.github_token_encrypted = None
+        user.github_connected_at = None
+        db.commit()
+        return GitHubStatusResponse(connected=False)
+
+    github_user = resp.json()
+    scopes = [s.strip() for s in resp.headers.get("X-OAuth-Scopes", "").split(",") if s.strip()]
+    connected_at = (
+        user.github_connected_at.isoformat() + "Z"
+        if user.github_connected_at
+        else None
+    )
+
+    return GitHubStatusResponse(
+        connected=True,
+        username=github_user.get("login"),
+        avatar_url=github_user.get("avatar_url"),
+        scopes=scopes,
+        connected_at=connected_at,
     )
 
 

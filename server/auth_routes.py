@@ -7,6 +7,7 @@ and JWT token management.
 
 import os
 from collections.abc import Generator
+from datetime import datetime, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -15,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from database.models import Tenant, User
 from server.auth_utils import create_access_token, get_current_user_from_token
+from server.token_crypto import encrypt_token
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
@@ -84,7 +86,7 @@ async def github_login():
         f"https://github.com/login/oauth/authorize"
         f"?client_id={config['client_id']}"
         f"&redirect_uri={config['frontend_url']}/auth/callback"
-        f"&scope=read:user user:email"
+        f"&scope=repo read:user user:email"
     )
     return {"url": github_auth_url}
 
@@ -156,16 +158,20 @@ async def github_callback(request: GitHubCallbackRequest, db: Session = Depends(
             email=github_user.get("email"),
             name=github_user.get("name"),
             avatar_url=github_user.get("avatar_url"),
-            tenant_id=tenant.id
+            tenant_id=tenant.id,
+            github_token_encrypted=encrypt_token(github_token),
+            github_connected_at=datetime.now(timezone.utc),
         )
         db.add(user)
         db.commit()
         db.refresh(user)
     else:
-        # Existing user - update info
+        # Existing user - update info and refresh token
         user.name = github_user.get("name")
         user.email = github_user.get("email")
         user.avatar_url = github_user.get("avatar_url")
+        user.github_token_encrypted = encrypt_token(github_token)
+        user.github_connected_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(user)
     

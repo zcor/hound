@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     Column,
     DateTime,
     Float,
@@ -106,6 +107,8 @@ class User(Base):
     email = Column(String(255), index=True)  # Not unique - users can have null/private emails
     name = Column(String(255))
     avatar_url = Column(String(500))
+    github_token_encrypted = Column(Text, nullable=True)  # Fernet-encrypted GitHub OAuth token
+    github_connected_at = Column(DateTime, nullable=True)  # When the GitHub token was stored
     
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
     tenant = relationship("Tenant", back_populates="users")
@@ -141,6 +144,9 @@ class Project(Base):
     git_url = Column(String(1024), nullable=True)  # Git repository URL
     github_repo_id = Column(BigInteger, nullable=True, index=True)  # GitHub repository ID
     installation_id = Column(BigInteger, nullable=True, index=True)  # GitHub App installation ID
+    full_name = Column(String(512), nullable=True)  # owner/repo format
+    default_branch = Column(String(255), nullable=True, default="main")
+    is_private = Column(Boolean, nullable=False, default=False)
     description = Column(Text, nullable=True)
     status = Column(String(50), nullable=False, default="active")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

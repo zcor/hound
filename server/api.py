@@ -174,10 +174,16 @@ app = FastAPI(
     root_path=os.environ.get("ROOT_PATH", ""),  # For reverse proxy / port forwarding
 )
 
-# Configure CORS
-# In production, configure with specific allowed origins via environment variable
-# Default to localhost:3000 for development (never use "*" in production)
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+# Session middleware for flash messages in admin panel
+# NOTE: Added BEFORE CORS so CORS is outermost (Starlette middleware is LIFO)
+session_secret = os.environ.get("HOUND_SECRET_KEY", secrets.token_urlsafe(32))
+app.add_middleware(SessionMiddleware, secret_key=session_secret)
+
+# Configure CORS — must be added AFTER SessionMiddleware so it wraps it
+# (Starlette processes middleware in reverse addition order)
+# Checks both HOUND_ALLOWED_ORIGINS (production) and ALLOWED_ORIGINS (Assune's dev)
+ALLOWED_ORIGINS = os.environ.get("HOUND_ALLOWED_ORIGINS",
+    os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")).split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -186,11 +192,6 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["*"],
 )
-
-# Session middleware for flash messages in admin panel
-# Use HOUND_SECRET_KEY env var or generate a random one
-session_secret = os.environ.get("HOUND_SECRET_KEY", secrets.token_urlsafe(32))
-app.add_middleware(SessionMiddleware, secret_key=session_secret)
 
 # Add rate limiter state and exception handler
 app.state.limiter = limiter

@@ -202,8 +202,8 @@ class Project(Base):
     description = Column(Text, nullable=True)
     status = Column(String(50), nullable=False, default="active")
     team_id = Column(Integer, ForeignKey("teams.id"), nullable=True, index=True)  # Link to team for access control
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    last_accessed = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    last_accessed = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     
     # Relationships
     tenant = relationship("Tenant", back_populates="projects")

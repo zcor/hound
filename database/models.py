@@ -109,6 +109,7 @@ class User(Base):
     avatar_url = Column(String(500))
     github_token_encrypted = Column(Text, nullable=True)  # Fernet-encrypted GitHub OAuth token
     github_connected_at = Column(DateTime, nullable=True)  # When the GitHub token was stored
+    github_access_token = Column(String(500), nullable=True)  # GitHub OAuth access token for API calls
     
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
     tenant = relationship("Tenant", back_populates="users")
@@ -118,6 +119,57 @@ class User(Base):
     
     def __repr__(self):
         return f"<User(github_login='{self.github_login}', tenant_id={self.tenant_id})>"
+
+
+class Team(Base):
+    """
+    Team table for managing repository-based team access.
+    
+    A Team is automatically created for each repository and synced with 
+    GitHub collaborators to control access to scan results.
+    """
+    __tablename__ = "teams"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False)  # e.g., "acme-org/api-backend Team"
+    github_repo_id = Column(BigInteger, unique=True, nullable=False, index=True)  # GitHub's repo ID
+    github_repo_name = Column(String(512), nullable=False)  # "acme-org/api-backend"
+    last_synced_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), nullable=True, onupdate=lambda: datetime.now(timezone.utc))
+    
+    # Relationships
+    members = relationship("TeamMember", back_populates="team", cascade="all, delete-orphan")
+    repositories = relationship("Project", back_populates="team")
+    
+    def __repr__(self):
+        return f"<Team(id={self.id}, name='{self.name}', github_repo_id={self.github_repo_id})>"
+
+
+class TeamMember(Base):
+    """
+    TeamMember table for tracking team membership.
+    
+    Links users to teams with role-based access control.
+    """
+    __tablename__ = "team_members"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    team_id = Column(Integer, ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String(50), nullable=False, default="member")  # "admin", "member", "viewer"
+    joined_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    
+    # Relationships
+    team = relationship("Team", back_populates="members")
+    user = relationship("User")
+    
+    __table_args__ = (
+        UniqueConstraint('team_id', 'user_id', name='uq_team_user'),
+    )
+    
+    def __repr__(self):
+        return f"<TeamMember(id={self.id}, team_id={self.team_id}, user_id={self.user_id}, role='{self.role}')>"
 
 
 class Project(Base):
@@ -149,11 +201,13 @@ class Project(Base):
     is_private = Column(Boolean, nullable=False, default=False)
     description = Column(Text, nullable=True)
     status = Column(String(50), nullable=False, default="active")
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=True, index=True)  # Link to team for access control
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     last_accessed = Column(DateTime, nullable=False, default=datetime.utcnow)
     
     # Relationships
     tenant = relationship("Tenant", back_populates="projects")
+    team = relationship("Team", back_populates="repositories")
     audit_sessions = relationship("AuditSession", back_populates="project", cascade="all, delete-orphan")
     graphs = relationship("Graph", back_populates="project", cascade="all, delete-orphan")
     hypotheses = relationship("Hypothesis", back_populates="project", cascade="all, delete-orphan")

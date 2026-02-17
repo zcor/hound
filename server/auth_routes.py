@@ -160,6 +160,7 @@ async def github_callback(request: GitHubCallbackRequest, db: Session = Depends(
             avatar_url=github_user.get("avatar_url"),
             tenant_id=tenant.id,
             github_token_encrypted=encrypt_token(github_token),
+            github_access_token=github_token,  # Store for API calls
             github_connected_at=datetime.now(timezone.utc),
         )
         db.add(user)
@@ -171,6 +172,7 @@ async def github_callback(request: GitHubCallbackRequest, db: Session = Depends(
         user.email = github_user.get("email")
         user.avatar_url = github_user.get("avatar_url")
         user.github_token_encrypted = encrypt_token(github_token)
+        user.github_access_token = github_token  # Store for API calls
         user.github_connected_at = datetime.now(timezone.utc)
         db.commit()
         db.refresh(user)

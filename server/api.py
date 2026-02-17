@@ -77,6 +77,8 @@ from database.models import (  # noqa: E402
     Hypothesis,
     Project,
     ScanExecution,
+    Team,
+    TeamMember,
     Tenant,
     User,
     create_db_engine,
@@ -476,6 +478,47 @@ async def get_optional_tenant_id(request: Request) -> int | None:
         return await get_current_tenant_id(request)
     except HTTPException:
         return None
+
+
+# Get current user from JWT token
+async def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
+    """
+    Extract user from JWT token for authenticated requests.
+    
+    This dependency can be used to protect endpoints that require authentication
+    and need access to the full user object.
+    
+    Args:
+        request: FastAPI request object
+        db: Database session
+        
+    Returns:
+        User object from database
+        
+    Raises:
+        HTTPException: If token is missing, invalid, expired, or user not found
+    """
+    from server.auth_routes import get_token_from_header
+    from server.auth_utils import get_current_user_from_token
+    
+    try:
+        token = get_token_from_header(request)
+        payload = get_current_user_from_token(token)
+        user_id = payload.get("user_id")
+        
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token: missing user_id")
+        
+        user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        return user
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid or expired token: {str(e)}")
+
 
 
 # ============================================================================
@@ -5171,6 +5214,184 @@ async def delete_repository(
     db.commit()
 
     return Response(status_code=204)
+
+
+# ============================================================================
+# Team Endpoints - Team-based access control
+# ============================================================================
+
+@app.post("/repositories/{repo_id}/sync-team", tags=["teams"])
+async def sync_team_from_github(
+    repo_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Sync team members from GitHub repository collaborators.
+    
+    - Fetches all collaborators from GitHub API
+    - Creates or updates Team record
+    - Adds/updates TeamMember records for each collaborator
+    - Links repository to team
+    
+    Returns team info with member list.
+    """
+    from server.services.github_service import GitHubService, parse_github_url
+    
+    # Get repository
+    repo = db.query(Project).filter_by(id=repo_id).first()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    
+    # Verify user has access (must have GitHub token)
+    if not current_user.github_access_token:
+        raise HTTPException(
+            status_code=401, 
+            detail="GitHub access token not found. Please re-authenticate."
+        )
+    
+    # Parse owner/repo from URL
+    try:
+        owner, repo_name = parse_github_url(repo.git_url or "")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    # Fetch GitHub data
+    github = GitHubService(current_user.github_access_token)
+    
+    try:
+        # Verify user has access to repo
+        user_has_access = await github.check_user_access(owner, repo_name, current_user.github_login)
+        if not user_has_access:
+            raise HTTPException(
+                status_code=403,
+                detail="You don't have access to this repository"
+            )
+        
+        repo_data = await github.get_repo_details(owner, repo_name)
+        collaborators = await github.get_repo_collaborators(owner, repo_name)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GitHub API error: {str(e)}")
+    
+    # Create or update team
+    team = db.query(Team).filter_by(github_repo_id=repo_data["id"]).first()
+    
+    if not team:
+        team = Team(
+            name=f"{owner}/{repo_name} Team",
+            github_repo_id=repo_data["id"],
+            github_repo_name=f"{owner}/{repo_name}",
+            last_synced_at=datetime.now(timezone.utc)
+        )
+        db.add(team)
+        db.flush()
+    else:
+        # Update sync timestamp
+        team.last_synced_at = datetime.now(timezone.utc)
+    
+    # Link repo to team
+    if repo.team_id != team.id:
+        repo.team_id = team.id
+    
+    # Get existing members
+    existing_members = db.query(TeamMember).filter_by(team_id=team.id).all()
+    existing_user_ids = {m.user_id for m in existing_members}
+    
+    synced_members = []
+    
+    # Sync team members
+    for collab in collaborators:
+        github_login = collab["login"]
+        
+        # Find or create user
+        user = db.query(User).filter_by(github_login=github_login).first()
+        
+        if not user:
+            # Create stub user (they'll complete profile on first login)
+            user = User(
+                github_id=collab["id"],
+                github_login=github_login,
+                avatar_url=collab.get("avatar_url"),
+                tenant_id=current_user.tenant_id  # Share tenant with repo owner
+            )
+            db.add(user)
+            db.flush()
+        
+        # Add to team if not already a member
+        if user.id not in existing_user_ids:
+            role = "admin" if collab.get("permissions", {}).get("admin") else "member"
+            team_member = TeamMember(
+                team_id=team.id,
+                user_id=user.id,
+                role=role
+            )
+            db.add(team_member)
+        
+        synced_members.append({
+            "github_login": github_login,
+            "avatar_url": collab.get("avatar_url"),
+            "role": "admin" if collab.get("permissions", {}).get("admin") else "member"
+        })
+    
+    db.commit()
+    
+    return {
+        "team_id": team.id,
+        "team_name": team.name,
+        "github_repo_name": team.github_repo_name,
+        "members_count": len(synced_members),
+        "members": synced_members
+    }
+
+
+@app.get("/teams/{team_id}/members", tags=["teams"])
+async def get_team_members(
+    team_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get all members of a team.
+    
+    User must be a member of the team to view members.
+    """
+    team = db.query(Team).filter_by(id=team_id).first()
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+    
+    # Verify user is a member
+    is_member = db.query(TeamMember).filter_by(
+        team_id=team_id,
+        user_id=current_user.id
+    ).first()
+    
+    if not is_member:
+        raise HTTPException(status_code=403, detail="You are not a member of this team")
+    
+    members = db.query(TeamMember).filter_by(team_id=team_id).all()
+    
+    return {
+        "team": {
+            "id": team.id,
+            "name": team.name,
+            "github_repo_name": team.github_repo_name,
+            "last_synced_at": team.last_synced_at.isoformat() if team.last_synced_at else None
+        },
+        "members": [
+            {
+                "id": m.id,
+                "user_id": m.user_id,
+                "github_login": m.user.github_login,
+                "github_avatar_url": m.user.avatar_url,
+                "email": m.user.email,
+                "role": m.role,
+                "joined_at": m.joined_at.isoformat()
+            }
+            for m in members
+        ]
+    }
 
 
 @app.get("/github/status", response_model=GitHubStatusResponse, tags=["github"])

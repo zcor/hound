@@ -28,10 +28,11 @@ class GitHubCallbackRequest(BaseModel):
 
 def get_github_config():
     """Get GitHub OAuth configuration from environment."""
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000").rstrip("/")
     return {
         "client_id": os.getenv("GITHUB_CLIENT_ID"),
         "client_secret": os.getenv("GITHUB_CLIENT_SECRET"),
-        "frontend_url": os.getenv("FRONTEND_URL", "http://localhost:3000")
+        "frontend_url": frontend_url
     }
 
 

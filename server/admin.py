@@ -20,6 +20,8 @@ from database.models import (
     Hypothesis,
     Project,
     ScanExecution,
+    Team,
+    TeamMember,
     Tenant,
     TokenUsageLog,
 )
@@ -1438,6 +1440,81 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
         )
 
 
+class TeamAdmin(ModelView, model=Team):
+    """Admin view for Team model - repository-based team access control."""
+
+    column_list = [
+        Team.id,
+        Team.name,
+        Team.github_repo_name,
+        Team.github_repo_id,
+        Team.last_synced_at,
+        Team.created_at,
+    ]
+    column_searchable_list = [Team.name, Team.github_repo_name]
+    column_sortable_list = [
+        Team.id,
+        Team.name,
+        Team.github_repo_name,
+        Team.created_at,
+        Team.last_synced_at,
+    ]
+    column_default_sort = [(Team.created_at, True)]
+    column_details_list = [
+        Team.id,
+        Team.name,
+        Team.github_repo_id,
+        Team.github_repo_name,
+        Team.last_synced_at,
+        Team.created_at,
+        Team.updated_at,
+    ]
+    icon = "fa-solid fa-people-group"
+    name = "Team"
+    name_plural = "Teams"
+    can_create = True
+    can_edit = True
+    can_delete = True
+
+
+class TeamMemberAdmin(ModelView, model=TeamMember):
+    """Admin view for TeamMember model - team membership management."""
+
+    column_list = [
+        TeamMember.id,
+        TeamMember.team,
+        TeamMember.user,
+        TeamMember.role,
+        TeamMember.joined_at,
+    ]
+    column_searchable_list = [TeamMember.role]
+    column_sortable_list = [
+        TeamMember.id,
+        TeamMember.role,
+        TeamMember.joined_at,
+    ]
+    column_default_sort = [(TeamMember.joined_at, True)]
+    column_formatters = {
+        TeamMember.role: lambda m, a: Markup(
+            f'<span class="badge bg-{"danger" if m.role == "admin" else "primary" if m.role == "member" else "secondary"}">'
+            f'{m.role}</span>'
+        ),
+    }
+    column_details_list = [
+        TeamMember.id,
+        TeamMember.team,
+        TeamMember.user,
+        TeamMember.role,
+        TeamMember.joined_at,
+    ]
+    icon = "fa-solid fa-user-group"
+    name = "Team Member"
+    name_plural = "Team Members"
+    can_create = True
+    can_edit = True
+    can_delete = True
+
+
 class TokenUsageAdmin(ModelView, model=TokenUsageLog):
     """Admin view for TokenUsageLog model - track LLM costs."""
     
@@ -1822,6 +1899,8 @@ def setup_admin(app, engine):
     admin.add_view(GraphAdmin)
     admin.add_view(HypothesisAdmin)
     admin.add_view(TokenUsageAdmin)
+    admin.add_view(TeamAdmin)
+    admin.add_view(TeamMemberAdmin)
     admin.add_view(ReportsView)
     # Note: ScanFindingsView not added to navigation - accessible only via "View Findings" action
     

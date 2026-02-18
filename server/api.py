@@ -4940,7 +4940,10 @@ async def _get_current_user_with_token(
     from server.auth_utils import get_current_user_from_token
 
     token = get_token_from_header(request)
-    payload = get_current_user_from_token(token)
+    try:
+        payload = get_current_user_from_token(token)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token. Please log in again.")
     user = db.query(User).filter(User.id == payload["user_id"]).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
@@ -5180,6 +5183,64 @@ async def create_repository(
         last_scan_at=None,
         scans_count=0,
         findings_count=0,
+        tenant_id=project.tenant_id,
+        created_at=project.created_at,
+        updated_at=project.last_accessed,
+    )
+
+
+@app.get("/repositories/{repository_id}", response_model=RepositoryResponse, tags=["repositories"])
+async def get_repository(
+    repository_id: int,
+    tenant_id: int = Query(..., description="Tenant ID"),
+    db: Session = Depends(get_db),
+):
+    """
+    Get details for a single repository by ID.
+
+    Returns repository info with scan statistics.
+    """
+    project = (
+        db.query(Project)
+        .filter(
+            Project.id == repository_id,
+            Project.tenant_id == tenant_id,
+            Project.status != "removed",
+        )
+        .first()
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    # Get last scan time
+    last_scan = db.query(ScanExecution).filter(
+        ScanExecution.project_id == project.id
+    ).order_by(ScanExecution.created_at.desc()).first()
+
+    last_scan_at = last_scan.created_at if last_scan else None
+
+    # Count scans and findings
+    scans_count = db.query(func.count(ScanExecution.id)).filter(
+        ScanExecution.project_id == project.id
+    ).scalar() or 0
+
+    findings_count = db.query(func.count(Hypothesis.id)).filter(
+        Hypothesis.project_id == project.id
+    ).scalar() or 0
+
+    return RepositoryResponse(
+        id=project.id,
+        name=project.name,
+        full_name=project.full_name,
+        git_url=project.git_url,
+        github_repo_id=project.github_repo_id,
+        description=project.description,
+        is_private=project.is_private,
+        default_branch=project.default_branch,
+        status=project.status,
+        last_scan_at=last_scan_at,
+        scans_count=scans_count,
+        findings_count=findings_count,
         tenant_id=project.tenant_id,
         created_at=project.created_at,
         updated_at=project.last_accessed,

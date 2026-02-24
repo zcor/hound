@@ -18,11 +18,17 @@ Usage:
 import json
 import logging
 import os
+import secrets
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from x402.http import HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
+import jwt
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+from x402.http import AuthHeaders, HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
+from x402.http.facilitator_client_base import AuthProvider
 from x402.http.types import RouteConfig
 from x402.http.x402_http_server import x402HTTPResourceServer
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
@@ -41,6 +47,63 @@ def usd_to_atomic_usdc(usd_str: str) -> int:
     """Convert USD string like '$0.50' to USDC atomic units (500000)."""
     usd = Decimal(usd_str.replace("$", ""))
     return int(usd * 10**6)
+
+
+class CdpAuthProvider:
+    """AuthProvider for Coinbase Developer Platform (CDP) mainnet facilitator.
+
+    Generates ES256 JWTs signed with the CDP API key. Each JWT has a 120-second
+    lifetime and includes the request URI for the facilitator endpoint.
+    """
+
+    def __init__(self, api_key_id: str, api_key_secret: str, facilitator_url: str):
+        self.api_key_id = api_key_id
+        self.facilitator_url = facilitator_url
+        # Parse the PEM private key (handle both raw and escaped newlines)
+        key_pem = api_key_secret.replace("\\n", "\n")
+        if not key_pem.startswith("-----"):
+            key_pem = f"-----BEGIN EC PRIVATE KEY-----\n{key_pem}\n-----END EC PRIVATE KEY-----\n"
+        self._private_key = load_pem_private_key(key_pem.encode(), password=None)
+
+    def _build_jwt(self, method: str, path: str) -> str:
+        """Build a CDP ES256 JWT for a specific facilitator endpoint."""
+        # Extract host from facilitator URL
+        from urllib.parse import urlparse
+        parsed = urlparse(self.facilitator_url)
+        host = parsed.netloc  # e.g. "api.cdp.coinbase.com"
+        base_path = parsed.path.rstrip("/")  # e.g. "/platform/v2/x402"
+
+        now = int(time.time())
+        uri = f"{method} {host}{base_path}/{path}"
+
+        payload = {
+            "sub": self.api_key_id,
+            "iss": "cdp",
+            "aud": ["cdp_service"],
+            "nbf": now,
+            "iat": now,
+            "exp": now + 120,
+            "uris": [uri],
+        }
+
+        return jwt.encode(
+            payload,
+            self._private_key,
+            algorithm="ES256",
+            headers={
+                "kid": self.api_key_id,
+                "nonce": secrets.token_hex(16),
+                "typ": "JWT",
+            },
+        )
+
+    def get_auth_headers(self) -> AuthHeaders:
+        """Generate fresh JWT auth headers for verify, settle, and supported endpoints."""
+        return AuthHeaders(
+            verify={"Authorization": f"Bearer {self._build_jwt('POST', 'verify')}"},
+            settle={"Authorization": f"Bearer {self._build_jwt('POST', 'settle')}"},
+            supported={"Authorization": f"Bearer {self._build_jwt('GET', 'supported')}"},
+        )
 
 
 @dataclass
@@ -114,8 +177,15 @@ def get_x402_config(config_path: Path | None = None) -> X402Config | None:
     # Load pricing
     pricing_raw = _load_pricing(config_path)
 
-    # Initialize x402 SDK
-    facilitator_config = FacilitatorConfig(url=facilitator_url)
+    # Initialize x402 SDK (with CDP auth for mainnet facilitator)
+    auth_provider = None
+    if "cdp.coinbase.com" in facilitator_url:
+        cdp_key_id = os.environ["CDP_API_KEY_ID"]
+        cdp_key_secret = os.environ["CDP_API_KEY_SECRET"]
+        auth_provider = CdpAuthProvider(cdp_key_id, cdp_key_secret, facilitator_url)
+        logger.info("CDP auth provider configured for mainnet facilitator")
+
+    facilitator_config = FacilitatorConfig(url=facilitator_url, auth_provider=auth_provider)
     facilitator_client = HTTPFacilitatorClient(config=facilitator_config)
     server = x402ResourceServer(facilitator_clients=facilitator_client)
 

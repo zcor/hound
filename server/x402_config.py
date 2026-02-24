@@ -59,11 +59,57 @@ class CdpAuthProvider:
     def __init__(self, api_key_id: str, api_key_secret: str, facilitator_url: str):
         self.api_key_id = api_key_id
         self.facilitator_url = facilitator_url
-        # Parse the PEM private key (handle both raw and escaped newlines)
-        key_pem = api_key_secret.replace("\\n", "\n")
-        if not key_pem.startswith("-----"):
-            key_pem = f"-----BEGIN EC PRIVATE KEY-----\n{key_pem}\n-----END EC PRIVATE KEY-----\n"
-        self._private_key = load_pem_private_key(key_pem.encode(), password=None)
+        self._private_key, self._algorithm = self._load_key(api_key_secret)
+
+    @staticmethod
+    def _load_key(key_data: str):
+        """Load CDP private key. Returns (key, algorithm).
+
+        Supports:
+        - PEM-encoded EC (ES256) or Ed25519 (EdDSA) keys
+        - Raw base64: 64-byte Ed25519 seed+pubkey, DER-encoded keys
+        """
+        import base64
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
+        from cryptography.hazmat.primitives.serialization import load_der_private_key
+
+        key_data = key_data.strip().replace("\\n", "\n")
+
+        # Format 1: Full PEM with headers
+        if key_data.startswith("-----"):
+            key = load_pem_private_key(key_data.encode(), password=None)
+            if isinstance(key, Ed25519PrivateKey):
+                return key, "EdDSA"
+            return key, "ES256"
+
+        # Format 2: Raw base64
+        try:
+            raw_bytes = base64.b64decode(key_data)
+        except Exception:
+            raise ValueError("CDP_API_KEY_SECRET is not valid PEM or base64")
+
+        # 64 bytes = Ed25519 seed (32) + public key (32) — CDP portal default
+        if len(raw_bytes) == 64:
+            try:
+                key = Ed25519PrivateKey.from_private_bytes(raw_bytes[:32])
+                return key, "EdDSA"
+            except Exception:
+                pass
+
+        # Try DER (PKCS8 or traditional EC)
+        try:
+            key = load_der_private_key(raw_bytes, password=None)
+            if isinstance(key, Ed25519PrivateKey):
+                return key, "EdDSA"
+            return key, "ES256"
+        except Exception:
+            pass
+
+        raise ValueError(
+            "CDP_API_KEY_SECRET could not be parsed. Expected PEM format or "
+            "base64-encoded key from portal.cdp.coinbase.com."
+        )
 
     def _build_jwt(self, method: str, path: str) -> str:
         """Build a CDP ES256 JWT for a specific facilitator endpoint."""
@@ -89,7 +135,7 @@ class CdpAuthProvider:
         return jwt.encode(
             payload,
             self._private_key,
-            algorithm="ES256",
+            algorithm=self._algorithm,
             headers={
                 "kid": self.api_key_id,
                 "nonce": secrets.token_hex(16),

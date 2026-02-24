@@ -75,6 +75,7 @@ from database.models import (  # noqa: E402
     Base,
     Graph,
     Hypothesis,
+    PaymentLog,
     Project,
     ScanExecution,
     Team,
@@ -102,6 +103,14 @@ GITHUB_APP_SLUG = os.environ.get("GITHUB_APP_SLUG", "firepan")
 
 # Rate limiter for auth endpoints
 limiter = Limiter(key_func=get_remote_address)
+
+
+def rate_limit_key_tenant_or_ip(request: Request) -> str:
+    """Custom key for slowapi: tenant_id from verified auth state, else IP."""
+    tenant_id = getattr(request.state, "tenant_id", None)
+    if tenant_id is not None:
+        return f"tenant:{tenant_id}"
+    return f"ip:{request.client.host}"
 
 # =============================================================================
 # ADMIN AUTHENTICATION
@@ -256,11 +265,21 @@ def get_admin():
     return _admin
 
 
-# Initialize admin on startup
+# Initialize admin and validate x402 on startup
 @app.on_event("startup")
 async def startup_event():
-    """Initialize admin panel on startup."""
+    """Initialize admin panel and validate x402 config on startup."""
     get_admin()
+
+    # Fail-fast: validate x402 config if enabled
+    from server.x402_config import get_x402_config
+    try:
+        config = get_x402_config()
+        if config:
+            logger.info("x402 payments enabled with %d paid routes", len(config.route_pricing))
+    except RuntimeError as e:
+        logger.error("x402 configuration error: %s", e)
+        raise
 
 
 # Register authentication routes
@@ -6836,6 +6855,173 @@ async def run_surface_scan(
         scan_duration_seconds=result.scan_duration_seconds,
         summary=result.summary,
         error=result.error,
+    )
+
+
+# =============================================================================
+# x402 PAID ENDPOINTS
+# =============================================================================
+
+@app.post("/surface/scan/full", response_model=SurfaceScanResponse)
+async def run_full_surface_scan(
+    request_body: SurfaceScanRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    tenant_id: int = Depends(get_current_tenant_id),
+):
+    """
+    Run a full vulnerability surface scan (PAID: $0.50 via x402).
+
+    Returns complete vulnerability findings with details.
+    When x402 is disabled, works identically to /surface/scan (no paywall).
+    """
+    from server.x402_deps import PaymentGate, create_paid_job, mark_job_failed, require_payment
+
+    # Run payment gate manually (can't use Depends with dynamic factory easily here)
+    gate_fn = require_payment("POST /surface/scan/full")
+    gate = await gate_fn(request=request, tenant_id=tenant_id, db=db)
+
+    if gate.status == "already_processed":
+        return {"execution_id": gate.job_id, "status": "already_processed", "message": "Already processed"}
+
+    from analysis.surface import SurfaceScanner
+
+    config = get_active_config()
+    scanner = SurfaceScanner(
+        config=config,
+        llm_budget=request_body.llm_budget,
+        model=request_body.model,
+        quiet=True,
+    )
+
+    result = scanner.scan(request_body.target)
+    execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
+
+    try:
+        scan_exec = ScanExecution(
+            execution_id=execution_id,
+            tenant_id=tenant_id,
+            repo_url=result.repo_url,
+            repo_name=result.repo_name,
+            status="completed" if not result.error else "failed",
+            risk_score=result.risk_score,
+            risk_level=result.risk_level,
+            findings=[f.model_dump() for f in result.findings],
+            quality_metrics=result.quality_metrics.model_dump(),
+            summary=result.summary,
+            scan_config={
+                "llm_budget": request_body.llm_budget,
+                "model": request_body.model,
+                "paid": True,
+            },
+            llm_calls_made=result.llm_calls_used,
+            contracts_scanned=result.contracts_scanned,
+            contracts_total=result.contracts_total,
+            error_message=result.error,
+            started_at=result.scan_timestamp,
+            completed_at=datetime.now(),
+        )
+        db.add(scan_exec)
+        db.commit()
+
+        if gate.enabled and gate.payment_log_id:
+            try:
+                create_paid_job(db, gate.payment_log_id, execution_id)
+            except Exception as e:
+                logger.error(f"Failed to link payment to job: {e}")
+                mark_job_failed(db, gate.payment_log_id)
+    except Exception as e:
+        logger.warning(f"Failed to save paid scan to database: {e}")
+        if gate.enabled and gate.payment_log_id:
+            mark_job_failed(db, gate.payment_log_id)
+
+    return SurfaceScanResponse(
+        execution_id=execution_id,
+        repo_url=result.repo_url,
+        repo_name=result.repo_name,
+        risk_score=result.risk_score,
+        risk_level=result.risk_level,
+        findings=[
+            SurfaceFinding(
+                pattern_id=f.pattern_id,
+                title=f.title,
+                severity=f.severity,
+                category=f.category,
+                confidence=f.confidence,
+                location=f.location,
+                code_snippet=f.code_snippet,
+                description=f.description,
+                llm_verified=f.llm_verified,
+                llm_notes=f.llm_notes,
+            )
+            for f in result.findings
+        ],
+        quality_metrics=SurfaceQualityMetrics(
+            solidity_version=result.quality_metrics.solidity_version,
+            vyper_version=result.quality_metrics.vyper_version,
+            has_tests=result.quality_metrics.has_tests,
+            test_count=result.quality_metrics.test_count,
+            has_natspec=result.quality_metrics.has_natspec,
+            contract_count=result.quality_metrics.contract_count,
+            total_loc=result.quality_metrics.total_loc,
+            has_events=result.quality_metrics.has_events,
+            uses_safemath=result.quality_metrics.uses_safemath,
+            has_access_control=result.quality_metrics.has_access_control,
+        ),
+        contracts_scanned=result.contracts_scanned,
+        llm_calls_used=result.llm_calls_used,
+        scan_duration_seconds=result.scan_duration_seconds,
+        summary=result.summary,
+        error=result.error,
+    )
+
+
+class PaymentLookupResponse(BaseModel):
+    """Response for payment lookup."""
+    id: int
+    payment_id: str | None
+    endpoint: str
+    status: str
+    amount_usd: float
+    payer_address: str | None
+    tx_hash: str | None
+    network: str
+    job_id: str | None
+    created_at: datetime
+    settled_at: datetime | None
+
+
+@app.get("/payments/{payment_id}")
+@limiter.limit("30/minute", key_func=rate_limit_key_tenant_or_ip)
+async def get_payment(
+    payment_id: str,
+    request: Request,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
+    """
+    Look up a payment by payment_id. Requires auth + ownership check.
+    Returns 404 (not 403) if payment belongs to a different tenant.
+    """
+    request.state.tenant_id = tenant_id
+
+    log = db.query(PaymentLog).filter(PaymentLog.payment_id == payment_id).first()
+    if not log or log.tenant_id != tenant_id:
+        raise HTTPException(404, "Payment not found")
+
+    return PaymentLookupResponse(
+        id=log.id,
+        payment_id=log.payment_id,
+        endpoint=log.endpoint,
+        status=log.status,
+        amount_usd=float(log.amount_usd) if log.amount_usd else 0.0,
+        payer_address=log.payer_address,
+        tx_hash=log.tx_hash,
+        network=log.network,
+        job_id=log.job_id,
+        created_at=log.created_at,
+        settled_at=log.settled_at,
     )
 
 

@@ -16,11 +16,13 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    Numeric,
     String,
     Text,
     TypeDecorator,
     UniqueConstraint,
     create_engine,
+    func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, JSONB
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
@@ -428,6 +430,45 @@ class TokenUsageLog(Base):
     
     def __repr__(self):
         return f"<TokenUsageLog(id={self.id}, model='{self.model}', tokens={self.total_tokens}, cost=${self.cost_usd or 0:.4f})>"
+
+
+class PaymentLog(Base):
+    """
+    x402 payment tracking for agent customers.
+
+    Tracks the full lifecycle: reserved → paid → job_created.
+    The unique constraint on (tenant_id, endpoint, idempotency_key) prevents
+    concurrent double-charge — only one reservation can exist per key.
+    """
+    __tablename__ = "payment_logs"
+
+    id = Column(Integer, primary_key=True)
+    payment_id = Column(String, unique=True, nullable=True, index=True)  # From facilitator — NULL while reserved
+    idempotency_key = Column(String, nullable=True)
+    request_hash = Column(String, nullable=True)  # SHA-256 of canonicalized request body
+    resource_id = Column(String, nullable=True, index=True)  # Concrete resource ID (e.g., audit ID)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    job_id = Column(String, nullable=True)  # Linked scan/audit job
+    tx_hash = Column(String, unique=True, nullable=True)  # On-chain tx hash
+    network = Column(String, nullable=False)
+    amount_atomic = Column(BigInteger, nullable=False, default=0)  # USDC atomic units (1 USDC = 1_000_000)
+    amount_usd = Column(Numeric(precision=10, scale=6), nullable=False, default=0)  # Human-readable USD
+    token = Column(String, default="USDC")
+    payer_address = Column(String, nullable=True, index=True)  # NULL while reserved
+    endpoint = Column(String, nullable=False)  # Route key e.g. "POST /surface/scan/full"
+    status = Column(String, default="reserved")  # reserved, paid, job_created, job_failed, expired
+    settled_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+    # Relationships
+    tenant = relationship("Tenant", backref="payment_logs")
+
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'endpoint', 'idempotency_key', name='uq_payment_idempotency'),
+    )
+
+    def __repr__(self):
+        return f"<PaymentLog(id={self.id}, endpoint='{self.endpoint}', status='{self.status}', amount_usd={self.amount_usd})>"
 
 
 # Model pricing table (per 1M tokens) - Updated January 2026

@@ -69,6 +69,14 @@ services:
       # Telegram Notifications
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # x402 Agent Payments
+      X402_ENABLED: ${X402_ENABLED:-false}
+      X402_WALLET_ADDRESS: ${X402_WALLET_ADDRESS:-}
+      X402_FACILITATOR_URL: ${X402_FACILITATOR_URL:-https://x402.org/facilitator}
+      X402_NETWORK: ${X402_NETWORK:-eip155:84532}
+      X402_FREE_SCAN_DAILY_BUDGET_USD: ${X402_FREE_SCAN_DAILY_BUDGET_USD:-25}
+      CDP_API_KEY_ID: ${CDP_API_KEY_ID:-}
+      CDP_API_KEY_SECRET: ${CDP_API_KEY_SECRET:-}
     volumes:
       - ./secrets:/secrets:ro
     depends_on:

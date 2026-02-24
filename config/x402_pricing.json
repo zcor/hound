@@ -1,0 +1,16 @@
+{
+  "routes": {
+    "POST /surface/scan/full": {
+      "price": "$0.50",
+      "description": "Full vulnerability scan with detailed findings"
+    },
+    "POST /audits/start": {
+      "price": "$5.00",
+      "description": "Deep autonomous security audit"
+    },
+    "GET /audits/{id}/report": {
+      "price": "$0.10",
+      "description": "Formatted audit report (30-day access per payment)"
+    }
+  }
+}

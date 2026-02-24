@@ -123,6 +123,9 @@ def get_x402_config(config_path: Path | None = None) -> X402Config | None:
     evm_scheme = ExactEvmServerScheme()
     server.register(network, evm_scheme)
 
+    # Initialize the server (required before verify/settle/build_payment_requirements)
+    server.initialize()
+
     # Build route configs for the HTTP server
     routes: dict[str, RouteConfig] = {}
     for route_key, route_info in pricing_raw.items():

@@ -93,14 +93,35 @@ def canonical_request_hash(body: bytes) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def build_402_headers(config, endpoint: str, resource_id: str | None) -> dict[str, str]:
-    """Build 402 Payment Required response headers per x402 v2 spec."""
+def _get_resource_config(config, endpoint: str):
+    """Get a ResourceConfig for the given endpoint from route pricing."""
+    from x402.schemas.config import ResourceConfig
+
     route_config = config.route_pricing.get(endpoint)
     if not route_config:
+        return None
+
+    # RouteConfig.accepts is a PaymentOption with scheme, pay_to, price, network
+    option = route_config.accepts
+    if isinstance(option, list):
+        option = option[0]
+
+    return ResourceConfig(
+        scheme=option.scheme,
+        pay_to=option.pay_to,
+        price=option.price,
+        network=option.network,
+        max_timeout_seconds=option.max_timeout_seconds,
+    )
+
+
+def build_402_headers(config, endpoint: str, resource_id: str | None) -> dict[str, str]:
+    """Build 402 Payment Required response headers per x402 v2 spec."""
+    rc = _get_resource_config(config, endpoint)
+    if not rc:
         return {}
 
-    # Build PaymentRequirements from RouteConfig
-    requirements = config.server.build_payment_requirements(route_config)
+    requirements = config.server.build_payment_requirements(rc)
     payment_required = config.server.create_payment_required_response(requirements)
 
     return {
@@ -235,12 +256,12 @@ async def process_payment_gate(
         raise HTTPException(status_code=402, detail="Invalid payment payload", headers=headers)
 
     # Get the route's requirements for verification
-    route_config = config.route_pricing.get(endpoint)
-    if not route_config:
+    rc = _get_resource_config(config, endpoint)
+    if not rc:
         transition(log, PaymentStatus.EXPIRED, db)
         raise HTTPException(500, f"No pricing configured for {endpoint}")
 
-    requirements_list = config.server.build_payment_requirements(route_config)
+    requirements_list = config.server.build_payment_requirements(rc)
     matched_req = config.server.find_matching_requirements(requirements_list, payload)
     if not matched_req:
         transition(log, PaymentStatus.EXPIRED, db)

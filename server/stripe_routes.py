@@ -149,7 +149,7 @@ async def create_checkout_session(
         line_items=[{"price": price_id, "quantity": 1}],
         success_url=f"{FRONTEND_URL}/settings/billing?success=true",
         cancel_url=f"{FRONTEND_URL}/settings/billing?canceled=true",
-        allow_promotion_codes=False,
+        allow_promotion_codes=True,
         metadata={"tenant_id": str(tenant.id), "plan": body.plan, "period": body.period},
     )
 

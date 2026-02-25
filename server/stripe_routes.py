@@ -19,6 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from database.models import Tenant
+from integrations.telegram import notify_payment_event
 
 logger = logging.getLogger(__name__)
 
@@ -294,8 +295,9 @@ async def handle_stripe_webhook(request: Request, db: Session = Depends(get_db))
         # status == "processing" — previous attempt may have crashed. Re-process.
 
     # Phase 2: Business logic
+    notification = None
     try:
-        _handle_event(event, db)
+        notification = _handle_event(event, db)
 
         # Phase 3: Mark done
         db.execute(
@@ -312,23 +314,31 @@ async def handle_stripe_webhook(request: Request, db: Session = Depends(get_db))
         logger.exception("Stripe webhook processing failed for event %s", event.id)
         raise
 
+    # Fire-and-forget Telegram alert — outside the webhook try/except
+    if notification:
+        try:
+            await notify_payment_event(event_id=event.id, **notification)
+        except Exception as e:
+            logger.warning("Telegram payment notification failed: %s", e)
+
     return Response(status_code=200)
 
 
-def _handle_event(event: stripe.Event, db: Session):
-    """Route Stripe events to handlers."""
+def _handle_event(event: stripe.Event, db: Session) -> dict | None:
+    """Route Stripe events to handlers. Returns notification dict or None."""
     etype = event.type
 
     if etype == "checkout.session.completed":
-        _handle_checkout_completed(event.data.object, db)
+        return _handle_checkout_completed(event.data.object, db)
     elif etype == "customer.subscription.updated":
-        _handle_subscription_updated(event.data.object, db)
+        return _handle_subscription_updated(event.data.object, db)
     elif etype == "customer.subscription.deleted":
-        _handle_subscription_deleted(event.data.object, db)
+        return _handle_subscription_deleted(event.data.object, db)
     elif etype == "invoice.payment_failed":
-        _handle_payment_failed(event.data.object, db)
+        return _handle_payment_failed(event.data.object, db)
     else:
         logger.info("Ignoring Stripe event type: %s", etype)
+        return None
 
 
 def _find_tenant_by_metadata(metadata: dict, db: Session) -> Tenant | None:
@@ -344,7 +354,7 @@ def _find_tenant_by_customer(customer_id: str, db: Session) -> Tenant | None:
     return db.query(Tenant).filter(Tenant.stripe_customer_id == customer_id).first()
 
 
-def _handle_checkout_completed(session, db: Session):
+def _handle_checkout_completed(session, db: Session) -> dict | None:
     """Handle checkout.session.completed — route by session mode."""
     metadata = session.get("metadata", {})
     tenant = _find_tenant_by_metadata(metadata, db)
@@ -357,7 +367,7 @@ def _handle_checkout_completed(session, db: Session):
 
     if not tenant:
         logger.error("Checkout completed but tenant not found. metadata=%s", metadata)
-        return
+        return None
 
     mode = session.get("mode")
 
@@ -376,6 +386,14 @@ def _handle_checkout_completed(session, db: Session):
             tenant.stripe_customer_id = customer_id
         db.commit()
         logger.info("Tenant %d upgraded to plan=%s period=%s", tenant.id, plan, period)
+        return {
+            "event_type": "subscription_created",
+            "tenant_name": tenant.name,
+            "tenant_id": tenant.id,
+            "customer_id": customer_id or tenant.stripe_customer_id,
+            "plan": plan,
+            "period": period,
+        }
 
     elif mode == "payment":
         event_type = metadata.get("type")
@@ -388,40 +406,60 @@ def _handle_checkout_completed(session, db: Session):
             )
             db.commit()
             logger.info("Tenant %d purchased credit tranche: +%d scans", tenant.id, scans_granted)
+            return {
+                "event_type": "credit_purchase",
+                "tenant_name": tenant.name,
+                "tenant_id": tenant.id,
+                "customer_id": session.get("customer") or tenant.stripe_customer_id,
+                "scans_granted": scans_granted,
+            }
+
+    return None
 
 
-def _handle_subscription_updated(subscription, db: Session):
+def _handle_subscription_updated(subscription, db: Session) -> dict | None:
     """Handle plan changes via Stripe portal."""
     customer_id = subscription.get("customer")
     tenant = _find_tenant_by_customer(customer_id, db)
     if not tenant:
         logger.warning("subscription.updated for unknown customer %s", customer_id)
-        return
+        return None
 
     # Check if plan changed via price lookup
+    new_plan = None
+    new_period = None
     items = subscription.get("items", {}).get("data", [])
     if items:
         price_id = items[0].get("price", {}).get("id")
         config = load_stripe_plans()
         for plan_key, plan_config in config["plans"].items():
             if price_id in (plan_config.get("monthly_price_id"), plan_config.get("annual_price_id")):
-                tenant.plan = plan_key
-                period = "annual" if price_id == plan_config.get("annual_price_id") else "monthly"
-                tenant.plan_period = period
+                new_plan = plan_key
+                new_period = "annual" if price_id == plan_config.get("annual_price_id") else "monthly"
+                tenant.plan = new_plan
+                tenant.plan_period = new_period
                 tenant.plan_updated_at = datetime.now(timezone.utc)
                 break
 
     tenant.stripe_subscription_id = subscription.get("id")
     db.commit()
+    return {
+        "event_type": "subscription_updated",
+        "tenant_name": tenant.name,
+        "tenant_id": tenant.id,
+        "customer_id": customer_id,
+        "plan": new_plan or tenant.plan,
+        "period": new_period or tenant.plan_period,
+    }
 
 
-def _handle_subscription_deleted(subscription, db: Session):
+def _handle_subscription_deleted(subscription, db: Session) -> dict | None:
     """Handle subscription cancellation."""
     customer_id = subscription.get("customer")
     tenant = _find_tenant_by_customer(customer_id, db)
     if not tenant:
         logger.warning("subscription.deleted for unknown customer %s", customer_id)
-        return
+        return None
 
     tenant.plan = "free"
     tenant.plan_period = None
@@ -429,11 +467,24 @@ def _handle_subscription_deleted(subscription, db: Session):
     tenant.plan_updated_at = datetime.now(timezone.utc)
     db.commit()
     logger.info("Tenant %d subscription canceled, reverted to free", tenant.id)
+    return {
+        "event_type": "subscription_deleted",
+        "tenant_name": tenant.name,
+        "tenant_id": tenant.id,
+        "customer_id": customer_id,
+    }
 
 
-def _handle_payment_failed(invoice, db: Session):
+def _handle_payment_failed(invoice, db: Session) -> dict | None:
     """Log payment failure — don't immediately downgrade."""
     customer_id = invoice.get("customer")
     tenant = _find_tenant_by_customer(customer_id, db)
     tenant_info = f"tenant_id={tenant.id}" if tenant else f"customer={customer_id}"
     logger.warning("Payment failed for %s. Invoice: %s", tenant_info, invoice.get("id"))
+    return {
+        "event_type": "payment_failed",
+        "tenant_name": tenant.name if tenant else None,
+        "tenant_id": tenant.id if tenant else None,
+        "customer_id": customer_id,
+        "invoice_id": invoice.get("id"),
+    }

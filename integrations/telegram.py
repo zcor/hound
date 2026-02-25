@@ -136,6 +136,71 @@ async def notify_new_repo_synced(
     return await send_telegram_message(message)
 
 
+async def notify_payment_event(
+    event_type: str,
+    tenant_name: str | None = None,
+    tenant_id: int | None = None,
+    customer_id: str | None = None,
+    event_id: str | None = None,
+    plan: str | None = None,
+    period: str | None = None,
+    scans_granted: int | None = None,
+    invoice_id: str | None = None,
+) -> bool:
+    """
+    Send a Telegram notification for a Stripe payment event.
+
+    Returns True if the message was sent successfully.
+    """
+    templates = {
+        "subscription_created": {
+            "header": "\U0001f4b0 <b>New Subscriber!</b>",
+            "fields": ["tenant", "plan", "period", "customer_id", "event_id", "tenant_id"],
+        },
+        "credit_purchase": {
+            "header": "\U0001f4b3 <b>Credit Purchase!</b>",
+            "fields": ["tenant", "scans_granted", "customer_id", "event_id", "tenant_id"],
+        },
+        "subscription_updated": {
+            "header": "\U0001f504 <b>Plan Changed!</b>",
+            "fields": ["tenant", "plan", "period", "customer_id", "event_id", "tenant_id"],
+        },
+        "subscription_deleted": {
+            "header": "\u26a0\ufe0f <b>Subscription Canceled</b>",
+            "fields": ["tenant", "customer_id", "event_id", "tenant_id"],
+        },
+        "payment_failed": {
+            "header": "\U0001f6a8 <b>Payment Failed!</b>",
+            "fields": ["tenant", "invoice_id", "customer_id", "event_id", "tenant_id"],
+        },
+    }
+
+    template = templates.get(event_type)
+    if not template:
+        logger.warning("Unknown payment event type: %s", event_type)
+        return False
+
+    field_renderers = {
+        "tenant": lambda: f"\U0001f3e2 <b>Tenant:</b> {_escape_html(str(tenant_name or 'Unknown'))}",
+        "plan": lambda: f"\U0001f4cb <b>Plan:</b> {_escape_html(str(plan or 'N/A'))}",
+        "period": lambda: f"\U0001f4c5 <b>Period:</b> {_escape_html(str(period or 'N/A'))}",
+        "customer_id": lambda: f"\U0001f194 <b>Customer:</b> {_escape_html(str(customer_id or 'N/A'))}",
+        "event_id": lambda: f"\U0001f50d <b>Event:</b> {_escape_html(str(event_id or 'N/A'))}",
+        "tenant_id": lambda: f"\U0001f522 <b>Tenant ID:</b> {tenant_id}",
+        "scans_granted": lambda: f"\U0001f4e6 <b>Scans:</b> +{scans_granted}",
+        "invoice_id": lambda: f"\U0001f9fe <b>Invoice:</b> {_escape_html(str(invoice_id or 'N/A'))}",
+    }
+
+    parts = [template["header"], ""]
+    for field in template["fields"]:
+        renderer = field_renderers.get(field)
+        if renderer:
+            parts.append(renderer())
+
+    message = "\n".join(parts)
+    return await send_telegram_message(message)
+
+
 def _escape_html(text: str) -> str:
     """Escape HTML special characters for Telegram HTML parse mode."""
     return (

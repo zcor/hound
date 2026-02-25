@@ -1092,6 +1092,105 @@ def test_findings_stats_includes_surface_scans(client, sample_tenant, sample_pro
     assert sample_project.name in data["by_repository"]
 
 
+def _create_stripe_tables(db):
+    """Create stripe_processed_events table for SQLite test DB."""
+    import sqlite3
+    from sqlalchemy import event, text
+
+    engine = db.get_bind()
+    if engine.dialect.name == "sqlite":
+        # Register NOW() for SQLite compat with raw SQL in stripe_routes
+        @event.listens_for(engine, "connect")
+        def _register_now(dbapi_conn, connection_record):
+            import datetime as _dt
+            dbapi_conn.create_function(
+                "NOW", 0, lambda: _dt.datetime.now(_dt.timezone.utc).isoformat()
+            )
+
+        # Register on the existing raw connection too
+        raw = db.connection().connection.dbapi_connection
+        import datetime as _dt
+        raw.create_function("NOW", 0, lambda: _dt.datetime.now(_dt.timezone.utc).isoformat())
+
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS stripe_processed_events (
+            event_id VARCHAR PRIMARY KEY,
+            status VARCHAR NOT NULL DEFAULT 'processing',
+            processed_at TIMESTAMP
+        )
+    """))
+    db.commit()
+
+
+def test_stripe_webhook_sends_telegram_notification(client, sample_tenant, test_db):
+    """Test that Stripe webhook dispatches Telegram notification on successful checkout."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    _create_stripe_tables(test_db)
+
+    sample_tenant.stripe_customer_id = "cus_test123"
+    test_db.commit()
+
+    fake_session = {
+        "mode": "subscription",
+        "customer": "cus_test123",
+        "subscription": "sub_test456",
+        "metadata": {"tenant_id": str(sample_tenant.id), "plan": "starter", "period": "monthly"},
+    }
+    fake_event = MagicMock()
+    fake_event.id = "evt_test_notify"
+    fake_event.type = "checkout.session.completed"
+    fake_event.data.object = fake_session
+
+    with patch("stripe.Webhook.construct_event", return_value=fake_event):
+        with patch("server.stripe_routes.notify_payment_event", new_callable=AsyncMock) as mock_notify:
+            mock_notify.return_value = True
+            response = client.post(
+                "/webhooks/stripe",
+                content=b'{}',
+                headers={"Stripe-Signature": "test_sig"},
+            )
+
+    assert response.status_code == 200
+    mock_notify.assert_called_once()
+    call_kwargs = mock_notify.call_args.kwargs
+    assert call_kwargs["event_type"] == "subscription_created"
+    assert call_kwargs["event_id"] == "evt_test_notify"
+    assert call_kwargs["plan"] == "starter"
+
+
+def test_stripe_webhook_returns_200_on_telegram_failure(client, sample_tenant, test_db):
+    """Test that Stripe webhook returns 200 even if Telegram notification fails."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    _create_stripe_tables(test_db)
+
+    sample_tenant.stripe_customer_id = "cus_test_fail"
+    test_db.commit()
+
+    fake_session = {
+        "mode": "subscription",
+        "customer": "cus_test_fail",
+        "subscription": "sub_test_fail",
+        "metadata": {"tenant_id": str(sample_tenant.id), "plan": "starter", "period": "monthly"},
+    }
+    fake_event = MagicMock()
+    fake_event.id = "evt_test_tg_fail"
+    fake_event.type = "checkout.session.completed"
+    fake_event.data.object = fake_session
+
+    with patch("stripe.Webhook.construct_event", return_value=fake_event):
+        with patch("server.stripe_routes.notify_payment_event", new_callable=AsyncMock) as mock_notify:
+            mock_notify.side_effect = Exception("Telegram API down")
+            response = client.post(
+                "/webhooks/stripe",
+                content=b'{}',
+                headers={"Stripe-Signature": "test_sig"},
+            )
+
+    assert response.status_code == 200
+
+
 def test_findings_stats_surface_scans_dont_affect_confirmed(
     client, sample_tenant, sample_project, sample_hypothesis, test_db
 ):

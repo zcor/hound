@@ -237,6 +237,7 @@ async def github_callback(request: GitHubCallbackRequest, db: Session = Depends(
         "token_type": "bearer",
         "user": {
             "id": user.id,
+            "tenant_id": user.tenant_id,
             "github_login": user.github_login,
             "email": user.email,
             "name": user.name,

@@ -4939,6 +4939,29 @@ async def get_current_month_usage(
     )
 
 
+def _count_findings_for_project(db: Session, project_id: int) -> int:
+    """Count current findings for a project.
+
+    Uses the LATEST completed surface scan (not cumulative) to avoid
+    inflating counts on rescan. Also includes deep audit hypotheses.
+    """
+    # Latest completed surface scan findings
+    latest_scan = db.query(ScanExecution).filter(
+        ScanExecution.project_id == project_id,
+        ScanExecution.status == "completed",
+        ScanExecution.findings.isnot(None),
+    ).order_by(ScanExecution.created_at.desc()).first()
+
+    surface_findings = len(latest_scan.findings) if latest_scan and latest_scan.findings else 0
+
+    # Deep audit hypotheses (if any exist)
+    deep_findings = db.query(func.count(Hypothesis.id)).filter(
+        Hypothesis.project_id == project_id
+    ).scalar() or 0
+
+    return surface_findings + deep_findings
+
+
 @app.get("/repositories", response_model=RepositoryListResponse)
 async def list_repositories(
     tenant_id: int = Query(..., description="Tenant ID from authentication context"),
@@ -4982,11 +5005,9 @@ async def list_repositories(
         scans_count = db.query(func.count(ScanExecution.id)).filter(
             ScanExecution.project_id == project.id
         ).scalar() or 0
-        
-        findings_count = db.query(func.count(Hypothesis.id)).filter(
-            Hypothesis.project_id == project.id
-        ).scalar() or 0
-        
+
+        findings_count = _count_findings_for_project(db, project.id)
+
         repositories.append(RepositoryResponse(
             id=project.id,
             name=project.name,
@@ -5316,9 +5337,7 @@ async def get_repository(
         ScanExecution.project_id == project.id
     ).scalar() or 0
 
-    findings_count = db.query(func.count(Hypothesis.id)).filter(
-        Hypothesis.project_id == project.id
-    ).scalar() or 0
+    findings_count = _count_findings_for_project(db, project.id)
 
     return RepositoryResponse(
         id=project.id,
@@ -5653,8 +5672,33 @@ async def trigger_repository_scan(
     db.commit()
     db.refresh(scan)
 
-    # TODO: Integrate with actual scan execution (Celery task or similar)
-    # For now, just create the record
+    # Dispatch to Celery worker (async — returns immediately)
+    try:
+        from worker.tasks import execute_scan_task
+        execute_scan_task.delay(
+            repo_url=project.git_url,
+            scan_id=execution_id,
+            tenant_id=project.tenant_id,
+        )
+    except Exception as e:
+        # Mark scan as failed — don't leave it stuck "pending"
+        scan.status = "failed"
+        scan.error_message = f"Failed to dispatch scan: {e}"
+        db.commit()
+
+        # Refund credit if one was consumed by tier enforcement
+        if allowance.get("uses_credit"):
+            try:
+                from server.tier_enforcement import refund_scan_credit
+                refund_scan_credit(db, project.tenant_id, execution_id)
+            except Exception as refund_err:
+                logger.error("Failed to refund scan credit: %s", refund_err)
+
+        logger.error("Failed to dispatch scan task: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Worker module not available: {e}. Is Celery configured?"
+        )
 
     return {
         "execution_id": execution_id,
@@ -5815,6 +5859,7 @@ async def get_findings_statistics(
         "confirmed": 0,
         "rejected": 0,
         "resolved": 0,
+        "scanner_detected": 0,
     }
     
     by_repository = {}
@@ -5832,7 +5877,31 @@ async def get_findings_statistics(
         if finding.project:
             repo_name = finding.project.name
             by_repository[repo_name] = by_repository.get(repo_name, 0) + 1
-    
+
+    # Also include surface scan findings (latest scan per project)
+    tenant_projects = db.query(Project.id, Project.name).filter(
+        Project.tenant_id == tenant_id,
+        Project.status != "removed",
+    ).all()
+
+    for proj_id, proj_name in tenant_projects:
+        latest_scan = db.query(ScanExecution).filter(
+            ScanExecution.project_id == proj_id,
+            ScanExecution.status == "completed",
+            ScanExecution.findings.isnot(None),
+        ).order_by(ScanExecution.created_at.desc()).first()
+
+        if not latest_scan or not latest_scan.findings:
+            continue
+
+        for finding in latest_scan.findings:
+            total += 1
+            sev = finding.get("severity", "low") if isinstance(finding, dict) else "low"
+            if sev in by_severity:
+                by_severity[sev] += 1
+            by_status["scanner_detected"] += 1
+            by_repository[proj_name] = by_repository.get(proj_name, 0) + 1
+
     return FindingStatsResponse(
         total=total,
         by_severity=by_severity,

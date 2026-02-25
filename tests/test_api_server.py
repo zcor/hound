@@ -857,3 +857,267 @@ def test_surface_scans_with_tenant_filter(client, sample_tenant, test_db):
     assert "scans" in data
     # All scans should belong to the specified tenant
     # (We can't easily verify this without more complex queries)
+
+
+# =============================================================================
+# Scan dispatch, findings count, and stats regression tests
+# =============================================================================
+
+
+def test_trigger_scan_dispatches_celery_task(client, sample_project, test_db):
+    """Test that triggering a scan calls execute_scan_task.delay()."""
+    from unittest.mock import MagicMock, patch
+
+    mock_task = MagicMock()
+
+    # Bypass tier enforcement — patched at the source module
+    def fake_require(action):
+        async def _check(request):
+            return {"uses_credit": False}
+        return _check
+
+    with patch("server.tier_enforcement.require_plan_allowance", fake_require):
+        with patch.dict("sys.modules", {"worker.tasks": MagicMock()}):
+            import sys
+            mock_module = sys.modules["worker.tasks"]
+            mock_module.execute_scan_task = mock_task
+
+            response = client.post(f"/repositories/{sample_project.id}/scan")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "pending"
+    assert "execution_id" in data
+    mock_task.delay.assert_called_once()
+    call_kwargs = mock_task.delay.call_args
+    assert call_kwargs.kwargs["repo_url"] == sample_project.git_url
+    assert call_kwargs.kwargs["tenant_id"] == sample_project.tenant_id
+
+
+def test_trigger_scan_dispatch_failure_returns_500(client, sample_project, test_db):
+    """Test that dispatch failure marks scan as failed and returns 500."""
+    from unittest.mock import patch
+
+    from database.models import ScanExecution
+
+    def fake_require(action):
+        async def _check(request):
+            return {"uses_credit": False}
+        return _check
+
+    with patch("server.tier_enforcement.require_plan_allowance", fake_require):
+        # Make worker.tasks import raise ImportError
+        original_import = __import__
+        def _blocked_import(name, *args, **kwargs):
+            if name == "worker.tasks":
+                raise ImportError("No module named 'worker.tasks'")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_blocked_import):
+            response = client.post(f"/repositories/{sample_project.id}/scan")
+
+    assert response.status_code == 500
+
+    # Verify the scan record was marked failed
+    scan = test_db.query(ScanExecution).filter(
+        ScanExecution.project_id == sample_project.id
+    ).order_by(ScanExecution.created_at.desc()).first()
+    assert scan is not None
+    assert scan.status == "failed"
+    assert "Failed to dispatch scan" in (scan.error_message or "")
+
+
+def test_trigger_scan_dispatch_failure_refunds_credit(client, sample_project, test_db):
+    """Test that dispatch failure refunds credit when uses_credit is True."""
+    from unittest.mock import MagicMock, patch
+
+    from database.models import ScanExecution
+
+    mock_refund = MagicMock()
+
+    def fake_require(action):
+        async def _check(request):
+            return {"uses_credit": True}
+        return _check
+
+    original_import = __import__
+    def _blocked_import(name, *args, **kwargs):
+        if name == "worker.tasks":
+            raise ImportError("No module named 'worker.tasks'")
+        return original_import(name, *args, **kwargs)
+
+    with patch("server.tier_enforcement.require_plan_allowance", fake_require):
+        with patch("builtins.__import__", side_effect=_blocked_import):
+            with patch("server.tier_enforcement.refund_scan_credit", mock_refund):
+                response = client.post(f"/repositories/{sample_project.id}/scan")
+
+    assert response.status_code == 500
+    # Refund should have been called
+    mock_refund.assert_called_once()
+
+
+def test_findings_count_uses_surface_scan(client, sample_project, test_db):
+    """Test that findings_count comes from latest completed surface scan."""
+    from datetime import datetime, timezone
+
+    from database.models import ScanExecution
+
+    # Create a completed scan with findings
+    scan = ScanExecution(
+        execution_id="scan_findings_test",
+        project_id=sample_project.id,
+        tenant_id=sample_project.tenant_id,
+        repo_name=sample_project.name,
+        status="completed",
+        findings=[
+            {"pattern_id": "reentrancy", "severity": "high", "title": "Reentrancy"},
+            {"pattern_id": "overflow", "severity": "medium", "title": "Overflow"},
+            {"pattern_id": "access", "severity": "critical", "title": "Access Control"},
+        ],
+        created_at=datetime.now(timezone.utc),
+    )
+    test_db.add(scan)
+    test_db.commit()
+
+    response = client.get(f"/repositories?tenant_id={sample_project.tenant_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] >= 1
+    repo = next(r for r in data["repositories"] if r["id"] == sample_project.id)
+    assert repo["findings_count"] == 3
+
+
+def test_findings_count_uses_latest_scan_only(client, sample_project, test_db):
+    """Test that findings_count uses latest scan, not cumulative across scans."""
+    from datetime import datetime, timedelta, timezone
+
+    from database.models import ScanExecution
+
+    now = datetime.now(timezone.utc)
+
+    # Older scan with 5 findings
+    old_scan = ScanExecution(
+        execution_id="scan_old",
+        project_id=sample_project.id,
+        tenant_id=sample_project.tenant_id,
+        repo_name=sample_project.name,
+        status="completed",
+        findings=[{"severity": "high", "title": f"Finding {i}"} for i in range(5)],
+        created_at=now - timedelta(hours=2),
+    )
+
+    # Newer scan with 2 findings
+    new_scan = ScanExecution(
+        execution_id="scan_new",
+        project_id=sample_project.id,
+        tenant_id=sample_project.tenant_id,
+        repo_name=sample_project.name,
+        status="completed",
+        findings=[
+            {"severity": "critical", "title": "Finding A"},
+            {"severity": "low", "title": "Finding B"},
+        ],
+        created_at=now,
+    )
+
+    test_db.add(old_scan)
+    test_db.add(new_scan)
+    test_db.commit()
+
+    response = client.get(f"/repositories?tenant_id={sample_project.tenant_id}")
+    assert response.status_code == 200
+    data = response.json()
+    repo = next(r for r in data["repositories"] if r["id"] == sample_project.id)
+    # Should be 2 (latest scan), not 7 (cumulative)
+    assert repo["findings_count"] == 2
+
+
+def test_findings_count_single_repo(client, sample_project, test_db):
+    """Test findings_count on the single repository detail endpoint."""
+    from datetime import datetime, timezone
+
+    from database.models import ScanExecution
+
+    scan = ScanExecution(
+        execution_id="scan_detail_test",
+        project_id=sample_project.id,
+        tenant_id=sample_project.tenant_id,
+        repo_name=sample_project.name,
+        status="completed",
+        findings=[
+            {"severity": "high", "title": "Finding 1"},
+            {"severity": "medium", "title": "Finding 2"},
+        ],
+        created_at=datetime.now(timezone.utc),
+    )
+    test_db.add(scan)
+    test_db.commit()
+
+    response = client.get(f"/repositories/{sample_project.id}?tenant_id={sample_project.tenant_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["findings_count"] == 2
+
+
+def test_findings_stats_includes_surface_scans(client, sample_tenant, sample_project, test_db):
+    """Test that /findings/stats includes surface scan findings in severity counts."""
+    from datetime import datetime, timezone
+
+    from database.models import ScanExecution
+
+    scan = ScanExecution(
+        execution_id="scan_stats_test",
+        project_id=sample_project.id,
+        tenant_id=sample_tenant.id,
+        repo_name=sample_project.name,
+        status="completed",
+        findings=[
+            {"severity": "critical", "title": "Critical Bug"},
+            {"severity": "high", "title": "High Bug"},
+            {"severity": "medium", "title": "Medium Bug"},
+        ],
+        created_at=datetime.now(timezone.utc),
+    )
+    test_db.add(scan)
+    test_db.commit()
+
+    response = client.get(f"/findings/stats?tenant_id={sample_tenant.id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] >= 3
+    assert data["by_severity"]["critical"] >= 1
+    assert data["by_severity"]["high"] >= 1
+    assert data["by_severity"]["medium"] >= 1
+    assert data["by_status"]["scanner_detected"] >= 3
+    assert sample_project.name in data["by_repository"]
+
+
+def test_findings_stats_surface_scans_dont_affect_confirmed(
+    client, sample_tenant, sample_project, sample_hypothesis, test_db
+):
+    """Test that surface scan findings don't increment the 'confirmed' status count."""
+    from datetime import datetime, timezone
+
+    from database.models import ScanExecution
+
+    scan = ScanExecution(
+        execution_id="scan_confirmed_test",
+        project_id=sample_project.id,
+        tenant_id=sample_tenant.id,
+        repo_name=sample_project.name,
+        status="completed",
+        findings=[
+            {"severity": "critical", "title": "Surface Finding"},
+        ],
+        created_at=datetime.now(timezone.utc),
+    )
+    test_db.add(scan)
+    test_db.commit()
+
+    response = client.get(f"/findings/stats?tenant_id={sample_tenant.id}")
+    assert response.status_code == 200
+    data = response.json()
+    # confirmed count should only reflect the sample_hypothesis (1), not surface scans
+    assert data["by_status"]["confirmed"] == 1
+    # scanner_detected should reflect surface scan findings
+    assert data["by_status"]["scanner_detected"] >= 1

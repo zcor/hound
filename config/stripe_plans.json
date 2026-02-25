@@ -1,0 +1,73 @@
+{
+  "plans": {
+    "test": {
+      "name": "Test Plan ($1)",
+      "monthly_price_id": "price_1T4fEwDkpP2ofst75pAVgiNf",
+      "annual_price_id": "price_1T4fEwDkpP2ofst75pAVgiNf",
+      "monthly_amount_cents": 100,
+      "annual_amount_cents": 100,
+      "limits": { "repos": 5, "audits_per_month": 1, "scans_per_month": 40 },
+      "features": [
+        "TEMPORARY - DELETE AFTER TESTING",
+        "Same limits as Starter",
+        "$1/month for testing checkout flow"
+      ]
+    },
+    "starter": {
+      "name": "Starter",
+      "monthly_price_id": "price_1T4fDGDkpP2ofst7JPdgcwlw",
+      "annual_price_id": "price_1T4fDGDkpP2ofst7So6dXnXC",
+      "monthly_amount_cents": 27500,
+      "annual_amount_cents": 22000,
+      "limits": { "repos": 5, "audits_per_month": 1, "scans_per_month": 40 },
+      "features": [
+        "Automated vulnerability scanning",
+        "PR/CI integration",
+        "Private dashboard",
+        "Email support",
+        "API access"
+      ]
+    },
+    "professional": {
+      "name": "Professional",
+      "monthly_price_id": "price_1T4fDWDkpP2ofst7pkk77v3M",
+      "annual_price_id": "price_1T4fDWDkpP2ofst7JrhEkpm6",
+      "monthly_amount_cents": 108900,
+      "annual_amount_cents": 87100,
+      "limits": { "repos": 15, "audits_per_month": 3, "scans_per_month": 180 },
+      "features": [
+        "Everything in Starter",
+        "AI-generated fuzz harnesses",
+        "Invariant discovery",
+        "Foundry integration",
+        "Priority support"
+      ]
+    },
+    "enterprise": {
+      "name": "Enterprise",
+      "monthly_price_id": "price_1T4fDoDkpP2ofst7kJS4Qiv3",
+      "annual_price_id": "price_1T4fDpDkpP2ofst7TYTSzzaT",
+      "monthly_amount_cents": 301100,
+      "annual_amount_cents": 240900,
+      "limits": { "repos": 50, "audits_per_month": 10, "scans_per_month": 1000 },
+      "features": [
+        "Everything in Professional",
+        "Custom detector development",
+        "Dedicated security engineer",
+        "Live monitoring dashboard",
+        "SLA guarantees",
+        "SSO integration"
+      ]
+    }
+  },
+  "credit_tranche": {
+    "name": "Credit Top-Up",
+    "price_id": "price_1T4fEwDkpP2ofst7dD4AP7qP",
+    "amount_cents": 20000,
+    "scans_granted": 10
+  },
+  "free": {
+    "name": "Free",
+    "limits": { "repos": 999, "audits_per_month": 0, "scans_per_month": 0 }
+  }
+}

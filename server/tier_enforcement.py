@@ -1,0 +1,175 @@
+"""
+Tier enforcement dependency for FastAPI endpoints.
+
+Checks plan limits before allowing scan/audit operations.
+Uses atomic SQL operations to prevent race conditions on credit consumption.
+
+Usage:
+    @app.post("/repositories/{repository_id}/scan")
+    async def trigger_scan(
+        ...,
+        allowance: dict = Depends(require_plan_allowance("scan")),
+    ):
+        # allowance = {"uses_credit": bool}
+"""
+
+import json
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import Depends, HTTPException, Request
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from database.models import ScanExecution, Tenant
+
+logger = logging.getLogger(__name__)
+
+
+def _load_plans() -> dict:
+    """Load plan config from stripe_plans.json."""
+    config_path = Path(__file__).parent.parent / "config" / "stripe_plans.json"
+    with open(config_path) as f:
+        data = json.load(f)
+    # Merge plans + free into a flat dict keyed by plan name
+    result = {}
+    for key, plan in data["plans"].items():
+        result[key] = plan
+    result["free"] = data["free"]
+    return result
+
+
+def require_plan_allowance(operation: str):
+    """
+    FastAPI dependency factory that checks plan limits.
+
+    Args:
+        operation: "scan" or "audit"
+
+    Returns:
+        A dependency function returning {"uses_credit": bool}
+    """
+    async def _check(
+        request: Request,
+        db: Session = Depends(lambda: None),  # Placeholder — overridden below
+    ) -> dict:
+        from server.api import get_current_tenant_id as _get_tid, get_db as _get_db
+
+        tenant_id = await _get_tid(request)
+
+        # Get a proper DB session
+        engine_db = next(_get_db())
+        try:
+            return _check_sync(tenant_id, operation, engine_db)
+        finally:
+            engine_db.close()
+
+    # Use proper FastAPI DI instead of manual session management
+    async def _check_with_di(
+        request: Request,
+    ) -> dict:
+        from server.api import get_current_tenant_id as _get_tid, get_db as _get_db, get_engine
+
+        tenant_id = await _get_tid(request)
+
+        from database.models import create_db_session
+        engine = get_engine()
+        db = create_db_session(engine)
+        try:
+            return _check_sync(tenant_id, operation, db)
+        finally:
+            db.close()
+
+    return _check_with_di
+
+
+def _check_sync(tenant_id: int, operation: str, db: Session) -> dict:
+    """Synchronous plan check with atomic credit reservation."""
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+
+    plans = _load_plans()
+    plan_config = plans.get(tenant.plan, plans["free"])
+    limits = plan_config.get("limits", {})
+
+    if operation == "scan":
+        # Use timezone-aware month boundary
+        now = datetime.now(timezone.utc)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        # Count non-failed scans this month
+        scan_count = db.query(ScanExecution).filter(
+            ScanExecution.tenant_id == tenant_id,
+            ScanExecution.created_at >= month_start,
+            ScanExecution.status.notin_(["failed", "error"]),
+        ).count()
+
+        base_limit = limits.get("scans_per_month", 0)
+
+        if scan_count < base_limit:
+            return {"uses_credit": False}
+
+        # Over base limit — try consuming a credit atomically
+        rows = db.execute(
+            text("UPDATE tenants SET scan_credits = scan_credits - 1 WHERE id = :tid AND scan_credits > 0"),
+            {"tid": tenant_id},
+        )
+        db.commit()
+
+        if rows.rowcount == 0:
+            raise HTTPException(403, {
+                "error": "scan_limit_reached",
+                "limit": base_limit,
+                "credits_remaining": 0,
+                "message": "Upgrade your plan or purchase credits to continue scanning",
+            })
+        return {"uses_credit": True}
+
+    elif operation == "audit":
+        from database.models import AuditSession
+        now = datetime.now(timezone.utc)
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        audit_count = db.query(AuditSession).filter(
+            AuditSession.start_time >= month_start,
+        ).count()
+
+        base_limit = limits.get("audits_per_month", 0)
+
+        if audit_count >= base_limit:
+            raise HTTPException(403, {
+                "error": "audit_limit_reached",
+                "limit": base_limit,
+                "message": "Upgrade your plan to run more audits",
+            })
+        return {"uses_credit": False}
+
+    return {"uses_credit": False}
+
+
+def refund_scan_credit(db: Session, tenant_id: int, scan_execution_id: str):
+    """
+    Refund a credit exactly once, tied to a specific failed scan execution.
+
+    Uses INSERT ... ON CONFLICT DO NOTHING as the concurrency gate.
+    Only the INSERT winner proceeds to refund — losers get rowcount=0.
+    """
+    result = db.execute(
+        text("""
+            INSERT INTO credit_refunds (scan_execution_id, tenant_id)
+            VALUES (:sid, :tid)
+            ON CONFLICT (scan_execution_id) DO NOTHING
+        """),
+        {"sid": scan_execution_id, "tid": tenant_id},
+    )
+    if result.rowcount == 0:
+        return  # Already refunded
+
+    db.execute(
+        text("UPDATE tenants SET scan_credits = scan_credits + 1 WHERE id = :tid"),
+        {"tid": tenant_id},
+    )
+    db.commit()
+    logger.info("Refunded scan credit for tenant %d (scan %s)", tenant_id, scan_execution_id)

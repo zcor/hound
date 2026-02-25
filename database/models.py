@@ -85,13 +85,21 @@ class Tenant(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # Stripe billing
+    stripe_customer_id = Column(String, unique=True, nullable=True, index=True)
+    stripe_subscription_id = Column(String, unique=True, nullable=True)
+    plan = Column(String(50), nullable=False, default="free")  # free, starter, professional, enterprise
+    plan_period = Column(String(20), nullable=True)  # monthly, annual
+    plan_updated_at = Column(DateTime, nullable=True)
+    scan_credits = Column(Integer, nullable=False, default=0)  # Credit tranche top-ups
+
     # Relationships
     projects = relationship("Project", back_populates="tenant", cascade="all, delete-orphan")
     scan_executions = relationship("ScanExecution", back_populates="tenant", cascade="all, delete-orphan")
     users = relationship("User", back_populates="tenant", cascade="all, delete-orphan")
-    
+
     def __repr__(self):
-        return f"<Tenant(id={self.id}, name='{self.name}')>"
+        return f"<Tenant(id={self.id}, name='{self.name}', plan='{self.plan}')>"
 
 
 class User(Base):

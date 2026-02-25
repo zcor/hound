@@ -287,6 +287,16 @@ from server.auth_routes import router as auth_router  # noqa: E402
 
 app.include_router(auth_router)
 
+# Register Stripe billing routes
+try:
+    from server.stripe_routes import router as stripe_router  # noqa: E402
+    from server.stripe_routes import webhook_router as stripe_webhook_router  # noqa: E402
+
+    app.include_router(stripe_router)           # /billing/* — authenticated endpoints
+    app.include_router(stripe_webhook_router)    # /webhooks/stripe — Stripe signature only
+except Exception as e:
+    logger.warning("Stripe routes not loaded (stripe package may not be installed): %s", e)
+
 
 # Redirect for URL compatibility - auditsession -> audit-session
 from starlette.responses import RedirectResponse as StarletteRedirect  # noqa: E402
@@ -2900,27 +2910,39 @@ class AuditStatusResponse(BaseModel):
 # ============================================================================
 
 @app.post("/audits/start", response_model=AuditStartResponse)
-async def start_audit(request: AuditStartRequest, db: Session = Depends(get_db)):
+async def start_audit(
+    request_body: AuditStartRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    tenant_id: int = Depends(get_current_tenant_id),
+):
     """
     Start a new security audit (async, returns immediately).
-    
+    PAID: $5.00 via x402 for AI agent customers.
+
     This endpoint:
-    1. Creates an AuditSession record with status "queued"
-    2. Dispatches work to the Celery worker queue
-    3. Returns immediately with a session_id for tracking
-    
+    1. Checks x402 payment gate (for agent customers)
+    2. Creates an AuditSession record with status "queued"
+    3. Dispatches work to the Celery worker queue
+    4. Returns immediately with a session_id for tracking
+
     The actual audit runs in a background Celery worker. Connect to the
     WebSocket endpoint to receive real-time progress updates.
-    
-    Example:
-        POST /audits/start
-        {
-            "repo_url": "https://github.com/owner/repo",
-            "installation_id": 12345,  // For private repos
-            "pr_number": 42,           // To post findings as PR comments
-            "repo_full_name": "owner/repo"
-        }
     """
+    # x402 payment gate
+    from server.x402_deps import PaymentGate, create_paid_job, mark_job_failed, require_payment
+
+    gate_fn = require_payment("POST /audits/start")
+    gate = await gate_fn(request=request, tenant_id=tenant_id, db=db)
+
+    if gate.status == "already_processed":
+        return AuditStartResponse(
+            session_id=gate.job_id or "",
+            status="already_processed",
+            message="Already processed",
+            websocket_url=f"/ws/sessions/{gate.job_id}",
+        )
+
     # Import worker tasks (done here to avoid circular imports)
     try:
         from worker.tasks import execute_audit_task
@@ -2929,51 +2951,58 @@ async def start_audit(request: AuditStartRequest, db: Session = Depends(get_db))
             status_code=500,
             detail=f"Worker module not available: {e}. Is Celery configured?"
         )
-    
+
     # Generate unique session ID
     session_id = f"audit_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
-    
+
     # Get or create tenant
-    tenant = db.query(Tenant).filter(Tenant.id == request.tenant_id).first()
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
     if not tenant:
         tenant = db.query(Tenant).first()
         if not tenant:
             tenant = Tenant(name="default")
             db.add(tenant)
             db.commit()
-    
+
     # Create AuditSession record with status "queued"
-    # Note: tenant_id is tracked via the project relationship, not directly on session
     audit_session = AuditSession(
         session_id=session_id,
-        project_id=request.project_id,  # Can be None for ad-hoc scans
+        project_id=request_body.project_id,
         status="queued",
         start_time=datetime.now(timezone.utc),
-        models={"max_iterations": request.max_iterations},
+        models={"max_iterations": request_body.max_iterations},
     )
     db.add(audit_session)
     db.commit()
-    
-    logger.info(f"Created audit session {session_id} for {request.repo_url}")
-    
+
+    logger.info(f"Created audit session {session_id} for {request_body.repo_url}")
+
+    # Link payment to job
+    if gate.enabled and gate.payment_log_id:
+        try:
+            create_paid_job(db, gate.payment_log_id, session_id)
+        except Exception as e:
+            logger.error(f"Failed to link payment to audit job: {e}")
+            mark_job_failed(db, gate.payment_log_id)
+
     # Dispatch to Celery worker queue (async - returns immediately!)
     task = execute_audit_task.delay(
-        repo_url=request.repo_url,
+        repo_url=request_body.repo_url,
         scan_id=session_id,
         tenant_id=tenant.id,
-        project_id=request.project_id,
-        max_iterations=request.max_iterations,
-        investigation_prompt=request.investigation_prompt,
-        installation_id=request.installation_id,
-        pr_number=request.pr_number,
-        repo_full_name=request.repo_full_name,
-        time_limit_minutes=request.time_limit_minutes,
-        mode=request.mode,
-        plan_n=request.plan_n,
+        project_id=request_body.project_id,
+        max_iterations=request_body.max_iterations,
+        investigation_prompt=request_body.investigation_prompt,
+        installation_id=request_body.installation_id,
+        pr_number=request_body.pr_number,
+        repo_full_name=request_body.repo_full_name,
+        time_limit_minutes=request_body.time_limit_minutes,
+        mode=request_body.mode,
+        plan_n=request_body.plan_n,
     )
-    
+
     logger.info(f"Dispatched audit task {task.id} for session {session_id}")
-    
+
     return AuditStartResponse(
         session_id=session_id,
         status="queued",
@@ -4572,9 +4601,14 @@ class SubscriptionResponse(BaseModel):
     """Response model for subscription details."""
     tenant_id: int
     org_name: str
-    plan: str = "free"  # free, pro, enterprise
+    plan: str = "free"  # free, starter, professional, enterprise
     status: str  # active, pending, suspended
     created_at: datetime
+    plan_limits: dict = {}  # { repos, audits_per_month, scans_per_month }
+    usage_this_month: dict = {}  # { scans_used, audits_used, repos_count }
+    can_scan: bool = False
+    scan_credits: int = 0
+    stripe_customer_id: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -4783,24 +4817,63 @@ async def get_current_subscription(
 ):
     """
     Get current subscription for user/organization.
-    
-    Returns subscription plan and status. Currently returns basic info;
-    can be enhanced with actual billing integration.
+
+    Returns subscription plan, limits, usage, and billing status.
     """
     tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
-    
-    # Map tenant status to subscription status
+
     subscription_status = "active" if tenant.status == "active" else "pending"
-    plan = "free"  # Default plan; can be enhanced with actual subscription data
-    
+    plan = tenant.plan or "free"
+
+    # Load plan limits
+    import json
+    from pathlib import Path
+    config_path = Path(__file__).parent.parent / "config" / "stripe_plans.json"
+    try:
+        with open(config_path) as f:
+            plans_config = json.load(f)
+        plan_data = plans_config["plans"].get(plan, plans_config.get("free", {}))
+        plan_limits = plan_data.get("limits", {})
+    except (FileNotFoundError, KeyError):
+        plan_limits = {"repos": 999, "audits_per_month": 0, "scans_per_month": 0}
+
+    # Calculate usage this month
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    scans_used = db.query(ScanExecution).filter(
+        ScanExecution.tenant_id == tenant_id,
+        ScanExecution.created_at >= month_start,
+        ScanExecution.status.notin_(["failed", "error"]),
+    ).count()
+
+    repos_count = db.query(Project).filter(
+        Project.tenant_id == tenant_id,
+        Project.status == "active",
+    ).count()
+
+    usage = {
+        "scans_used": scans_used,
+        "repos_count": repos_count,
+    }
+
+    # Can scan: within plan limit OR has credits
+    scans_limit = plan_limits.get("scans_per_month", 0)
+    can_scan = scans_used < scans_limit or (tenant.scan_credits or 0) > 0
+
     return SubscriptionResponse(
         tenant_id=tenant.id,
         org_name=tenant.name,
         plan=plan,
         status=subscription_status,
         created_at=tenant.created_at,
+        plan_limits=plan_limits,
+        usage_this_month=usage,
+        can_scan=can_scan,
+        scan_credits=tenant.scan_credits or 0,
+        stripe_customer_id=tenant.stripe_customer_id,
     )
 
 
@@ -5543,22 +5616,29 @@ async def github_status(
 @app.post("/repositories/{repository_id}/scan")
 async def trigger_repository_scan(
     repository_id: int,
-    db: Session = Depends(get_db)
+    request: Request,
+    db: Session = Depends(get_db),
 ):
     """
     Trigger a new scan for a repository.
-    
+
     Creates a surface scan execution for the specified repository.
+    Checks plan limits before allowing the scan.
     Returns the execution ID for tracking.
     """
+    # Tier enforcement: check plan limits
+    from server.tier_enforcement import require_plan_allowance
+    tier_check = require_plan_allowance("scan")
+    allowance = await tier_check(request)
+
     # Verify repository exists
     project = db.query(Project).filter(Project.id == repository_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Repository not found")
-    
+
     # Generate scan execution ID
     execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
-    
+
     # Create scan execution
     scan = ScanExecution(
         execution_id=execution_id,
@@ -5572,15 +5652,16 @@ async def trigger_repository_scan(
     db.add(scan)
     db.commit()
     db.refresh(scan)
-    
+
     # TODO: Integrate with actual scan execution (Celery task or similar)
     # For now, just create the record
-    
+
     return {
         "execution_id": execution_id,
         "repository_id": repository_id,
         "status": "pending",
         "message": "Scan queued successfully",
+        "uses_credit": allowance.get("uses_credit", False),
     }
 
 

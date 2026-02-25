@@ -5,6 +5,7 @@ This module provides FastAPI endpoints for GitHub OAuth authentication
 and JWT token management.
 """
 
+import logging
 import os
 from collections.abc import Generator
 from datetime import datetime, timezone
@@ -12,11 +13,15 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database.models import Tenant, User
 from server.auth_utils import create_access_token, get_current_user_from_token
 from server.token_crypto import encrypt_token
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
@@ -146,13 +151,49 @@ async def github_callback(request: GitHubCallbackRequest, db: Session = Depends(
     
     # 3. Create or update user in database
     user = db.query(User).filter(User.github_id == github_user["id"]).first()
-    
+    is_new_user = False
+
     if not user:
-        # New user - create tenant and user
-        tenant = Tenant(name=f"Organization for {github_user['login']}")
-        db.add(tenant)
-        db.flush()  # Get tenant.id
-        
+        # New user — find or create tenant (unified with GitHub App tenants)
+        normalized_login = github_user["login"].lower()
+
+        # Check for existing tenant by github_account_login (case-insensitive)
+        tenant = db.query(Tenant).filter(
+            func.lower(Tenant.github_account_login) == normalized_login
+        ).first()
+
+        # Also check by name pattern from GitHub App flow
+        if not tenant:
+            tenant = db.query(Tenant).filter(
+                func.lower(Tenant.name) == f"github_{normalized_login}"
+            ).first()
+
+        if tenant:
+            # Existing tenant — activate if pending
+            if tenant.status == "pending":
+                tenant.status = "active"
+        else:
+            # Brand new user — create tenant
+            is_new_user = True
+            try:
+                tenant = Tenant(
+                    name=f"github_{github_user['login']}",
+                    github_account_login=github_user["login"],
+                    github_account_type="User",
+                    status="active",  # Freemium = instant access, no waitlist
+                )
+                db.add(tenant)
+                db.flush()
+            except IntegrityError:
+                # Race condition: another request created this tenant
+                db.rollback()
+                tenant = db.query(Tenant).filter(
+                    func.lower(Tenant.github_account_login) == normalized_login
+                ).first()
+                if not tenant:
+                    raise HTTPException(500, "Tenant creation conflict")
+                is_new_user = False
+
         user = User(
             github_id=github_user["id"],
             github_login=github_user["login"],
@@ -161,30 +202,36 @@ async def github_callback(request: GitHubCallbackRequest, db: Session = Depends(
             avatar_url=github_user.get("avatar_url"),
             tenant_id=tenant.id,
             github_token_encrypted=encrypt_token(github_token),
-            github_access_token=github_token,  # Store for API calls
+            github_access_token=github_token,
             github_connected_at=datetime.now(timezone.utc),
         )
         db.add(user)
         db.commit()
         db.refresh(user)
+        logger.info("New user created: %s (tenant_id=%d, is_new=%s)",
+                     github_user["login"], tenant.id, is_new_user)
     else:
         # Existing user - update info and refresh token
         user.name = github_user.get("name")
         user.email = github_user.get("email")
         user.avatar_url = github_user.get("avatar_url")
         user.github_token_encrypted = encrypt_token(github_token)
-        user.github_access_token = github_token  # Store for API calls
+        user.github_access_token = github_token
         user.github_connected_at = datetime.now(timezone.utc)
+        # Ensure tenant is active on login
+        tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+        if tenant and tenant.status == "pending":
+            tenant.status = "active"
         db.commit()
         db.refresh(user)
-    
+
     # 4. Generate JWT token
     access_token = create_access_token(data={
         "user_id": user.id,
         "tenant_id": user.tenant_id,
         "github_login": user.github_login
     })
-    
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -195,7 +242,8 @@ async def github_callback(request: GitHubCallbackRequest, db: Session = Depends(
             "name": user.name,
             "avatar_url": user.avatar_url
         },
-        "tenant_id": user.tenant_id
+        "tenant_id": user.tenant_id,
+        "is_new_user": is_new_user
     }
 
 

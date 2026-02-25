@@ -85,15 +85,20 @@ class TenantAdmin(ModelView, model=Tenant):
         Tenant.id,
         Tenant.name,
         Tenant.status,
+        Tenant.plan,
         Tenant.github_account_login,
+        Tenant.contact_email,
         Tenant.installation_id,
-        Tenant.created_at
+        Tenant.created_at,
     ]
     column_searchable_list = [Tenant.name, Tenant.github_account_login, Tenant.contact_email]
-    column_sortable_list = [Tenant.id, Tenant.name, Tenant.status, Tenant.created_at]
+    column_sortable_list = [Tenant.id, Tenant.name, Tenant.status, Tenant.plan, Tenant.created_at]
     column_default_sort = [(Tenant.created_at, True)]
     column_formatters = {
         Tenant.status: lambda m, a: status_formatter(m.status),
+        Tenant.plan: lambda m, a: Markup(
+            f'<span class="badge bg-{"success" if m.plan in ("professional", "enterprise") else "info" if m.plan == "starter" else "secondary"}">{m.plan or "free"}</span>'
+        ),
         Tenant.name: lambda m, a: Markup(
             f'<strong style="font-size: 1.1em; color: #64b5f6;">{m.name}</strong>'
         ),
@@ -102,6 +107,12 @@ class TenantAdmin(ModelView, model=Tenant):
         Tenant.id,
         Tenant.name,
         Tenant.status,
+        Tenant.plan,
+        Tenant.plan_period,
+        Tenant.scan_credits,
+        Tenant.stripe_customer_id,
+        Tenant.stripe_subscription_id,
+        Tenant.plan_updated_at,
         Tenant.contact_email,
         Tenant.github_account_login,
         Tenant.github_account_type,

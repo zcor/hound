@@ -1,18 +1,5 @@
 {
   "plans": {
-    "test": {
-      "name": "Test Plan ($1)",
-      "monthly_price_id": "price_1T4fEwDkpP2ofst75pAVgiNf",
-      "annual_price_id": "price_1T4fEwDkpP2ofst75pAVgiNf",
-      "monthly_amount_cents": 100,
-      "annual_amount_cents": 100,
-      "limits": { "repos": 5, "audits_per_month": 1, "scans_per_month": 40 },
-      "features": [
-        "TEMPORARY - DELETE AFTER TESTING",
-        "Same limits as Starter",
-        "$1/month for testing checkout flow"
-      ]
-    },
     "starter": {
       "name": "Starter",
       "monthly_price_id": "price_1T4fDGDkpP2ofst7JPdgcwlw",

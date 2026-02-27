@@ -8,6 +8,7 @@ import shutil
 import tarfile
 import tempfile
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -274,7 +275,7 @@ class SurfaceScanner:
 
         return batch_result
 
-    def _resolve_target(self, target: str) -> tuple[Path, str | None, callable | None]:
+    def _resolve_target(self, target: str) -> tuple[Path, str | None, Callable[[], None] | None]:
         """Resolve target to local path, downloading if needed.
 
         Returns:
@@ -295,7 +296,7 @@ class SurfaceScanner:
 
         return local_path, None, None
 
-    def _fetch_github_repo(self, url: str) -> tuple[Path, str, callable]:
+    def _fetch_github_repo(self, url: str) -> tuple[Path, str, Callable[[], None]]:
         """Fetch a GitHub repository as a tarball.
 
         Returns:

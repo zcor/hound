@@ -23,6 +23,8 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     func,
+    or_,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, JSONB
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
@@ -465,6 +467,8 @@ class PaymentLog(Base):
     payer_address = Column(String, nullable=True, index=True)  # NULL while reserved
     endpoint = Column(String, nullable=False)  # Route key e.g. "POST /surface/scan/full"
     status = Column(String, default="reserved")  # reserved, paid, job_created, job_failed, expired
+    discount_code = Column(String(50), nullable=True)  # x402 discount code applied
+    resolved_price_cents = Column(Integer, nullable=True)  # Actual price charged (cents) after discount
     settled_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now())
 
@@ -477,6 +481,56 @@ class PaymentLog(Base):
 
     def __repr__(self):
         return f"<PaymentLog(id={self.id}, endpoint='{self.endpoint}', status='{self.status}', amount_usd={self.amount_usd})>"
+
+
+class X402Discount(Base):
+    """
+    x402 discount/coupon definitions.
+
+    Supports fixed-price overrides (fixed_price_cents) and percentage discounts.
+    Can be scoped to a specific endpoint or apply globally (endpoint=NULL).
+    """
+    __tablename__ = "x402_discounts"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(50), unique=True, nullable=False, index=True)
+    percentage_off = Column(Integer, nullable=True)  # 0-100
+    fixed_price_cents = Column(Integer, nullable=True)  # cents, e.g. 1 = $0.01
+    endpoint = Column(String(255), nullable=True)  # NULL = all routes
+    max_uses = Column(Integer, nullable=True)  # NULL = unlimited
+    current_uses = Column(Integer, nullable=False, default=0)
+    max_uses_per_tenant = Column(Integer, nullable=True)
+    active = Column(Boolean, nullable=False, default=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=func.now())
+
+    def __repr__(self):
+        return f"<X402Discount(code='{self.code}', active={self.active})>"
+
+
+class TenantDiscount(Base):
+    """
+    Links a discount to a tenant (created on coupon redemption).
+
+    The unique constraint on (tenant_id, discount_id) prevents double-redemption.
+    """
+    __tablename__ = "tenant_discounts"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    discount_id = Column(Integer, ForeignKey("x402_discounts.id"), nullable=False)
+    uses = Column(Integer, nullable=False, default=0)
+    redeemed_at = Column(DateTime, nullable=False, default=func.now())
+
+    discount = relationship("X402Discount")
+    tenant = relationship("Tenant")
+
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'discount_id', name='uq_tenant_discount'),
+    )
+
+    def __repr__(self):
+        return f"<TenantDiscount(tenant_id={self.tenant_id}, discount_id={self.discount_id})>"
 
 
 # Model pricing table (per 1M tokens) - Updated January 2026
@@ -579,14 +633,31 @@ def create_db_session(engine):
     return Session()
 
 
+def ensure_schema(engine):
+    """Idempotent schema patches for columns that create_all() can't add to existing tables.
+
+    Postgres: ADD COLUMN IF NOT EXISTS (atomic, safe under concurrent multi-worker startup).
+    SQLite: no-op — tests use create_all() which builds complete tables from scratch.
+    """
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS discount_code VARCHAR(50)"
+            ))
+            conn.execute(text(
+                "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS resolved_price_cents INTEGER"
+            ))
+
+
 def init_database(engine):
     """
-    Initialize the database by creating all tables.
-    
+    Initialize the database by creating all tables, then apply schema patches.
+
     Args:
         engine: SQLAlchemy Engine instance
     """
     Base.metadata.create_all(engine)
+    ensure_schema(engine)
 
 
 def drop_all_tables(engine):

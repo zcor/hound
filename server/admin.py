@@ -18,12 +18,15 @@ from database.models import (
     AuditSession,
     Graph,
     Hypothesis,
+    PaymentLog,
     Project,
     ScanExecution,
     Team,
     TeamMember,
     Tenant,
+    TenantDiscount,
     TokenUsageLog,
+    X402Discount,
 )
 
 
@@ -1584,6 +1587,103 @@ class TokenUsageAdmin(ModelView, model=TokenUsageLog):
     can_delete = True  # Allow cleanup of old logs
 
 
+class PaymentLogAdmin(ModelView, model=PaymentLog):
+    """Admin view for PaymentLog model — x402 payment tracking."""
+
+    page_size = 50
+    column_list = [
+        PaymentLog.id,
+        PaymentLog.endpoint,
+        PaymentLog.status,
+        PaymentLog.amount_usd,
+        PaymentLog.discount_code,
+        PaymentLog.resolved_price_cents,
+        PaymentLog.payer_address,
+        PaymentLog.created_at,
+    ]
+    column_searchable_list = [PaymentLog.endpoint, PaymentLog.discount_code, PaymentLog.payer_address]
+    column_sortable_list = [PaymentLog.id, PaymentLog.status, PaymentLog.amount_usd, PaymentLog.created_at]
+    column_default_sort = [(PaymentLog.created_at, True)]
+    column_formatters = {
+        PaymentLog.status: lambda m, a: status_formatter(m.status),
+        PaymentLog.amount_usd: lambda m, a: Markup(
+            f'<span class="badge bg-success">${m.amount_usd:.2f}</span>'
+        ) if m.amount_usd else "",
+        PaymentLog.discount_code: lambda m, a: Markup(
+            f'<span class="badge bg-warning">{m.discount_code}</span>'
+        ) if m.discount_code else "",
+    }
+    icon = "fa-solid fa-credit-card"
+    name = "Payment Log"
+    name_plural = "Payment Logs"
+    can_create = False
+    can_edit = False
+    can_delete = True
+
+
+class X402DiscountAdmin(ModelView, model=X402Discount):
+    """Admin view for X402Discount model — coupon management."""
+
+    page_size = 50
+    column_list = [
+        X402Discount.id,
+        X402Discount.code,
+        X402Discount.fixed_price_cents,
+        X402Discount.percentage_off,
+        X402Discount.endpoint,
+        X402Discount.active,
+        X402Discount.current_uses,
+        X402Discount.max_uses,
+        X402Discount.max_uses_per_tenant,
+        X402Discount.expires_at,
+        X402Discount.created_at,
+    ]
+    column_searchable_list = [X402Discount.code, X402Discount.endpoint]
+    column_sortable_list = [X402Discount.id, X402Discount.code, X402Discount.active, X402Discount.created_at]
+    column_default_sort = [(X402Discount.created_at, True)]
+    column_formatters = {
+        X402Discount.active: lambda m, a: Markup(
+            f'<span class="badge bg-{"success" if m.active else "danger"}">{"Active" if m.active else "Inactive"}</span>'
+        ),
+        X402Discount.fixed_price_cents: lambda m, a: Markup(
+            f'<span class="badge bg-info">${m.fixed_price_cents / 100:.2f}</span>'
+        ) if m.fixed_price_cents is not None else "",
+        X402Discount.percentage_off: lambda m, a: Markup(
+            f'<span class="badge bg-info">{m.percentage_off}% off</span>'
+        ) if m.percentage_off is not None else "",
+        X402Discount.current_uses: lambda m, a: Markup(
+            f'{m.current_uses}/{m.max_uses if m.max_uses is not None else "∞"}'
+        ),
+    }
+    icon = "fa-solid fa-tags"
+    name = "X402 Discount"
+    name_plural = "X402 Discounts"
+    can_create = True
+    can_edit = True
+    can_delete = True
+
+
+class TenantDiscountAdmin(ModelView, model=TenantDiscount):
+    """Admin view for TenantDiscount model — coupon redemptions."""
+
+    page_size = 50
+    column_list = [
+        TenantDiscount.id,
+        TenantDiscount.tenant,
+        TenantDiscount.discount,
+        TenantDiscount.uses,
+        TenantDiscount.redeemed_at,
+    ]
+    column_sortable_list = [TenantDiscount.id, TenantDiscount.uses, TenantDiscount.redeemed_at]
+    column_default_sort = [(TenantDiscount.redeemed_at, True)]
+    icon = "fa-solid fa-ticket"
+    name = "Tenant Discount"
+    name_plural = "Tenant Discounts"
+    can_create = True
+    can_edit = True
+    can_delete = True
+
+
 class ReportsView(BaseView):
     """Custom view to browse and access generated audit reports."""
     
@@ -1912,6 +2012,9 @@ def setup_admin(app, engine):
     admin.add_view(TokenUsageAdmin)
     admin.add_view(TeamAdmin)
     admin.add_view(TeamMemberAdmin)
+    admin.add_view(PaymentLogAdmin)
+    admin.add_view(X402DiscountAdmin)
+    admin.add_view(TenantDiscountAdmin)
     admin.add_view(ReportsView)
     # Note: ScanFindingsView not added to navigation - accessible only via "View Findings" action
     

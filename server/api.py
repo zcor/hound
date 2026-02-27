@@ -268,8 +268,12 @@ def get_admin():
 # Initialize admin and validate x402 on startup
 @app.on_event("startup")
 async def startup_event():
-    """Initialize admin panel and validate x402 config on startup."""
+    """Initialize admin panel, apply schema patches, and validate x402 config on startup."""
     get_admin()
+
+    # Apply idempotent schema patches (e.g. new columns on existing tables)
+    from database.models import ensure_schema
+    ensure_schema(get_engine())
 
     # Fail-fast: validate x402 config if enabled
     from server.x402_config import get_x402_config
@@ -296,6 +300,11 @@ try:
     app.include_router(stripe_webhook_router)    # /webhooks/stripe — Stripe signature only
 except Exception as e:
     logger.warning("Stripe routes not loaded (stripe package may not be installed): %s", e)
+
+# Register x402 discount/coupon routes
+from server.x402_routes import router as x402_router  # noqa: E402
+
+app.include_router(x402_router)
 
 
 # Redirect for URL compatibility - auditsession -> audit-session

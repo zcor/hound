@@ -2,10 +2,10 @@
   "plans": {
     "starter": {
       "name": "Starter",
-      "monthly_price_id": "price_1T4fDGDkpP2ofst7JPdgcwlw",
-      "annual_price_id": "price_1T4fDGDkpP2ofst7So6dXnXC",
-      "monthly_amount_cents": 27500,
-      "annual_amount_cents": 22000,
+      "monthly_price_id": "price_1T5jTSDkpP2ofst7BdRzly2B",
+      "annual_price_id": "price_1T5jTdDkpP2ofst7lYgQtWm7",
+      "monthly_amount_cents": 29900,
+      "annual_amount_cents": 23900,
       "limits": { "repos": 5, "audits_per_month": 1, "scans_per_month": 40 },
       "features": [
         "Automated vulnerability scanning",
@@ -17,10 +17,10 @@
     },
     "professional": {
       "name": "Professional",
-      "monthly_price_id": "price_1T4fDWDkpP2ofst7pkk77v3M",
-      "annual_price_id": "price_1T4fDWDkpP2ofst7JrhEkpm6",
-      "monthly_amount_cents": 108900,
-      "annual_amount_cents": 87100,
+      "monthly_price_id": "price_1T5jTdDkpP2ofst7HwUihaSI",
+      "annual_price_id": "price_1T5jTdDkpP2ofst7bj5h7CTx",
+      "monthly_amount_cents": 119900,
+      "annual_amount_cents": 95900,
       "limits": { "repos": 15, "audits_per_month": 3, "scans_per_month": 180 },
       "features": [
         "Everything in Starter",
@@ -32,10 +32,10 @@
     },
     "enterprise": {
       "name": "Enterprise",
-      "monthly_price_id": "price_1T4fDoDkpP2ofst7kJS4Qiv3",
-      "annual_price_id": "price_1T4fDpDkpP2ofst7TYTSzzaT",
-      "monthly_amount_cents": 301100,
-      "annual_amount_cents": 240900,
+      "monthly_price_id": "price_1T5jTeDkpP2ofst76a424AFA",
+      "annual_price_id": "price_1T5jTeDkpP2ofst7WmfWi0L4",
+      "monthly_amount_cents": 299900,
+      "annual_amount_cents": 239900,
       "limits": { "repos": 50, "audits_per_month": 10, "scans_per_month": 1000 },
       "features": [
         "Everything in Professional",

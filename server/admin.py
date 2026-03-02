@@ -129,6 +129,24 @@ class TenantAdmin(ModelView, model=Tenant):
     name = "Tenant / Organization"
     name_plural = "Tenants / Organizations"
 
+    @action(
+        name="preview_dashboard",
+        label="Preview Dashboard",
+        confirmation_message=None,
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def preview_dashboard_action(self, request: Request) -> RedirectResponse:
+        """Open the tenant's dashboard in admin preview mode."""
+        pks = request.query_params.get("pks", "").split(",")
+        if not pks or pks == [""]:
+            return RedirectResponse(
+                request.url_for("admin:list", identity=self.identity),
+                status_code=302,
+            )
+        tenant_id = pks[0]
+        return RedirectResponse(f"/admin/tenant/{tenant_id}/preview", status_code=302)
+
 
 class ProjectAdmin(ModelView, model=Project):
     """Admin view for Project model."""

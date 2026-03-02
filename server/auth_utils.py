@@ -3,12 +3,18 @@ JWT utilities for user authentication.
 
 This module provides functions to create and validate JWT tokens
 for user authentication with GitHub OAuth.
+
+Also provides reject_preview_writes — a FastAPI dependency that blocks
+non-safe-method requests when using an admin preview token. Lives here
+(not api.py) to avoid circular imports: both api.py and stripe_routes.py
+can import from this leaf module safely.
 """
 
 import os
 from datetime import datetime, timedelta, timezone
 
 import jwt
+from fastapi import HTTPException, Request
 
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-secret-change-in-production")
 ALGORITHM = "HS256"
@@ -78,3 +84,24 @@ def get_current_user_from_token(token: str) -> dict:
         "tenant_id": payload.get("tenant_id"),
         "github_login": payload.get("github_login")
     }
+
+
+async def reject_preview_writes(request: Request):
+    """Block non-safe-method requests when using an admin preview token.
+
+    Uses decode_access_token() (NOT get_current_user_from_token) to get
+    the full JWT payload including the admin_preview claim.
+    """
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return  # safe methods always allowed
+
+    from server.auth_routes import get_token_from_header
+
+    try:
+        token = get_token_from_header(request)
+        payload = decode_access_token(token)
+    except Exception:
+        return  # no valid token = not a preview request, let other deps handle auth
+
+    if payload.get("admin_preview", False):
+        raise HTTPException(status_code=403, detail="Preview mode is read-only")

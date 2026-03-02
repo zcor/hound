@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from database.models import Tenant
 from integrations.telegram import notify_payment_event
+from server.auth_utils import reject_preview_writes
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ async def create_checkout_session(
     body: CheckoutRequest,
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """Create a Stripe Checkout Session for a subscription."""
     from server.api import get_current_tenant_id as _get_tid
@@ -161,6 +163,7 @@ async def create_checkout_session(
 async def buy_credits(
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """Create a Stripe Checkout Session for a one-time credit tranche purchase."""
     from server.api import get_current_tenant_id as _get_tid
@@ -201,6 +204,7 @@ async def buy_credits(
 async def create_billing_portal(
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """Create a Stripe Billing Portal session for plan management."""
     from server.api import get_current_tenant_id as _get_tid

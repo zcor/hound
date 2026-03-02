@@ -86,6 +86,7 @@ from database.models import (  # noqa: E402
     create_db_session,
 )
 from integrations.telegram import notify_new_repo_synced  # noqa: E402
+from server.auth_utils import reject_preview_writes  # noqa: E402
 from server.token_crypto import decrypt_token  # noqa: E402
 
 # Configure logging
@@ -447,10 +448,85 @@ def admin_logout(admin_session: str | None = Cookie(default=None, alias=ADMIN_SE
     """Logout and clear session."""
     if admin_session and admin_session in _admin_sessions:
         _admin_sessions.discard(admin_session)
-    
+
     response = RedirectResponse("/admin/login", status_code=303)
     response.delete_cookie(ADMIN_SESSION_COOKIE)
     return response
+
+
+# =============================================================================
+# ADMIN TENANT PREVIEW (read-only impersonation)
+# =============================================================================
+
+class PreviewExchangeRequest(BaseModel):
+    code: str
+
+class PreviewExchangeResponse(BaseModel):
+    token: str
+    tenant_id: int
+    tenant_name: str
+
+
+@app.get("/admin/tenant/{tenant_id}/preview")
+async def admin_generate_preview_code(
+    tenant_id: int,
+    request: Request,
+    admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE),
+    db: Session = Depends(get_db),
+):
+    """Generate a one-time preview code and redirect to the dashboard."""
+    if not verify_admin_auth(request, admin_session):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    code = secrets.token_urlsafe(32)
+    redis_client = get_auth_redis_client()
+    try:
+        await redis_client.setex(
+            f"admin_preview:{code}",
+            120,  # 2 min TTL
+            json.dumps({"tenant_id": tenant_id, "tenant_name": tenant.name}),
+        )
+    finally:
+        await redis_client.aclose()
+
+    frontend_url = os.environ.get("FRONTEND_URL", "https://app.firepan.com")
+    return RedirectResponse(f"{frontend_url}/admin-preview?code={code}", status_code=302)
+
+
+@app.post("/admin/preview/exchange", response_model=PreviewExchangeResponse)
+@limiter.limit("10/minute")
+async def exchange_preview_code(request: Request, body: PreviewExchangeRequest):
+    """Exchange a one-time preview code for a short-lived read-only JWT."""
+    redis_client = get_auth_redis_client()
+    try:
+        key = f"admin_preview:{body.code}"
+        data_raw = await redis_client.getdel(key)  # atomic consume
+        if not data_raw:
+            raise HTTPException(status_code=400, detail="Invalid or expired preview code")
+    finally:
+        await redis_client.aclose()
+
+    data = json.loads(data_raw)
+    from server.auth_utils import create_access_token
+    token = create_access_token(
+        data={
+            "user_id": 0,
+            "tenant_id": data["tenant_id"],
+            "github_login": "admin_preview",
+            "admin_preview": True,
+        },
+        expires_delta=timedelta(hours=1),
+    )
+
+    return PreviewExchangeResponse(
+        token=token,
+        tenant_id=data["tenant_id"],
+        tenant_name=data["tenant_name"],
+    )
 
 
 # Dependency for database session
@@ -2933,6 +3009,7 @@ async def start_audit(
     request: Request,
     db: Session = Depends(get_db),
     tenant_id: int = Depends(get_current_tenant_id),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Start a new security audit (async, returns immediately).
@@ -5250,8 +5327,10 @@ async def list_github_repos(
 @app.post("/repositories", status_code=201, response_model=RepositoryResponse, tags=["repositories"])
 async def create_repository(
     body: RepositoryCreateRequest,
+    request: Request,
     tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Add a GitHub repository to the tenant's monitored repositories.
@@ -5386,8 +5465,10 @@ async def get_repository(
 @app.delete("/repositories/{repository_id}", status_code=204, tags=["repositories"])
 async def delete_repository(
     repository_id: int,
+    request: Request,
     tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Remove a repository from monitoring (soft delete).
@@ -5421,8 +5502,10 @@ async def delete_repository(
 @app.post("/repositories/{repo_id}/sync-team", tags=["teams"])
 async def sync_team_from_github(
     repo_id: int,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Sync team members from GitHub repository collaborators.
@@ -5662,6 +5745,7 @@ async def trigger_repository_scan(
     repository_id: int,
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Trigger a new scan for a repository.
@@ -7110,6 +7194,7 @@ async def run_full_surface_scan(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     tenant_id: int = Depends(get_current_tenant_id),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Run a full vulnerability surface scan (PAID: $0.50 via x402).
@@ -7399,7 +7484,9 @@ async def get_surface_scan(
 @app.delete("/surface/scans/{execution_id}")
 async def delete_surface_scan(
     execution_id: str,
-    db: Session = Depends(get_db)
+    request: Request,
+    db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Delete a surface scan from the database.

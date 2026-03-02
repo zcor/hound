@@ -137,21 +137,26 @@ def verify_admin_auth(request: Request, admin_session: str | None = Cookie(defau
     # If no admin key is set, allow access (local development)
     if not ADMIN_API_KEY:
         return True
-    
+
     # Check session cookie
     if admin_session and admin_session in _admin_sessions:
         return True
-    
+
+    # Check Starlette session marker (set by admin actions like preview_dashboard)
+    # This is secure: the session cookie is signed with HOUND_SECRET_KEY
+    if request.session.get("admin_preview_authorized"):
+        return True
+
     # Check API key in header
     api_key = request.headers.get("X-Admin-Key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     if api_key == ADMIN_API_KEY:
         return True
-    
+
     # Check API key in query param (for browser access)
     api_key = request.query_params.get("admin_key")
     if api_key == ADMIN_API_KEY:
         return True
-    
+
     return False
 
 
@@ -585,15 +590,10 @@ async def admin_generate_preview_code(
     db: Session = Depends(get_db),
 ):
     """Generate a one-time preview code and redirect to the dashboard."""
-    logger.info(
-        "PREVIEW: tenant_id=%s cookie=%s sessions=%s headers=%s",
-        tenant_id,
-        admin_session[:20] + "..." if admin_session else None,
-        len(_admin_sessions),
-        dict(request.cookies),
-    )
     if not verify_admin_auth(request, admin_session):
         raise HTTPException(status_code=403, detail="Admin access required")
+    # Consume the session marker so it can't be reused
+    request.session.pop("admin_preview_authorized", None)
 
     tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
     if not tenant:

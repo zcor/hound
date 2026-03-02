@@ -145,6 +145,10 @@ class TenantAdmin(ModelView, model=Tenant):
                 status_code=302,
             )
         tenant_id = pks[0]
+        # Mark session so the preview endpoint can verify admin auth.
+        # This is secure: Starlette session cookie is signed with HOUND_SECRET_KEY,
+        # and this action only runs inside an authenticated admin context.
+        request.session["admin_preview_authorized"] = True
         return RedirectResponse(f"/admin/tenant/{tenant_id}/preview", status_code=302)
 
 

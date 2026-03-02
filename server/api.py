@@ -49,7 +49,6 @@ import httpx  # noqa: E402
 import redis.asyncio as aioredis  # noqa: E402
 from fastapi import (  # noqa: E402
     BackgroundTasks,
-    Cookie,
     Depends,
     FastAPI,
     HTTPException,
@@ -119,40 +118,31 @@ def rate_limit_key_tenant_or_ip(request: Request) -> str:
 # Set HOUND_ADMIN_KEY environment variable to protect admin panel
 # If not set, admin panel is open (for local development)
 ADMIN_API_KEY = os.environ.get("HOUND_ADMIN_KEY", "")
-ADMIN_SESSION_COOKIE = "hound_admin_session"
-# Store valid session tokens (in production, use Redis)
-_admin_sessions: set = set()
 
 
-def generate_session_token() -> str:
-    """Generate a secure session token."""
-    return secrets.token_urlsafe(32)
-
-
-def verify_admin_auth(request: Request, admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)) -> bool:
+def verify_admin_auth(request: Request) -> bool:
     """
     Verify admin authentication.
-    Returns True if authenticated, raises HTTPException if not.
+    Returns True if authenticated, False if not.
     """
     # If no admin key is set, allow access (local development)
     if not ADMIN_API_KEY:
         return True
 
-    # Check session cookie
-    if admin_session and admin_session in _admin_sessions:
+    # Starlette session (set by SQLAdmin auth backend login)
+    if request.session.get("admin_logged_in"):
         return True
 
-    # Check Starlette session marker (set by admin actions like preview_dashboard)
-    # This is secure: the session cookie is signed with HOUND_SECRET_KEY
+    # Admin preview marker (set by preview_dashboard_action)
     if request.session.get("admin_preview_authorized"):
         return True
 
-    # Check API key in header
+    # API key in header (programmatic access)
     api_key = request.headers.get("X-Admin-Key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     if api_key == ADMIN_API_KEY:
         return True
 
-    # Check API key in query param (for browser access)
+    # API key in query param (browser access)
     api_key = request.query_params.get("admin_key")
     if api_key == ADMIN_API_KEY:
         return True
@@ -160,9 +150,9 @@ def verify_admin_auth(request: Request, admin_session: str | None = Cookie(defau
     return False
 
 
-def require_admin(request: Request, admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)):
+def require_admin(request: Request):
     """Dependency to require admin authentication."""
-    if not verify_admin_auth(request, admin_session):
+    if not verify_admin_auth(request):
         # For HTML pages, redirect to login
         if "text/html" in request.headers.get("accept", ""):
             raise HTTPException(status_code=303, detail="Redirect to login", headers={"Location": "/admin/login"})
@@ -324,142 +314,6 @@ async def redirect_auditsession(path: str):
 
 
 # =============================================================================
-# ADMIN LOGIN/LOGOUT ENDPOINTS
-# =============================================================================
-
-@app.get("/admin/login", response_class=HTMLResponse)
-def admin_login_page(request: Request, error: str | None = None):
-    """Admin login page."""
-    # If no admin key is set, redirect to home (no auth needed)
-    if not ADMIN_API_KEY:
-        return RedirectResponse("/admin/home", status_code=303)
-    
-    error_html = f'<div class="error">{error}</div>' if error else ''
-    
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Hound Admin Login</title>
-        <style>
-            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                min-height: 100vh;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }}
-            .login-box {{
-                background: #1e1e2e;
-                padding: 40px;
-                border-radius: 12px;
-                box-shadow: 0 10px 40px rgba(0,0,0,0.3);
-                width: 100%;
-                max-width: 400px;
-            }}
-            h1 {{
-                color: #30a14e;
-                margin-bottom: 8px;
-                font-size: 24px;
-            }}
-            p {{
-                color: #888;
-                margin-bottom: 24px;
-                font-size: 14px;
-            }}
-            .error {{
-                background: #da3633;
-                color: white;
-                padding: 12px;
-                border-radius: 6px;
-                margin-bottom: 16px;
-                font-size: 14px;
-            }}
-            input {{
-                width: 100%;
-                padding: 12px 16px;
-                border: 1px solid #30363d;
-                border-radius: 6px;
-                background: #0d1117;
-                color: #e6edf3;
-                font-size: 16px;
-                margin-bottom: 16px;
-            }}
-            input:focus {{
-                outline: none;
-                border-color: #30a14e;
-            }}
-            button {{
-                width: 100%;
-                padding: 12px;
-                background: #238636;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                font-size: 16px;
-                cursor: pointer;
-                transition: background 0.2s;
-            }}
-            button:hover {{
-                background: #2ea043;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="login-box">
-            <h1>🐕 Hound Admin</h1>
-            <p>Enter your admin key to access the dashboard</p>
-            {error_html}
-            <form method="POST" action="/admin/login">
-                <input type="password" name="admin_key" placeholder="Admin Key" required autofocus>
-                <button type="submit">Login</button>
-            </form>
-        </div>
-    </body>
-    </html>
-    """
-
-
-@app.post("/admin/login")
-async def admin_login(request: Request):
-    """Handle admin login."""
-    form = await request.form()
-    admin_key = form.get("admin_key", "")
-    
-    if admin_key == ADMIN_API_KEY:
-        # Create session token
-        session_token = generate_session_token()
-        _admin_sessions.add(session_token)
-        
-        # Set cookie and redirect to home
-        response = RedirectResponse("/admin/home", status_code=303)
-        response.set_cookie(
-            key=ADMIN_SESSION_COOKIE,
-            value=session_token,
-            httponly=True,
-            secure=False,  # Set to True when using HTTPS
-            samesite="lax",
-            max_age=86400 * 7  # 7 days
-        )
-        return response
-    
-    return RedirectResponse("/admin/login?error=Invalid+admin+key", status_code=303)
-
-
-@app.get("/admin/logout")
-def admin_logout(admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)):
-    """Logout and clear session."""
-    if admin_session and admin_session in _admin_sessions:
-        _admin_sessions.discard(admin_session)
-
-    response = RedirectResponse("/admin/login", status_code=303)
-    response.delete_cookie(ADMIN_SESSION_COOKIE)
-    return response
-
-
-# =============================================================================
 # ADMIN TENANT PREVIEW (read-only impersonation)
 # =============================================================================
 
@@ -586,11 +440,10 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)) -> U
 async def admin_generate_preview_code(
     tenant_id: int,
     request: Request,
-    admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE),
     db: Session = Depends(get_db),
 ):
     """Generate a one-time preview code and redirect to the dashboard."""
-    if not verify_admin_auth(request, admin_session):
+    if not verify_admin_auth(request):
         raise HTTPException(status_code=403, detail="Admin access required")
     # Consume the session marker so it can't be reused
     request.session.pop("admin_preview_authorized", None)
@@ -3117,17 +2970,26 @@ async def start_audit(
 
 
 @app.get("/audits/{session_id}/status", response_model=AuditStatusResponse)
-async def get_audit_status(session_id: str, db: Session = Depends(get_db)):
+async def get_audit_status(
+    session_id: str,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Get the current status of an audit.
-    
+
     Returns the current status, progress information, and findings count.
     """
     session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
-    
     if not session:
         raise HTTPException(status_code=404, detail="Audit session not found")
-    
+
+    # Verify tenant ownership via project
+    if session.project_id:
+        project = db.query(Project).filter(Project.id == session.project_id).first()
+        if not project or project.tenant_id != tenant_id:
+            raise HTTPException(status_code=404, detail="Audit session not found")
+
     # Count findings
     findings_count = 0
     if session.project_id:
@@ -3178,7 +3040,8 @@ class AutoFixPRResponse(BaseModel):
 async def create_auto_fix_pr(
     session_id: str,
     request: AutoFixPRRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
 ):
     """
     Create a PR with automatic fixes for detected security issues.
@@ -3264,7 +3127,10 @@ async def create_auto_fix_pr(
 
 
 @app.post("/github/create-fix-pr", response_model=AutoFixPRResponse)
-async def create_fix_pr_standalone(request: AutoFixPRRequest):
+async def create_fix_pr_standalone(
+    request: AutoFixPRRequest,
+    _: None = Depends(require_admin),
+):
     """
     Create a fix PR without an audit session (standalone).
     
@@ -3335,7 +3201,11 @@ class GraphBuildResponse(BaseModel):
 
 
 @app.post("/graphs/build", response_model=GraphBuildResponse)
-async def build_graphs(request: GraphBuildRequest, db: Session = Depends(get_db)):
+async def build_graphs(
+    request: GraphBuildRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+):
     """
     Build knowledge graphs for a repository (async, returns immediately).
     
@@ -3400,12 +3270,21 @@ async def build_graphs(request: GraphBuildRequest, db: Session = Depends(get_db)
 
 
 @app.get("/projects/{project_id}/graphs")
-async def get_project_graphs(project_id: int, db: Session = Depends(get_db)):
+async def get_project_graphs(
+    project_id: int,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Get all graphs for a project.
-    
+
     Returns a list of graphs with their metadata (excludes full graph data).
     """
+    # Verify project belongs to tenant
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project or project.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Project not found")
+
     graphs = db.query(Graph).filter(Graph.project_id == project_id).all()
     
     return [
@@ -3423,13 +3302,19 @@ async def get_project_graphs(project_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/graphs/{graph_id}")
-async def get_graph(graph_id: int, db: Session = Depends(get_db)):
+async def get_graph(
+    graph_id: int,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Get a specific graph with full data.
     """
     graph = db.query(Graph).filter(Graph.id == graph_id).first()
-    
     if not graph:
+        raise HTTPException(status_code=404, detail="Graph not found")
+    project = db.query(Project).filter(Project.id == graph.project_id).first()
+    if not project or project.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Graph not found")
     
     return {
@@ -3467,7 +3352,11 @@ class SyncGraphBuildResponse(BaseModel):
 
 
 @app.post("/graphs/build-sync", response_model=SyncGraphBuildResponse)
-async def build_graphs_sync(request: SyncGraphBuildRequest, db: Session = Depends(get_db)):
+async def build_graphs_sync(
+    request: SyncGraphBuildRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+):
     """
     Build knowledge graphs SYNCHRONOUSLY (blocking call).
     
@@ -3647,7 +3536,11 @@ class SyncAuditResponse(BaseModel):
 
 
 @app.post("/audits/run-sync", response_model=SyncAuditResponse)
-async def run_audit_sync(request: SyncAuditRequest, db: Session = Depends(get_db)):
+async def run_audit_sync(
+    request: SyncAuditRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+):
     """
     Run a security audit SYNCHRONOUSLY (blocking call).
     
@@ -4274,17 +4167,27 @@ async def list_projects(
 
 
 @app.post("/projects", response_model=ProjectResponse)
-async def create_project(project_data: ProjectCreate, db: Session = Depends(get_db)):
+async def create_project(
+    project_data: ProjectCreate,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+):
     """
     Create a new project for manual git URLs or source paths.
 
     Accepts either git_url or source_path. Creates the project using
     the ProjectManager and stores it in the database.
-    
+
     Note: If git_url is provided without source_path, the repository
     should be cloned first. This is currently a placeholder for future
     git clone functionality.
     """
+    # Path traversal validation
+    if ".." in project_data.name:
+        raise HTTPException(status_code=400, detail="Invalid project name: path traversal not allowed")
+    if project_data.source_path and ".." in project_data.source_path:
+        raise HTTPException(status_code=400, detail="Invalid source_path: path traversal not allowed")
+
     # Validate that at least one source is provided
     if not project_data.git_url and not project_data.source_path:
         raise HTTPException(
@@ -4367,7 +4270,11 @@ async def create_project(project_data: ProjectCreate, db: Session = Depends(get_
 
 
 @app.get("/projects/{project_id}/sessions", response_model=list[SessionResponse])
-async def list_project_sessions(project_id: int, db: Session = Depends(get_db)):
+async def list_project_sessions(
+    project_id: int,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     List all audit sessions for a project.
 
@@ -4379,9 +4286,9 @@ async def list_project_sessions(project_id: int, db: Session = Depends(get_db)):
     - Coverage information
     - Number of investigations
     """
-    # Verify project exists
+    # Verify project exists and belongs to tenant
     project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
+    if not project or project.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Query sessions for the project
@@ -4414,7 +4321,11 @@ async def list_project_sessions(project_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/sessions/{session_id}/graph")
-async def get_session_graph(session_id: str, db: Session = Depends(get_db)):
+async def get_session_graph(
+    session_id: str,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Return the system_graph JSON for visualization.
 
@@ -4428,9 +4339,9 @@ async def get_session_graph(session_id: str, db: Session = Depends(get_db)):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Get the project's graphs
+    # Get the project's graphs and verify tenant ownership
     project = db.query(Project).filter(Project.id == session.project_id).first()
-    if not project:
+    if not project or project.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Project not found for session")
 
     # Try to get SystemArchitecture graph from database
@@ -4522,7 +4433,11 @@ async def get_project_hypotheses(
 
 
 @app.get("/sessions/{session_id}/findings", response_model=list[FindingResponse])
-async def get_session_findings(session_id: str, db: Session = Depends(get_db)):
+async def get_session_findings(
+    session_id: str,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Return the list of confirmed hypotheses (findings).
 
@@ -4534,6 +4449,12 @@ async def get_session_findings(session_id: str, db: Session = Depends(get_db)):
 
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # Verify tenant ownership via project
+    if session.project_id:
+        project = db.query(Project).filter(Project.id == session.project_id).first()
+        if not project or project.tenant_id != tenant_id:
+            raise HTTPException(status_code=404, detail="Session not found")
 
     # Get confirmed hypotheses for the project
     hypotheses = (
@@ -4579,7 +4500,10 @@ class FindingStatusUpdate(BaseModel):
 
 @app.post("/findings/{finding_id}/status")
 async def update_finding_status(
-    finding_id: int, status_update: FindingStatusUpdate, db: Session = Depends(get_db)
+    finding_id: int,
+    status_update: FindingStatusUpdate,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
 ):
     """
     Update the status of a finding (hypothesis) by database ID.
@@ -4617,7 +4541,10 @@ async def update_finding_status(
 
 @app.put("/api/findings/{finding_id}/status")
 async def update_finding_status_by_hyp_id(
-    finding_id: str, status_update: FindingStatusUpdate, db: Session = Depends(get_db)
+    finding_id: str,
+    status_update: FindingStatusUpdate,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
 ):
     """
     Update the status of a finding (hypothesis) by hypothesis_id string.
@@ -4875,12 +4802,18 @@ async def get_current_user_profile(
 
 
 @app.get("/organizations/{org_id}", response_model=OrganizationResponse)
-async def get_organization(org_id: int, db: Session = Depends(get_db)):
+async def get_organization(
+    org_id: int,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Get organization details by ID.
-    
+
     Returns organization metadata including GitHub account information.
     """
+    if org_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Organization not found")
     org = db.query(Tenant).filter(Tenant.id == org_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
@@ -4898,14 +4831,20 @@ async def get_organization(org_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/organizations/{org_id}/members", response_model=list[OrganizationMemberResponse])
-async def list_organization_members(org_id: int, db: Session = Depends(get_db)):
+async def list_organization_members(
+    org_id: int,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     List members of an organization.
-    
+
     Note: In the current GitHub App installation model, we don't track individual members.
     This returns the organization itself as a single member. Future enhancement could
     integrate with GitHub API to fetch actual org members.
     """
+    if org_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Organization not found")
     org = db.query(Tenant).filter(Tenant.id == org_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
@@ -7513,7 +7452,8 @@ async def delete_surface_scan(
 
 @app.get("/surface/stats")
 async def get_surface_scan_stats(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
 ):
     """
     Get statistics for surface scans - useful for admin dashboard.

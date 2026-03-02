@@ -11,6 +11,7 @@ from pathlib import Path
 
 from markupsafe import Markup
 from sqladmin import Admin, BaseView, ModelView, action, expose
+from sqladmin.authentication import AuthenticationBackend
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
 
@@ -2001,27 +2002,67 @@ class ScanFindingsView(BaseView):
             db.close()
 
 
+class AdminAuth(AuthenticationBackend):
+    """SQLAdmin auth backend using HOUND_ADMIN_KEY + Starlette signed sessions."""
+
+    def __init__(self, secret_key: str) -> None:
+        # Do NOT call super().__init__() — that adds a second SessionMiddleware.
+        # The outer FastAPI app already has one (api.py:197) with the same secret.
+        # Sharing the same cookie lets admin_preview_authorized flow between apps.
+        self.middlewares = []  # Empty — reuse outer SessionMiddleware
+
+    async def login(self, request: Request) -> bool:
+        form = await request.form()
+        # SQLAdmin login template posts "username" and "password" fields
+        admin_key = form.get("password", "") or form.get("username", "")
+        expected = os.environ.get("HOUND_ADMIN_KEY", "")
+        if expected and admin_key == expected:
+            request.session["admin_logged_in"] = True
+            return True
+        return False
+
+    async def logout(self, request: Request) -> bool:
+        request.session.clear()
+        return True
+
+    async def authenticate(self, request: Request) -> bool:
+        if not os.environ.get("HOUND_ADMIN_KEY", ""):
+            return True  # Dev mode — no key configured
+        return request.session.get("admin_logged_in", False)
+
+
 def setup_admin(app, engine):
     """
     Set up SQLAdmin with all model views.
-    
+
     Args:
         app: FastAPI application instance
         engine: SQLAlchemy engine instance
-        
+
     Returns:
         Admin instance
     """
-    
+
     # Get base URL from environment or use default
-    # This is important for port forwarding scenarios (Codespaces, ngrok, etc.)
     base_url = os.environ.get("ADMIN_BASE_URL", "/admin")
-    
+    admin_key = os.environ.get("HOUND_ADMIN_KEY", "")
+    secret = os.environ.get("HOUND_SECRET_KEY", "")
+
+    # Fail closed: if admin auth is enabled, require a signing secret
+    if admin_key and not secret:
+        raise RuntimeError(
+            "HOUND_SECRET_KEY is required when HOUND_ADMIN_KEY is set. "
+            "Admin panel cannot start without a session signing secret."
+        )
+
+    auth_backend = AdminAuth(secret_key=secret) if admin_key else None
+
     admin = Admin(
         app,
         engine,
         title="Firepan Admin",
         base_url=base_url,
+        authentication_backend=auth_backend,
     )
     
     # Register all admin views

@@ -90,6 +90,24 @@ def sample_tenant(test_db):
     return tenant
 
 
+def auth_headers(tenant):
+    """Create JWT auth headers for a tenant."""
+    token = create_access_token({
+        "tenant_id": tenant.id,
+        "user_id": tenant.id,
+        "github_login": "test",
+    })
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def admin_key(monkeypatch):
+    """Enable admin auth and return the key."""
+    import server.api as api_module
+    monkeypatch.setattr(api_module, "ADMIN_API_KEY", "test-admin-key")
+    return "test-admin-key"
+
+
 @pytest.fixture
 def sample_project(test_db, sample_tenant):
     """Create a sample project for testing."""
@@ -200,16 +218,16 @@ def test_health_check(client):
 
 def test_list_projects_empty(client, sample_tenant):
     """Test listing projects when none exist."""
-    response = client.get("/projects")
+    response = client.get("/projects", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert isinstance(data, list)
     assert len(data) == 0
 
 
-def test_list_projects_with_data(client, sample_project):
+def test_list_projects_with_data(client, sample_project, sample_tenant):
     """Test listing projects with existing data."""
-    response = client.get("/projects")
+    response = client.get("/projects", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert isinstance(data, list)
@@ -222,18 +240,18 @@ def test_list_projects_with_data(client, sample_project):
     assert "confirmed_count" in data[0]
 
 
-def test_list_project_sessions_empty(client, sample_project):
+def test_list_project_sessions_empty(client, sample_project, sample_tenant):
     """Test listing sessions for a project with no sessions."""
-    response = client.get(f"/projects/{sample_project.id}/sessions")
+    response = client.get(f"/projects/{sample_project.id}/sessions", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert isinstance(data, list)
     assert len(data) == 0
 
 
-def test_list_project_sessions_with_data(client, sample_project, sample_session):
+def test_list_project_sessions_with_data(client, sample_project, sample_session, sample_tenant):
     """Test listing sessions for a project with existing sessions."""
-    response = client.get(f"/projects/{sample_project.id}/sessions")
+    response = client.get(f"/projects/{sample_project.id}/sessions", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert isinstance(data, list)
@@ -248,14 +266,14 @@ def test_list_project_sessions_with_data(client, sample_project, sample_session)
 
 def test_list_project_sessions_not_found(client, sample_tenant):
     """Test listing sessions for a non-existent project."""
-    response = client.get("/projects/999/sessions")
+    response = client.get("/projects/999/sessions", headers=auth_headers(sample_tenant))
     assert response.status_code == 404
     assert "not found" in response.json()["detail"].lower()
 
 
-def test_get_session_graph(client, sample_session, sample_graph):
+def test_get_session_graph(client, sample_session, sample_graph, sample_tenant):
     """Test getting graph data for a session."""
-    response = client.get(f"/sessions/{sample_session.session_id}/graph")
+    response = client.get(f"/sessions/{sample_session.session_id}/graph", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert "name" in data
@@ -268,22 +286,22 @@ def test_get_session_graph(client, sample_session, sample_graph):
 
 def test_get_session_graph_not_found(client, sample_tenant):
     """Test getting graph for a non-existent session."""
-    response = client.get("/sessions/nonexistent_session/graph")
+    response = client.get("/sessions/nonexistent_session/graph", headers=auth_headers(sample_tenant))
     assert response.status_code == 404
 
 
-def test_get_session_findings_empty(client, sample_session):
+def test_get_session_findings_empty(client, sample_session, sample_tenant):
     """Test getting findings for a session with no confirmed hypotheses."""
-    response = client.get(f"/sessions/{sample_session.session_id}/findings")
+    response = client.get(f"/sessions/{sample_session.session_id}/findings", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert isinstance(data, list)
     assert len(data) == 0
 
 
-def test_get_session_findings_with_data(client, sample_session, sample_hypothesis):
+def test_get_session_findings_with_data(client, sample_session, sample_hypothesis, sample_tenant):
     """Test getting findings for a session with confirmed hypotheses."""
-    response = client.get(f"/sessions/{sample_session.session_id}/findings")
+    response = client.get(f"/sessions/{sample_session.session_id}/findings", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert isinstance(data, list)
@@ -298,7 +316,7 @@ def test_get_session_findings_with_data(client, sample_session, sample_hypothesi
 
 def test_get_session_findings_not_found(client, sample_tenant):
     """Test getting findings for a non-existent session."""
-    response = client.get("/sessions/nonexistent_session/findings")
+    response = client.get("/sessions/nonexistent_session/findings", headers=auth_headers(sample_tenant))
     assert response.status_code == 404
 
 
@@ -337,15 +355,15 @@ def test_websocket_connection(client, sample_session):
         ({"name": "invalid_project", "description": "Missing source"}, 400),
     ],
 )
-def test_create_project_validation(client, sample_tenant, project_data, expected_status):
+def test_create_project_validation(client, sample_tenant, admin_key, project_data, expected_status):
     """Test project creation with various input validations."""
-    response = client.post("/projects", json=project_data)
+    response = client.post("/projects", json=project_data, headers={"X-Admin-Key": admin_key})
     assert response.status_code == expected_status
 
 
-def test_projects_with_stats(client, sample_project, sample_graph, sample_session, sample_hypothesis):
+def test_projects_with_stats(client, sample_project, sample_graph, sample_session, sample_hypothesis, sample_tenant):
     """Test that project list includes correct statistics."""
-    response = client.get("/projects")
+    response = client.get("/projects", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert len(data) == 1
@@ -364,7 +382,7 @@ def test_projects_with_stats(client, sample_project, sample_graph, sample_sessio
 def test_audit_start_endpoint_validation(client, sample_tenant):
     """Test that /audits/start requires repo_url."""
     # Missing repo_url should fail validation
-    response = client.post("/audits/start", json={})
+    response = client.post("/audits/start", json={}, headers=auth_headers(sample_tenant))
     assert response.status_code == 422  # Validation error
 
 
@@ -372,19 +390,19 @@ def test_audit_start_worker_import(client, sample_tenant, monkeypatch):
     """Test /audits/start handles worker import gracefully."""
     # Mock the Celery task to avoid actual execution
     from unittest.mock import MagicMock, patch
-    
+
     mock_task = MagicMock()
     mock_task.id = "mock_task_id_12345"
-    
+
     with patch("worker.tasks.execute_audit_task") as mock_execute:
         mock_execute.delay.return_value = mock_task
-        
+
         response = client.post(
             "/audits/start",
             json={
                 "repo_url": "https://github.com/test/repo",
-                "tenant_id": sample_tenant.id,
             },
+            headers=auth_headers(sample_tenant),
         )
         
         assert response.status_code == 200
@@ -403,13 +421,13 @@ def test_audit_start_worker_import(client, sample_tenant, monkeypatch):
 
 def test_audit_status_not_found(client, sample_tenant):
     """Test audit status for non-existent session."""
-    response = client.get("/audits/nonexistent_session/status")
+    response = client.get("/audits/nonexistent_session/status", headers=auth_headers(sample_tenant))
     assert response.status_code == 404
 
 
-def test_audit_status_found(client, sample_session):
+def test_audit_status_found(client, sample_session, sample_tenant):
     """Test audit status for existing session."""
-    response = client.get(f"/audits/{sample_session.session_id}/status")
+    response = client.get(f"/audits/{sample_session.session_id}/status", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["session_id"] == sample_session.session_id
@@ -515,7 +533,7 @@ def test_get_current_user_not_found(client):
 
 def test_get_organization(client, sample_tenant):
     """Test getting organization details."""
-    response = client.get(f"/organizations/{sample_tenant.id}")
+    response = client.get(f"/organizations/{sample_tenant.id}", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["id"] == sample_tenant.id
@@ -525,15 +543,15 @@ def test_get_organization(client, sample_tenant):
     assert "updated_at" in data
 
 
-def test_get_organization_not_found(client):
+def test_get_organization_not_found(client, sample_tenant):
     """Test getting non-existent organization."""
-    response = client.get("/organizations/999")
+    response = client.get("/organizations/999", headers=auth_headers(sample_tenant))
     assert response.status_code == 404
 
 
 def test_list_organization_members(client, sample_tenant):
     """Test listing organization members."""
-    response = client.get(f"/organizations/{sample_tenant.id}/members")
+    response = client.get(f"/organizations/{sample_tenant.id}/members", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert isinstance(data, list)
@@ -542,15 +560,15 @@ def test_list_organization_members(client, sample_tenant):
     assert data[0]["role"] == "owner"
 
 
-def test_list_organization_members_not_found(client):
+def test_list_organization_members_not_found(client, sample_tenant):
     """Test listing members for non-existent organization."""
-    response = client.get("/organizations/999/members")
+    response = client.get("/organizations/999/members", headers=auth_headers(sample_tenant))
     assert response.status_code == 404
 
 
 def test_get_current_subscription(client, sample_tenant):
     """Test getting current subscription."""
-    response = client.get(f"/subscriptions/current?tenant_id={sample_tenant.id}")
+    response = client.get("/subscriptions/current", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["tenant_id"] == sample_tenant.id
@@ -559,9 +577,16 @@ def test_get_current_subscription(client, sample_tenant):
     assert "status" in data
 
 
-def test_get_current_subscription_not_found(client):
+def test_get_current_subscription_not_found(client, test_db):
     """Test getting subscription for non-existent tenant."""
-    response = client.get("/subscriptions/current?tenant_id=999")
+    # Create a tenant so JWT is valid, but it has no subscription data matching tenant 999
+    ghost_tenant = Tenant(name="ghost_tenant")
+    test_db.add(ghost_tenant)
+    test_db.commit()
+    test_db.refresh(ghost_tenant)
+    # Use a JWT with a non-existent tenant_id
+    token = create_access_token({"tenant_id": 999, "user_id": 999, "github_login": "ghost"})
+    response = client.get("/subscriptions/current", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 404
 
 
@@ -570,7 +595,7 @@ def test_get_current_month_usage(client, sample_tenant, test_db):
     from datetime import datetime, timezone
 
     from database.models import ScanExecution, TokenUsageLog
-    
+
     # Create some usage data
     token_log = TokenUsageLog(
         tenant_id=sample_tenant.id,
@@ -582,7 +607,7 @@ def test_get_current_month_usage(client, sample_tenant, test_db):
         created_at=datetime.now(timezone.utc),
     )
     test_db.add(token_log)
-    
+
     scan = ScanExecution(
         execution_id="scan_test_123",
         tenant_id=sample_tenant.id,
@@ -592,8 +617,8 @@ def test_get_current_month_usage(client, sample_tenant, test_db):
     )
     test_db.add(scan)
     test_db.commit()
-    
-    response = client.get(f"/usage/current-month?tenant_id={sample_tenant.id}")
+
+    response = client.get("/usage/current-month", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["tenant_id"] == sample_tenant.id
@@ -605,7 +630,7 @@ def test_get_current_month_usage(client, sample_tenant, test_db):
 
 def test_list_repositories_empty(client, sample_tenant):
     """Test listing repositories when none exist."""
-    response = client.get(f"/repositories?tenant_id={sample_tenant.id}")
+    response = client.get("/repositories", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert "repositories" in data
@@ -614,9 +639,9 @@ def test_list_repositories_empty(client, sample_tenant):
     assert len(data["repositories"]) == 0
 
 
-def test_list_repositories_with_data(client, sample_project):
+def test_list_repositories_with_data(client, sample_project, sample_tenant):
     """Test listing repositories with existing projects."""
-    response = client.get(f"/repositories?tenant_id={sample_project.tenant_id}")
+    response = client.get("/repositories", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["total"] >= 1
@@ -631,7 +656,7 @@ def test_list_repositories_pagination(client, sample_tenant, test_db):
     from datetime import datetime, timezone
 
     from database.models import Project
-    
+
     # Create multiple projects
     for i in range(5):
         project = Project(
@@ -643,9 +668,9 @@ def test_list_repositories_pagination(client, sample_tenant, test_db):
         )
         test_db.add(project)
     test_db.commit()
-    
+
     # Test first page
-    response = client.get(f"/repositories?tenant_id={sample_tenant.id}&page=1&page_size=2")
+    response = client.get("/repositories?page=1&page_size=2", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["page"] == 1
@@ -654,18 +679,27 @@ def test_list_repositories_pagination(client, sample_tenant, test_db):
     assert data["total"] >= 5
 
 
-def test_list_repositories_search(client, sample_project):
+def test_list_repositories_search(client, sample_project, sample_tenant):
     """Test repository search functionality."""
-    response = client.get(f"/repositories?tenant_id={sample_project.tenant_id}&search=test")
+    response = client.get("/repositories?search=test", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["total"] >= 1
     assert any("test" in repo["name"].lower() for repo in data["repositories"])
 
 
-def test_trigger_repository_scan(client, sample_project):
+def test_trigger_repository_scan(client, sample_project, sample_tenant):
     """Test triggering a scan for a repository."""
-    response = client.post(f"/repositories/{sample_project.id}/scan")
+    from unittest.mock import MagicMock, patch
+
+    def fake_require(action):
+        async def _check(request):
+            return {"uses_credit": False}
+        return _check
+
+    with patch("server.tier_enforcement.require_plan_allowance", fake_require):
+        with patch.dict("sys.modules", {"worker.tasks": MagicMock()}):
+            response = client.post(f"/repositories/{sample_project.id}/scan", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert "execution_id" in data
@@ -673,15 +707,23 @@ def test_trigger_repository_scan(client, sample_project):
     assert data["status"] == "pending"
 
 
-def test_trigger_repository_scan_not_found(client):
+def test_trigger_repository_scan_not_found(client, sample_tenant):
     """Test triggering scan for non-existent repository."""
-    response = client.post("/repositories/999/scan")
+    from unittest.mock import patch
+
+    def fake_require(action):
+        async def _check(request):
+            return {"uses_credit": False}
+        return _check
+
+    with patch("server.tier_enforcement.require_plan_allowance", fake_require):
+        response = client.post("/repositories/999/scan", headers=auth_headers(sample_tenant))
     assert response.status_code == 404
 
 
-def test_list_repository_scans_empty(client, sample_project):
+def test_list_repository_scans_empty(client, sample_project, sample_tenant):
     """Test listing scans for repository with no scans."""
-    response = client.get(f"/repositories/{sample_project.id}/scans")
+    response = client.get(f"/repositories/{sample_project.id}/scans", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["repository_id"] == sample_project.id
@@ -689,12 +731,12 @@ def test_list_repository_scans_empty(client, sample_project):
     assert len(data["scans"]) == 0
 
 
-def test_list_repository_scans_with_data(client, sample_project, test_db):
+def test_list_repository_scans_with_data(client, sample_project, sample_tenant, test_db):
     """Test listing scans for repository with existing scans."""
     from datetime import datetime, timezone
 
     from database.models import ScanExecution
-    
+
     # Create scan executions
     scan = ScanExecution(
         execution_id="scan_test_456",
@@ -711,8 +753,8 @@ def test_list_repository_scans_with_data(client, sample_project, test_db):
     )
     test_db.add(scan)
     test_db.commit()
-    
-    response = client.get(f"/repositories/{sample_project.id}/scans")
+
+    response = client.get(f"/repositories/{sample_project.id}/scans", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["total"] >= 1
@@ -722,15 +764,15 @@ def test_list_repository_scans_with_data(client, sample_project, test_db):
     assert data["scans"][0]["findings_count"] == 1
 
 
-def test_list_repository_scans_not_found(client):
+def test_list_repository_scans_not_found(client, sample_tenant):
     """Test listing scans for non-existent repository."""
-    response = client.get("/repositories/999/scans")
+    response = client.get("/repositories/999/scans", headers=auth_headers(sample_tenant))
     assert response.status_code == 404
 
 
 def test_list_all_findings_empty(client, sample_tenant):
     """Test listing all findings when none exist."""
-    response = client.get(f"/findings?tenant_id={sample_tenant.id}")
+    response = client.get("/findings", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert "findings" in data
@@ -738,10 +780,9 @@ def test_list_all_findings_empty(client, sample_tenant):
     assert len(data["findings"]) == 0
 
 
-def test_list_all_findings_with_data(client, sample_hypothesis):
+def test_list_all_findings_with_data(client, sample_hypothesis, sample_tenant):
     """Test listing all findings with existing hypotheses."""
-    project = sample_hypothesis.project
-    response = client.get(f"/findings?tenant_id={project.tenant_id}")
+    response = client.get("/findings", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["total"] >= 1
@@ -749,30 +790,27 @@ def test_list_all_findings_with_data(client, sample_hypothesis):
     assert data["findings"][0]["hypothesis_id"] == sample_hypothesis.hypothesis_id
 
 
-def test_list_all_findings_filter_severity(client, sample_hypothesis):
+def test_list_all_findings_filter_severity(client, sample_hypothesis, sample_tenant):
     """Test filtering findings by severity."""
-    project = sample_hypothesis.project
-    response = client.get(f"/findings?tenant_id={project.tenant_id}&severity=high")
+    response = client.get("/findings?severity=high", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     if data["total"] > 0:
         assert all(f["severity"] == "high" for f in data["findings"])
 
 
-def test_list_all_findings_filter_status(client, sample_hypothesis):
+def test_list_all_findings_filter_status(client, sample_hypothesis, sample_tenant):
     """Test filtering findings by status."""
-    project = sample_hypothesis.project
-    response = client.get(f"/findings?tenant_id={project.tenant_id}&status=confirmed")
+    response = client.get("/findings?status=confirmed", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     if data["total"] > 0:
         assert all(f["status"] == "confirmed" for f in data["findings"])
 
 
-def test_list_all_findings_filter_repository(client, sample_hypothesis):
+def test_list_all_findings_filter_repository(client, sample_hypothesis, sample_tenant, sample_project):
     """Test filtering findings by repository."""
-    project = sample_hypothesis.project
-    response = client.get(f"/findings?tenant_id={project.tenant_id}&repository_id={project.id}")
+    response = client.get(f"/findings?repository_id={sample_project.id}", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["total"] >= 1
@@ -783,7 +821,7 @@ def test_list_all_findings_pagination(client, sample_tenant, sample_project, tes
     from datetime import datetime, timezone
 
     from database.models import Hypothesis
-    
+
     # Create multiple hypotheses
     for i in range(5):
         hyp = Hypothesis(
@@ -800,8 +838,8 @@ def test_list_all_findings_pagination(client, sample_tenant, sample_project, tes
         )
         test_db.add(hyp)
     test_db.commit()
-    
-    response = client.get(f"/findings?tenant_id={sample_tenant.id}&page=1&page_size=2")
+
+    response = client.get("/findings?page=1&page_size=2", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["page"] == 1
@@ -811,7 +849,7 @@ def test_list_all_findings_pagination(client, sample_tenant, sample_project, tes
 
 def test_get_findings_statistics_empty(client, sample_tenant):
     """Test getting findings statistics when none exist."""
-    response = client.get(f"/findings/stats?tenant_id={sample_tenant.id}")
+    response = client.get("/findings/stats", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 0
@@ -820,10 +858,9 @@ def test_get_findings_statistics_empty(client, sample_tenant):
     assert "by_repository" in data
 
 
-def test_get_findings_statistics_with_data(client, sample_hypothesis):
+def test_get_findings_statistics_with_data(client, sample_hypothesis, sample_tenant):
     """Test getting findings statistics with existing data."""
-    project = sample_hypothesis.project
-    response = client.get(f"/findings/stats?tenant_id={project.tenant_id}")
+    response = client.get("/findings/stats", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["total"] >= 1
@@ -956,7 +993,7 @@ def test_trigger_scan_dispatch_failure_refunds_credit(client, sample_project, te
     mock_refund.assert_called_once()
 
 
-def test_findings_count_uses_surface_scan(client, sample_project, test_db):
+def test_findings_count_uses_surface_scan(client, sample_project, sample_tenant, test_db):
     """Test that findings_count comes from latest completed surface scan."""
     from datetime import datetime, timezone
 
@@ -979,7 +1016,7 @@ def test_findings_count_uses_surface_scan(client, sample_project, test_db):
     test_db.add(scan)
     test_db.commit()
 
-    response = client.get(f"/repositories?tenant_id={sample_project.tenant_id}")
+    response = client.get("/repositories", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["total"] >= 1
@@ -987,7 +1024,7 @@ def test_findings_count_uses_surface_scan(client, sample_project, test_db):
     assert repo["findings_count"] == 3
 
 
-def test_findings_count_uses_latest_scan_only(client, sample_project, test_db):
+def test_findings_count_uses_latest_scan_only(client, sample_project, sample_tenant, test_db):
     """Test that findings_count uses latest scan, not cumulative across scans."""
     from datetime import datetime, timedelta, timezone
 
@@ -1024,7 +1061,7 @@ def test_findings_count_uses_latest_scan_only(client, sample_project, test_db):
     test_db.add(new_scan)
     test_db.commit()
 
-    response = client.get(f"/repositories?tenant_id={sample_project.tenant_id}")
+    response = client.get("/repositories", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     repo = next(r for r in data["repositories"] if r["id"] == sample_project.id)
@@ -1032,7 +1069,7 @@ def test_findings_count_uses_latest_scan_only(client, sample_project, test_db):
     assert repo["findings_count"] == 2
 
 
-def test_findings_count_single_repo(client, sample_project, test_db):
+def test_findings_count_single_repo(client, sample_project, sample_tenant, test_db):
     """Test findings_count on the single repository detail endpoint."""
     from datetime import datetime, timezone
 
@@ -1053,7 +1090,7 @@ def test_findings_count_single_repo(client, sample_project, test_db):
     test_db.add(scan)
     test_db.commit()
 
-    response = client.get(f"/repositories/{sample_project.id}?tenant_id={sample_project.tenant_id}")
+    response = client.get(f"/repositories/{sample_project.id}", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["findings_count"] == 2
@@ -1081,7 +1118,7 @@ def test_findings_stats_includes_surface_scans(client, sample_tenant, sample_pro
     test_db.add(scan)
     test_db.commit()
 
-    response = client.get(f"/findings/stats?tenant_id={sample_tenant.id}")
+    response = client.get("/findings/stats", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     assert data["total"] >= 3
@@ -1213,7 +1250,7 @@ def test_findings_stats_surface_scans_dont_affect_confirmed(
     test_db.add(scan)
     test_db.commit()
 
-    response = client.get(f"/findings/stats?tenant_id={sample_tenant.id}")
+    response = client.get("/findings/stats", headers=auth_headers(sample_tenant))
     assert response.status_code == 200
     data = response.json()
     # confirmed count should only reflect the sample_hypothesis (1), not surface scans

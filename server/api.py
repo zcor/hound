@@ -467,68 +467,6 @@ class PreviewExchangeResponse(BaseModel):
     tenant_name: str
 
 
-@app.get("/admin/tenant/{tenant_id}/preview")
-async def admin_generate_preview_code(
-    tenant_id: int,
-    request: Request,
-    admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE),
-    db: Session = Depends(get_db),
-):
-    """Generate a one-time preview code and redirect to the dashboard."""
-    if not verify_admin_auth(request, admin_session):
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
-
-    code = secrets.token_urlsafe(32)
-    redis_client = get_auth_redis_client()
-    try:
-        await redis_client.setex(
-            f"admin_preview:{code}",
-            120,  # 2 min TTL
-            json.dumps({"tenant_id": tenant_id, "tenant_name": tenant.name}),
-        )
-    finally:
-        await redis_client.aclose()
-
-    frontend_url = os.environ.get("FRONTEND_URL", "https://app.firepan.com")
-    return RedirectResponse(f"{frontend_url}/admin-preview?code={code}", status_code=302)
-
-
-@app.post("/admin/preview/exchange", response_model=PreviewExchangeResponse)
-@limiter.limit("10/minute")
-async def exchange_preview_code(request: Request, body: PreviewExchangeRequest):
-    """Exchange a one-time preview code for a short-lived read-only JWT."""
-    redis_client = get_auth_redis_client()
-    try:
-        key = f"admin_preview:{body.code}"
-        data_raw = await redis_client.getdel(key)  # atomic consume
-        if not data_raw:
-            raise HTTPException(status_code=400, detail="Invalid or expired preview code")
-    finally:
-        await redis_client.aclose()
-
-    data = json.loads(data_raw)
-    from server.auth_utils import create_access_token
-    token = create_access_token(
-        data={
-            "user_id": 0,
-            "tenant_id": data["tenant_id"],
-            "github_login": "admin_preview",
-            "admin_preview": True,
-        },
-        expires_delta=timedelta(hours=1),
-    )
-
-    return PreviewExchangeResponse(
-        token=token,
-        tenant_id=data["tenant_id"],
-        tenant_name=data["tenant_name"],
-    )
-
-
 # Dependency for database session
 def get_db():
     """Get database session."""
@@ -634,6 +572,71 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)) -> U
     except ValueError as e:
         raise HTTPException(status_code=401, detail=f"Invalid or expired token: {str(e)}")
 
+
+# =============================================================================
+# ADMIN TENANT PREVIEW — endpoints (after get_db is defined)
+# =============================================================================
+
+@app.get("/admin/tenant/{tenant_id}/preview")
+async def admin_generate_preview_code(
+    tenant_id: int,
+    request: Request,
+    admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE),
+    db: Session = Depends(get_db),
+):
+    """Generate a one-time preview code and redirect to the dashboard."""
+    if not verify_admin_auth(request, admin_session):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    code = secrets.token_urlsafe(32)
+    redis_client = get_auth_redis_client()
+    try:
+        await redis_client.setex(
+            f"admin_preview:{code}",
+            120,  # 2 min TTL
+            json.dumps({"tenant_id": tenant_id, "tenant_name": tenant.name}),
+        )
+    finally:
+        await redis_client.aclose()
+
+    frontend_url = os.environ.get("FRONTEND_URL", "https://app.firepan.com")
+    return RedirectResponse(f"{frontend_url}/admin-preview?code={code}", status_code=302)
+
+
+@app.post("/admin/preview/exchange", response_model=PreviewExchangeResponse)
+@limiter.limit("10/minute")
+async def exchange_preview_code(request: Request, body: PreviewExchangeRequest):
+    """Exchange a one-time preview code for a short-lived read-only JWT."""
+    redis_client = get_auth_redis_client()
+    try:
+        key = f"admin_preview:{body.code}"
+        data_raw = await redis_client.getdel(key)  # atomic consume
+        if not data_raw:
+            raise HTTPException(status_code=400, detail="Invalid or expired preview code")
+    finally:
+        await redis_client.aclose()
+
+    data = json.loads(data_raw)
+    from server.auth_utils import create_access_token
+    token = create_access_token(
+        data={
+            "user_id": 0,
+            "tenant_id": data["tenant_id"],
+            "github_login": "admin_preview",
+            "admin_preview": True,
+        },
+        expires_delta=timedelta(hours=1),
+    )
+
+    return PreviewExchangeResponse(
+        token=token,
+        tenant_id=data["tenant_id"],
+        tenant_name=data["tenant_name"],
+    )
 
 
 # ============================================================================

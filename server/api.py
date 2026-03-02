@@ -585,6 +585,13 @@ async def admin_generate_preview_code(
     db: Session = Depends(get_db),
 ):
     """Generate a one-time preview code and redirect to the dashboard."""
+    logger.info(
+        "PREVIEW: tenant_id=%s cookie=%s sessions=%s headers=%s",
+        tenant_id,
+        admin_session[:20] + "..." if admin_session else None,
+        len(_admin_sessions),
+        dict(request.cookies),
+    )
     if not verify_admin_auth(request, admin_session):
         raise HTTPException(status_code=403, detail="Admin access required")
 

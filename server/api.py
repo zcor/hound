@@ -2850,21 +2850,30 @@ class GraphResponse(BaseModel):
 
 
 class FindingResponse(BaseModel):
-    """Response model for hypothesis/finding data."""
+    """Response model for hypothesis/finding data.
 
-    id: int
-    hypothesis_id: str
+    Supports both deep-audit hypotheses (from Hypothesis table) and surface scan
+    findings (from ScanExecution.findings JSONB).  Nullable fields accommodate
+    surface scan findings which lack hypothesis-specific metadata.
+    """
+
+    id: int | None = None
+    hypothesis_id: str | None = None
     title: str
     description: str
-    vulnerability_type: str
-    status: str
+    vulnerability_type: str | None = None
+    status: str = "confirmed"
     confidence: float
     severity: str
-    node_refs: list[str] | None
+    node_refs: list[str] | None = None
     evidence: Any | None = None  # Can be dict or list
-    reported_by_model: str | None
-    junior_model: str | None
-    senior_model: str | None
+    reported_by_model: str | None = None
+    junior_model: str | None = None
+    senior_model: str | None = None
+    project_id: int | None = None  # Explicit repo linkage
+    pattern_id: str | None = None  # Surface scan pattern identifier
+    location: str | None = None  # Code location from surface scan
+    code_snippet: str | None = None  # Code snippet from surface scan
     created_at: datetime
     updated_at: datetime
 
@@ -5779,16 +5788,19 @@ async def list_all_findings(
     db: Session = Depends(get_db)
 ):
     """
-    List all findings (hypotheses) for organization/user.
-    
+    List all findings for a tenant: deep-audit hypotheses + surface scan findings.
+
+    Surface scan findings are a current-state view (latest completed scan per
+    project only).  Deep-audit hypotheses include all linked findings.
     Supports filtering by severity, status, and repository.
     Returns paginated list with full finding details.
     """
-    # Build query - join with projects to filter by tenant
+    # Query all hypothesis findings for tenant (pagination applied after
+    # combining with surface scan findings below).
     query = db.query(Hypothesis).join(
         Project, Hypothesis.project_id == Project.id
     ).filter(Project.tenant_id == tenant_id)
-    
+
     # Apply filters
     if severity:
         query = query.filter(Hypothesis.severity == severity)
@@ -5796,37 +5808,96 @@ async def list_all_findings(
         query = query.filter(Hypothesis.status == status)
     if repository_id:
         query = query.filter(Hypothesis.project_id == repository_id)
+
+    findings = query.order_by(Hypothesis.created_at.desc()).all()
     
-    # Get total count
-    total = query.count()
-    
-    # Apply pagination
-    offset = (page - 1) * page_size
-    findings = query.order_by(Hypothesis.created_at.desc()).offset(offset).limit(page_size).all()
-    
-    # Build response
-    findings_list = []
-    for finding in findings:
-        findings_list.append(FindingResponse(
-            id=finding.id,
-            hypothesis_id=finding.hypothesis_id,
-            title=finding.title,
-            description=finding.description,
-            vulnerability_type=finding.vulnerability_type,
-            status=finding.status,
-            confidence=finding.confidence,
-            severity=finding.severity,
-            node_refs=finding.node_refs,
-            evidence=finding.evidence,
-            reported_by_model=finding.reported_by_model,
-            junior_model=finding.junior_model,
-            senior_model=finding.senior_model,
-            created_at=finding.created_at,
-            updated_at=finding.updated_at,
+    # Build hypothesis findings
+    hypothesis_findings = []
+    for h in findings:
+        hypothesis_findings.append(FindingResponse(
+            id=h.id,
+            hypothesis_id=h.hypothesis_id,
+            title=h.title,
+            description=h.description,
+            vulnerability_type=h.vulnerability_type,
+            status=h.status,
+            confidence=h.confidence,
+            severity=h.severity,
+            node_refs=h.node_refs,
+            evidence=h.evidence,
+            reported_by_model=h.reported_by_model,
+            junior_model=h.junior_model,
+            senior_model=h.senior_model,
+            project_id=h.project_id,
+            created_at=h.created_at,
+            updated_at=h.updated_at,
         ))
-    
+
+    # Include surface scan findings (latest completed scan per project).
+    # This is a current-state view: only the most recent completed scan per
+    # project is included, matching /findings/stats semantics.  Historical
+    # scan data is available via /repositories/{id}/scans.
+    tenant_projects = db.query(Project.id, Project.name).filter(
+        Project.tenant_id == tenant_id,
+        Project.status != "removed",
+    ).all()
+
+    surface_findings: list[FindingResponse] = []
+    for proj_id, proj_name in tenant_projects:
+        # Apply repository_id filter early if set
+        if repository_id and proj_id != repository_id:
+            continue
+
+        latest_scan = db.query(ScanExecution).filter(
+            ScanExecution.project_id == proj_id,
+            ScanExecution.status == "completed",
+            ScanExecution.findings.isnot(None),
+        ).order_by(ScanExecution.created_at.desc()).first()
+
+        if not latest_scan or not latest_scan.findings:
+            continue
+
+        scan_ts = latest_scan.completed_at or latest_scan.created_at
+        for sf in latest_scan.findings:
+            if not isinstance(sf, dict):
+                continue
+            sf_severity = sf.get("severity", "medium")
+            sf_status = "scanner_detected"
+            # Apply severity/status filters
+            if severity and sf_severity != severity:
+                continue
+            if status and sf_status != status:
+                continue
+            surface_findings.append(FindingResponse(
+                id=None,
+                hypothesis_id=None,
+                pattern_id=sf.get("pattern_id"),
+                title=sf.get("title", "Untitled"),
+                description=sf.get("description", ""),
+                vulnerability_type=sf.get("category"),
+                status=sf_status,
+                confidence=sf.get("confidence", 0.5),
+                severity=sf_severity,
+                node_refs=None,
+                evidence={"scan_execution_id": latest_scan.execution_id},
+                location=sf.get("location"),
+                code_snippet=sf.get("code_snippet"),
+                project_id=proj_id,
+                created_at=scan_ts,
+                updated_at=scan_ts,
+            ))
+
+    # Combine, sort by created_at descending, then paginate in-memory.
+    # Acceptable at current scale (tens to low hundreds per tenant).
+    # TODO: optimise with SQL UNION when finding volume grows.
+    combined = hypothesis_findings + surface_findings
+    combined.sort(key=lambda f: f.created_at, reverse=True)
+    total = len(combined)
+    offset = (page - 1) * page_size
+    page_items = combined[offset : offset + page_size]
+
     return FindingListResponse(
-        findings=findings_list,
+        findings=page_items,
         total=total,
         page=page,
         page_size=page_size,

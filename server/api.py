@@ -4139,9 +4139,12 @@ async def root():
 
 
 @app.get("/projects", response_model=list[ProjectResponse])
-async def list_projects(db: Session = Depends(get_db)):
+async def list_projects(
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
-    List all projects from the database.
+    List all projects for the authenticated tenant.
 
     Returns project metadata with statistics including:
     - Number of graphs
@@ -4149,7 +4152,7 @@ async def list_projects(db: Session = Depends(get_db)):
     - Number of hypotheses
     - Number of confirmed hypotheses
     """
-    projects = db.query(Project).all()
+    projects = db.query(Project).filter(Project.tenant_id == tenant_id).all()
 
     response = []
     for project in projects:
@@ -4379,18 +4382,22 @@ async def get_session_graph(session_id: str, db: Session = Depends(get_db)):
 
 @app.get("/projects/{project_id}/hypotheses", response_model=list[FindingResponse])
 async def get_project_hypotheses(
-    project_id: int, 
+    project_id: int,
     status: str | None = None,
-    db: Session = Depends(get_db)
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
 ):
     """
     Return all hypotheses for a project, optionally filtered by status.
-    
+
     Query params:
         - status: Filter by status (proposed, investigating, confirmed, rejected, resolved)
     """
-    # Verify project exists
-    project = db.query(Project).filter(Project.id == project_id).first()
+    # Verify project exists and belongs to tenant
+    project = db.query(Project).filter(
+        Project.id == project_id,
+        Project.tenant_id == tenant_id,
+    ).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
@@ -4674,7 +4681,6 @@ class RepositoryListResponse(BaseModel):
 
 class RepositoryCreateRequest(BaseModel):
     """Request model for adding a new repository."""
-    tenant_id: int
     github_repo_id: int | None = None
     name: str
     full_name: str
@@ -4830,7 +4836,7 @@ async def list_organization_members(org_id: int, db: Session = Depends(get_db)):
 
 @app.get("/subscriptions/current", response_model=SubscriptionResponse)
 async def get_current_subscription(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db)
 ):
     """
@@ -4897,7 +4903,7 @@ async def get_current_subscription(
 
 @app.get("/usage/current-month", response_model=UsageStatsResponse)
 async def get_current_month_usage(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db)
 ):
     """
@@ -4982,7 +4988,7 @@ def _count_findings_for_project(db: Session, project_id: int) -> int:
 
 @app.get("/repositories", response_model=RepositoryListResponse)
 async def list_repositories(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    tenant_id: int = Depends(get_current_tenant_id),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     search: str | None = Query(None, description="Search repository name"),
@@ -5244,6 +5250,7 @@ async def list_github_repos(
 @app.post("/repositories", status_code=201, response_model=RepositoryResponse, tags=["repositories"])
 async def create_repository(
     body: RepositoryCreateRequest,
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
 ):
     """
@@ -5263,7 +5270,7 @@ async def create_repository(
 
     # Check for duplicates (github_repo_id OR git_url within tenant, excluding removed)
     dup_query = db.query(Project).filter(
-        Project.tenant_id == body.tenant_id,
+        Project.tenant_id == tenant_id,
         Project.status != "removed",
     )
     if body.github_repo_id:
@@ -5279,7 +5286,7 @@ async def create_repository(
 
     now = datetime.now(timezone.utc)
     project = Project(
-        tenant_id=body.tenant_id,
+        tenant_id=tenant_id,
         name=body.name,
         full_name=body.full_name,
         git_url=body.git_url,
@@ -5323,7 +5330,7 @@ async def create_repository(
 @app.get("/repositories/{repository_id}", response_model=RepositoryResponse, tags=["repositories"])
 async def get_repository(
     repository_id: int,
-    tenant_id: int = Query(..., description="Tenant ID"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
 ):
     """
@@ -5379,7 +5386,7 @@ async def get_repository(
 @app.delete("/repositories/{repository_id}", status_code=204, tags=["repositories"])
 async def delete_repository(
     repository_id: int,
-    tenant_id: int = Query(..., description="Tenant ID"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
 ):
     """
@@ -5732,15 +5739,19 @@ async def list_repository_scans(
     repository_id: int,
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
-    db: Session = Depends(get_db)
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
 ):
     """
     List scan history for a repository.
-    
+
     Returns paginated list of all scan executions for the specified repository.
     """
-    # Verify repository exists
-    project = db.query(Project).filter(Project.id == repository_id).first()
+    # Verify repository exists and belongs to tenant
+    project = db.query(Project).filter(
+        Project.id == repository_id,
+        Project.tenant_id == tenant_id,
+    ).first()
     if not project:
         raise HTTPException(status_code=404, detail="Repository not found")
     
@@ -5779,7 +5790,7 @@ async def list_repository_scans(
 
 @app.get("/findings", response_model=FindingListResponse)
 async def list_all_findings(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    tenant_id: int = Depends(get_current_tenant_id),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     severity: str | None = Query(None, description="Filter by severity (critical, high, medium, low)"),
@@ -5906,7 +5917,7 @@ async def list_all_findings(
 
 @app.get("/findings/stats", response_model=FindingStatsResponse)
 async def get_findings_statistics(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db)
 ):
     """
@@ -7317,14 +7328,18 @@ async def list_surface_scans(
 @app.get("/surface/scans/{execution_id}", response_model=SurfaceScanResponse)
 async def get_surface_scan(
     execution_id: str,
-    db: Session = Depends(get_db)
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
 ):
     """
     Get details of a specific surface scan.
-    
+
     Returns full scan results including all findings and quality metrics.
     """
-    scan = db.query(ScanExecution).filter(ScanExecution.execution_id == execution_id).first()
+    scan = db.query(ScanExecution).filter(
+        ScanExecution.execution_id == execution_id,
+        ScanExecution.tenant_id == tenant_id,
+    ).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     

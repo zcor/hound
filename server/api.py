@@ -5121,7 +5121,7 @@ async def _get_current_user_with_token(
 @app.get("/github/repos", response_model=GitHubRepoListResponse, tags=["github"])
 async def list_github_repos(
     request: Request,
-    tenant_id: int = Query(..., description="Tenant ID"),
+    tenant_id: int = Depends(get_current_tenant_id),
     page: int = Query(1, ge=1, description="Page number"),
     per_page: int = Query(30, ge=1, le=100, description="Results per page"),
     search: str | None = Query(None, description="Filter repos by name"),
@@ -5627,7 +5627,7 @@ async def get_team_members(
 @app.get("/github/status", response_model=GitHubStatusResponse, tags=["github"])
 async def github_status(
     request: Request,
-    tenant_id: int = Query(..., description="Tenant ID"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
 ):
     """

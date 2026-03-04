@@ -68,13 +68,15 @@ def decode_access_token(token: str) -> dict:
 def get_current_user_from_token(token: str) -> dict:
     """
     Extract user info from JWT token.
-    
+
+    Minimal JWT: only authorization data, no PII.
+
     Args:
         token: JWT token string
-        
+
     Returns:
-        Dictionary with user_id, tenant_id, and github_login
-        
+        Dictionary with user_id and tenant_id
+
     Raises:
         ValueError: If token is invalid or missing required fields
     """
@@ -82,7 +84,6 @@ def get_current_user_from_token(token: str) -> dict:
     return {
         "user_id": payload.get("user_id"),
         "tenant_id": payload.get("tenant_id"),
-        "github_login": payload.get("github_login")
     }
 
 

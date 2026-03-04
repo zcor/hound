@@ -17,6 +17,7 @@ from database.models import (
     Hypothesis,
     Project,
     Tenant,
+    User,
 )
 
 # Set test database URL before importing app
@@ -95,7 +96,34 @@ def auth_headers(tenant):
     token = create_access_token({
         "tenant_id": tenant.id,
         "user_id": tenant.id,
-        "github_login": "test",
+    })
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def github_user(test_db, sample_tenant):
+    """Create a user with GitHub linked (needed for scan endpoints)."""
+    user = User(
+        github_id=12345678,
+        github_login="testuser",
+        email="test@example.com",
+        name="Test User",
+        avatar_url="https://avatars.githubusercontent.com/u/12345678",
+        tenant_id=sample_tenant.id,
+        signup_provider="github",
+        github_access_token="ghp_test_token",
+    )
+    test_db.add(user)
+    test_db.commit()
+    test_db.refresh(user)
+    return user
+
+
+def github_auth_headers(user):
+    """Create JWT auth headers for a user with GitHub linked."""
+    token = create_access_token({
+        "tenant_id": user.tenant_id,
+        "user_id": user.id,
     })
     return {"Authorization": f"Bearer {token}"}
 
@@ -688,7 +716,7 @@ def test_list_repositories_search(client, sample_project, sample_tenant):
     assert any("test" in repo["name"].lower() for repo in data["repositories"])
 
 
-def test_trigger_repository_scan(client, sample_project, sample_tenant):
+def test_trigger_repository_scan(client, sample_project, github_user):
     """Test triggering a scan for a repository."""
     from unittest.mock import MagicMock, patch
 
@@ -699,7 +727,7 @@ def test_trigger_repository_scan(client, sample_project, sample_tenant):
 
     with patch("server.tier_enforcement.require_plan_allowance", fake_require):
         with patch.dict("sys.modules", {"worker.tasks": MagicMock()}):
-            response = client.post(f"/repositories/{sample_project.id}/scan", headers=auth_headers(sample_tenant))
+            response = client.post(f"/repositories/{sample_project.id}/scan", headers=github_auth_headers(github_user))
     assert response.status_code == 200
     data = response.json()
     assert "execution_id" in data
@@ -707,7 +735,7 @@ def test_trigger_repository_scan(client, sample_project, sample_tenant):
     assert data["status"] == "pending"
 
 
-def test_trigger_repository_scan_not_found(client, sample_tenant):
+def test_trigger_repository_scan_not_found(client, github_user):
     """Test triggering scan for non-existent repository."""
     from unittest.mock import patch
 
@@ -717,7 +745,7 @@ def test_trigger_repository_scan_not_found(client, sample_tenant):
         return _check
 
     with patch("server.tier_enforcement.require_plan_allowance", fake_require):
-        response = client.post("/repositories/999/scan", headers=auth_headers(sample_tenant))
+        response = client.post("/repositories/999/scan", headers=github_auth_headers(github_user))
     assert response.status_code == 404
 
 
@@ -901,7 +929,7 @@ def test_surface_scans_with_tenant_filter(client, sample_tenant, test_db):
 # =============================================================================
 
 
-def test_trigger_scan_dispatches_celery_task(client, sample_project, test_db):
+def test_trigger_scan_dispatches_celery_task(client, sample_project, github_user, test_db):
     """Test that triggering a scan calls execute_scan_task.delay()."""
     from unittest.mock import MagicMock, patch
 
@@ -919,7 +947,7 @@ def test_trigger_scan_dispatches_celery_task(client, sample_project, test_db):
             mock_module = sys.modules["worker.tasks"]
             mock_module.execute_scan_task = mock_task
 
-            response = client.post(f"/repositories/{sample_project.id}/scan")
+            response = client.post(f"/repositories/{sample_project.id}/scan", headers=github_auth_headers(github_user))
 
     assert response.status_code == 200
     data = response.json()
@@ -931,7 +959,7 @@ def test_trigger_scan_dispatches_celery_task(client, sample_project, test_db):
     assert call_kwargs.kwargs["tenant_id"] == sample_project.tenant_id
 
 
-def test_trigger_scan_dispatch_failure_returns_500(client, sample_project, test_db):
+def test_trigger_scan_dispatch_failure_returns_500(client, sample_project, github_user, test_db):
     """Test that dispatch failure marks scan as failed and returns 500."""
     from unittest.mock import patch
 
@@ -951,7 +979,7 @@ def test_trigger_scan_dispatch_failure_returns_500(client, sample_project, test_
             return original_import(name, *args, **kwargs)
 
         with patch("builtins.__import__", side_effect=_blocked_import):
-            response = client.post(f"/repositories/{sample_project.id}/scan")
+            response = client.post(f"/repositories/{sample_project.id}/scan", headers=github_auth_headers(github_user))
 
     assert response.status_code == 500
 
@@ -964,7 +992,7 @@ def test_trigger_scan_dispatch_failure_returns_500(client, sample_project, test_
     assert "Failed to dispatch scan" in (scan.error_message or "")
 
 
-def test_trigger_scan_dispatch_failure_refunds_credit(client, sample_project, test_db):
+def test_trigger_scan_dispatch_failure_refunds_credit(client, sample_project, github_user, test_db):
     """Test that dispatch failure refunds credit when uses_credit is True."""
     from unittest.mock import MagicMock, patch
 
@@ -986,7 +1014,7 @@ def test_trigger_scan_dispatch_failure_refunds_credit(client, sample_project, te
     with patch("server.tier_enforcement.require_plan_allowance", fake_require):
         with patch("builtins.__import__", side_effect=_blocked_import):
             with patch("server.tier_enforcement.refund_scan_credit", mock_refund):
-                response = client.post(f"/repositories/{sample_project.id}/scan")
+                response = client.post(f"/repositories/{sample_project.id}/scan", headers=github_auth_headers(github_user))
 
     assert response.status_code == 500
     # Refund should have been called

@@ -433,6 +433,34 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)) -> U
 
 
 # =============================================================================
+# GITHUB CAPABILITY GATE — require linked GitHub for scan operations
+# =============================================================================
+
+async def require_github_linked(request: Request, db: Session = Depends(get_db)) -> User:
+    """Require that the current user has a linked GitHub account with token.
+
+    Use as a FastAPI dependency on scan-triggering endpoints.
+    Google-only users must link GitHub before running scans.
+    """
+    from server.auth_routes import get_token_from_header
+    from server.auth_utils import get_current_user_from_token
+
+    token = get_token_from_header(request)
+    try:
+        payload = get_current_user_from_token(token)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user = db.query(User).filter(User.id == payload["user_id"]).first()
+    if not user or not user.github_id or not user.github_access_token:
+        raise HTTPException(
+            status_code=403,
+            detail="GitHub account required. Connect GitHub in Settings to run scans.",
+            headers={"X-Requires-Github": "true"},
+        )
+    return user
+
+
+# =============================================================================
 # ADMIN TENANT PREVIEW — endpoints (after get_db is defined)
 # =============================================================================
 
@@ -486,7 +514,6 @@ async def exchange_preview_code(request: Request, body: PreviewExchangeRequest):
         data={
             "user_id": 0,
             "tenant_id": data["tenant_id"],
-            "github_login": "admin_preview",
             "admin_preview": True,
         },
         expires_delta=timedelta(hours=1),
@@ -5695,6 +5722,7 @@ async def trigger_repository_scan(
     request: Request,
     db: Session = Depends(get_db),
     _: None = Depends(reject_preview_writes),
+    __: User = Depends(require_github_linked),
 ):
     """
     Trigger a new scan for a repository.

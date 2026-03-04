@@ -11,6 +11,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
@@ -106,31 +107,112 @@ class Tenant(Base):
 
 class User(Base):
     """
-    User table for GitHub OAuth authentication.
-    
-    Stores user information from GitHub OAuth for authentication
-    and authorization using JWT tokens.
+    User table for OAuth authentication (GitHub + Google).
+
+    Stores user information from OAuth providers for authentication
+    and authorization using JWT tokens. At least one provider must be linked.
     """
     __tablename__ = "users"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
-    github_id = Column(BigInteger, unique=True, index=True, nullable=False)
-    github_login = Column(String(255), unique=True, index=True, nullable=False)
-    email = Column(String(255), index=True)  # Not unique - users can have null/private emails
-    name = Column(String(255))
-    avatar_url = Column(String(500))
+
+    # GitHub provider (nullable — Google-only users won't have these)
+    github_id = Column(BigInteger, unique=True, index=True, nullable=True)
+    github_login = Column(String(255), unique=True, index=True, nullable=True)
     github_token_encrypted = Column(Text, nullable=True)  # Fernet-encrypted GitHub OAuth token
     github_connected_at = Column(DateTime, nullable=True)  # When the GitHub token was stored
     github_access_token = Column(String(500), nullable=True)  # GitHub OAuth access token for API calls
-    
+
+    # Google provider (nullable — GitHub-only users won't have these)
+    google_id = Column(String(255), unique=True, index=True, nullable=True)
+    google_email = Column(String(255), nullable=True)
+    google_name = Column(String(255), nullable=True)
+    google_avatar_url = Column(String(500), nullable=True)
+    google_connected_at = Column(DateTime, nullable=True)
+
+    # Shared profile fields
+    email = Column(String(255), index=True)  # Not unique - users can have null/private emails
+    name = Column(String(255))
+    avatar_url = Column(String(500))
+
+    # Immutable after creation — tracks how the user originally signed up
+    signup_provider = Column(String(50), nullable=False, default="github")
+
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
     tenant = relationship("Tenant", back_populates="users")
-    
+
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-    
+
+    __table_args__ = (
+        CheckConstraint(
+            "github_id IS NOT NULL OR google_id IS NOT NULL",
+            name="chk_at_least_one_provider",
+        ),
+        CheckConstraint(
+            "signup_provider IN ('github', 'google')",
+            name="chk_signup_provider_values",
+        ),
+    )
+
+    # --- Helper properties ---
+
+    @property
+    def primary_provider(self) -> str:
+        """The provider the user originally signed up with."""
+        return self.signup_provider
+
+    @property
+    def display_name(self) -> str:
+        """Best available display name."""
+        return self.github_login or self.google_name or self.email or f"User {self.id}"
+
+    @property
+    def has_github(self) -> bool:
+        return self.github_id is not None
+
+    @property
+    def has_google(self) -> bool:
+        return self.google_id is not None
+
+    def to_profile_dict(self) -> dict:
+        """Full profile for /auth/me — null-safe for all optional fields."""
+        return {
+            "id": self.id,
+            "tenant_id": self.tenant_id,
+            # GitHub (optional)
+            "github_username": self.github_login,
+            "github_avatar_url": self.avatar_url if self.has_github else None,
+            # Google (optional)
+            "google_email": self.google_email,
+            "google_name": self.google_name,
+            "google_avatar_url": self.google_avatar_url,
+            # Unified
+            "email": self.email or self.google_email or "",
+            "name": self.name or self.google_name,
+            "avatar_url": self.avatar_url or self.google_avatar_url or "",
+            "display_name": self.display_name,
+            "primary_provider": self.primary_provider,
+            "has_github": self.has_github,
+            "has_google": self.has_google,
+        }
+
     def __repr__(self):
-        return f"<User(github_login='{self.github_login}', tenant_id={self.tenant_id})>"
+        return f"<User(id={self.id}, display_name='{self.display_name}', tenant_id={self.tenant_id})>"
+
+
+class OAuthAuditLog(Base):
+    """Audit log for OAuth link/unlink/login events."""
+    __tablename__ = "oauth_audit_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    action = Column(String(50), nullable=False)       # 'link', 'unlink', 'login', 'login_new'
+    provider = Column(String(50), nullable=False)      # 'github', 'google'
+    provider_user_id = Column(String(255), nullable=True)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
 class Team(Base):
@@ -647,6 +729,16 @@ def ensure_schema(engine):
             conn.execute(text(
                 "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS resolved_price_cents INTEGER"
             ))
+            # Google OAuth fields
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255) UNIQUE"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_email VARCHAR(255)"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_name VARCHAR(255)"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_avatar_url VARCHAR(500)"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_connected_at TIMESTAMP WITH TIME ZONE"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_provider VARCHAR(50) NOT NULL DEFAULT 'github'"))
+            # Make GitHub fields nullable (safe — just removes constraint)
+            conn.execute(text("ALTER TABLE users ALTER COLUMN github_id DROP NOT NULL"))
+            conn.execute(text("ALTER TABLE users ALTER COLUMN github_login DROP NOT NULL"))
 
 
 def init_database(engine):

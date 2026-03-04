@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from database.models import Base, Tenant, User
+from database.models import Base, OAuthAuditLog, Tenant, User
 from server.auth_utils import create_access_token, decode_access_token, get_current_user_from_token
 
 # Set test database URL before importing app
@@ -87,7 +87,8 @@ def sample_user(test_db, sample_tenant):
         email="test@example.com",
         name="Test User",
         avatar_url="https://avatars.githubusercontent.com/u/12345678",
-        tenant_id=sample_tenant.id
+        tenant_id=sample_tenant.id,
+        signup_provider="github",
     )
     test_db.add(user)
     test_db.commit()
@@ -103,10 +104,9 @@ class TestJWTUtilities:
         data = {
             "user_id": 1,
             "tenant_id": 1,
-            "github_login": "testuser"
         }
         token = create_access_token(data)
-        
+
         assert token is not None
         assert isinstance(token, str)
         assert len(token) > 0
@@ -116,15 +116,26 @@ class TestJWTUtilities:
         data = {
             "user_id": 1,
             "tenant_id": 1,
-            "github_login": "testuser"
         }
         token = create_access_token(data)
         payload = decode_access_token(token)
-        
+
         assert payload["user_id"] == 1
         assert payload["tenant_id"] == 1
-        assert payload["github_login"] == "testuser"
         assert "exp" in payload
+
+    def test_slim_jwt_has_no_pii(self):
+        """Test that slim JWT does not contain github_login or other PII."""
+        data = {
+            "user_id": 1,
+            "tenant_id": 1,
+        }
+        token = create_access_token(data)
+        payload = decode_access_token(token)
+
+        assert "github_login" not in payload
+        assert "email" not in payload
+        assert "name" not in payload
 
     def test_decode_invalid_token(self):
         """Test decoding an invalid token."""
@@ -132,18 +143,17 @@ class TestJWTUtilities:
             decode_access_token("invalid.token.here")
 
     def test_get_current_user_from_token(self):
-        """Test extracting user info from token."""
+        """Test extracting user info from token (slim — no github_login)."""
         data = {
             "user_id": 1,
             "tenant_id": 1,
-            "github_login": "testuser"
         }
         token = create_access_token(data)
         user_info = get_current_user_from_token(token)
-        
+
         assert user_info["user_id"] == 1
         assert user_info["tenant_id"] == 1
-        assert user_info["github_login"] == "testuser"
+        assert "github_login" not in user_info
 
 
 class TestAuthRoutes:
@@ -268,25 +278,26 @@ class TestAuthRoutes:
         assert sample_user.name == "Updated Name"
 
     def test_get_current_user(self, client, sample_user):
-        """Test getting current user info from JWT token."""
+        """Test getting current user info from JWT token (via /auth/me)."""
         # Create a valid token
         token = create_access_token({
             "user_id": sample_user.id,
             "tenant_id": sample_user.tenant_id,
-            "github_login": sample_user.github_login
         })
-        
+
         response = client.get(
             "/auth/me",
             headers={"Authorization": f"Bearer {token}"}
         )
-        
+
         assert response.status_code == 200
         data = response.json()
         assert data["id"] == sample_user.id
-        assert data["github_login"] == sample_user.github_login
+        assert data["github_username"] == sample_user.github_login
         assert data["email"] == sample_user.email
         assert data["tenant_id"] == sample_user.tenant_id
+        assert data["has_github"] is True
+        assert data["has_google"] is False
 
     def test_get_current_user_no_token(self, client):
         """Test getting current user without token."""
@@ -320,7 +331,6 @@ class TestProtectedEndpoints:
         token = create_access_token({
             "user_id": sample_user.id,
             "tenant_id": sample_user.tenant_id,
-            "github_login": sample_user.github_login
         })
         
         response = client.get(
@@ -345,7 +355,6 @@ class TestProtectedEndpoints:
         token = create_access_token({
             "user_id": sample_user.id,
             "tenant_id": sample_user.tenant_id,
-            "github_login": sample_user.github_login
         })
         
         response = client.get(

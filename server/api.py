@@ -4076,92 +4076,157 @@ async def handle_github_webhook(request: Request, db: Session = Depends(get_db))
 
         return {"status": "ok", "event": "installation", "action": action}
     
-    # Handle pull request events - THIS TRIGGERS AUDITS
+    # Handle pull request events — trigger surface scan + PR comment
     if event_type == "pull_request":
         action = payload.get("action")
-        
-        # Only audit on PR open or synchronize (new commits pushed)
+
+        # Only scan on PR open or synchronize (new commits pushed)
         if action not in ("opened", "synchronize", "reopened"):
             return {"status": "ok", "event": "pull_request", "action": action, "skipped": True}
-        
+
         pr = payload.get("pull_request", {})
         repo = payload.get("repository", {})
         installation = payload.get("installation", {})
-        
+
         pr_number = pr.get("number")
         repo_full_name = repo.get("full_name")
         clone_url = repo.get("clone_url")
-        installation_id = installation.get("id")
-        
-        if not all([pr_number, repo_full_name, clone_url, installation_id]):
+        pr_installation_id = installation.get("id")
+        head_sha = pr.get("head", {}).get("sha", "")
+        github_repo_id = repo.get("id")
+
+        if not all([pr_number, repo_full_name, clone_url, pr_installation_id]):
             logger.warning("Missing required fields in PR webhook payload")
             return {"status": "error", "message": "Missing required fields"}
-        
-        logger.info(f"Triggering audit for PR #{pr_number} on {repo_full_name}")
-        
-        # Import and dispatch task
+
+        # Look up project to check pr_comments_enabled
+        project = db.query(Project).filter(Project.github_repo_id == github_repo_id).first() if github_repo_id else None
+
+        # Check pr_comments_enabled guard
+        if project and hasattr(project, 'pr_comments_enabled') and not project.pr_comments_enabled:
+            logger.info(f"PR comments disabled for {repo_full_name}, skipping")
+            return {"status": "ok", "event": "pull_request", "skipped": True, "reason": "PR comments disabled"}
+
+        # Look up tenant via installation_id
+        tenant = db.query(Tenant).filter(Tenant.installation_id == pr_installation_id).first()
+        if not tenant and project:
+            tenant = db.query(Tenant).filter(Tenant.id == project.tenant_id).first()
+        if not tenant:
+            tenant = db.query(Tenant).first()
+        if not tenant:
+            logger.warning(f"No tenant found for PR webhook from {repo_full_name}")
+            return {"status": "error", "message": "No tenant found"}
+
+        logger.info(f"Triggering surface scan for PR #{pr_number} on {repo_full_name}")
+
+        # Redis dedup: per PR + head SHA
+        dedup_key = f"pr:scan:{project.id if project else 0}:{pr_number}:{head_sha}"
         try:
-            from worker.tasks import execute_audit_task
+            import redis as redis_lib
+            redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+            r = redis_lib.from_url(redis_url)
+            acquired = r.set(dedup_key, "1", ex=300, nx=True)
+        except Exception:
+            acquired = True  # fail open
+
+        if not acquired:
+            logger.info(f"Duplicate PR scan for {repo_full_name}#{pr_number}@{head_sha[:8]}, skipping")
+            return {"status": "ok", "event": "pull_request", "skipped": True, "reason": "Duplicate"}
+
+        # Import and dispatch surface scan task
+        try:
+            from worker.tasks import execute_scan_task
         except ImportError as e:
             logger.error(f"Worker module not available: {e}")
             return {"status": "error", "message": "Worker not available"}
-        
-        # Generate session ID
-        session_id = f"pr_{repo_full_name.replace('/', '_')}_{pr_number}_{uuid.uuid4().hex[:8]}"
-        
-        # Get or create tenant
-        tenant = db.query(Tenant).first()
-        if not tenant:
-            tenant = Tenant(name="default")
-            db.add(tenant)
-            db.commit()
-            db.refresh(tenant)
-        
-        # Create audit session (project_id is null for webhook-triggered scans)
-        audit_session = AuditSession(
-            session_id=session_id,
-            project_id=None,  # Will be linked to project if one exists/is created
-            status="queued",
-            start_time=datetime.now(timezone.utc),
-            models={"trigger": "github_webhook", "pr_number": pr_number},
-        )
-        db.add(audit_session)
-        db.commit()
-        
-        # Dispatch to worker
-        task = execute_audit_task.delay(
-            repo_url=clone_url,
-            scan_id=session_id,
+
+        # Create ScanExecution record
+        timestamp = int(datetime.now(timezone.utc).timestamp())
+        execution_id = f"scan_{uuid.uuid4().hex[:12]}_{timestamp}"
+
+        scan_execution = ScanExecution(
+            execution_id=execution_id,
+            project_id=project.id if project else None,
             tenant_id=tenant.id,
-            installation_id=installation_id,
+            repo_url=clone_url,
+            repo_name=repo_full_name,
+            status="pending",
+            scan_config={"trigger_source": "pr", "pr_number": pr_number, "head_sha": head_sha},
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        db.add(scan_execution)
+        db.commit()
+
+        # Dispatch surface scan with PR params
+        task = execute_scan_task.delay(
+            repo_url=clone_url,
+            scan_id=execution_id,
+            tenant_id=tenant.id,
+            llm_budget=5,
             pr_number=pr_number,
             repo_full_name=repo_full_name,
+            installation_id=pr_installation_id,
         )
-        
-        logger.info(f"Dispatched PR audit task {task.id} for session {session_id}")
-        
+
+        logger.info(f"Dispatched PR scan task {task.id} for {execution_id}")
+
         return {
             "status": "ok",
             "event": "pull_request",
             "action": action,
-            "session_id": session_id,
+            "execution_id": execution_id,
             "task_id": task.id,
         }
     
-    # Handle push events (optional: audit on push to main branch)
+    # Handle push events — trigger surface scan on contract changes
     if event_type == "push":
         ref = payload.get("ref", "")
         repo = payload.get("repository", {})
-        
-        # Only trigger on main/master branch pushes
+        installation = payload.get("installation", {})
+
+        # Only trigger on default branch pushes
         default_branch = repo.get("default_branch", "main")
         if ref not in (f"refs/heads/{default_branch}", "refs/heads/main", "refs/heads/master"):
             return {"status": "ok", "event": "push", "skipped": True, "reason": "Not default branch"}
-        
-        # TODO: Optionally trigger audit on main branch pushes
-        logger.info(f"Push to {ref} on {repo.get('full_name')} - audit not triggered (configure as needed)")
-        
-        return {"status": "ok", "event": "push", "branch": ref}
+
+        github_repo_id = repo.get("id")
+        repo_full_name = repo.get("full_name", "")
+        clone_url = repo.get("clone_url", "")
+        push_installation_id = installation.get("id")
+        head_commit = payload.get("head_commit", {})
+        commit_sha = head_commit.get("id", payload.get("after", ""))
+
+        # Look up project by github_repo_id
+        project = db.query(Project).filter(Project.github_repo_id == github_repo_id).first()
+        if not project:
+            logger.info(f"Push to {repo_full_name}: no matching project, skipping")
+            return {"status": "ok", "event": "push", "skipped": True, "reason": "No matching project"}
+
+        if project.status != "active":
+            logger.info(f"Push to {repo_full_name}: project not active, skipping")
+            return {"status": "ok", "event": "push", "skipped": True, "reason": "Project not active"}
+
+        if not project.tenant_id:
+            logger.warning(f"Push to {repo_full_name}: project has no tenant_id")
+            return {"status": "error", "message": "Project has no tenant"}
+
+        # Dispatch scan via audit_trigger
+        from integrations.audit_trigger import run_audit_task
+        execution_id = run_audit_task(
+            project_id=project.id,
+            project_name=repo_full_name,
+            commit_sha=commit_sha,
+            repo_url=clone_url,
+            tenant_id=project.tenant_id,
+            installation_id=push_installation_id,
+            payload=payload,
+        )
+
+        if execution_id:
+            return {"status": "ok", "event": "push", "execution_id": execution_id}
+        else:
+            return {"status": "ok", "event": "push", "skipped": True, "reason": "No contract changes or duplicate"}
     
     # Unknown event type
     return {"status": "ok", "event": event_type, "handled": False}
@@ -7085,6 +7150,7 @@ class SurfaceScanResponse(BaseModel):
     scan_duration_seconds: float
     summary: str
     error: str | None = None
+    scan_log: str | None = None
 
 
 class SurfaceScanListItem(BaseModel):
@@ -7519,6 +7585,7 @@ async def get_surface_scan(
         scan_duration_seconds=duration,
         summary=scan.summary or "",
         error=scan.error_message,
+        scan_log=scan.scan_log,
     )
 
 

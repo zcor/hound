@@ -725,6 +725,9 @@ def execute_scan_task(
     tenant_id: int,
     llm_budget: int = 5,
     model: str | None = None,
+    pr_number: int | None = None,
+    repo_full_name: str | None = None,
+    installation_id: int | None = None,
 ) -> dict:
     """
     Execute a lightweight surface scan.
@@ -766,7 +769,12 @@ def execute_scan_task(
         
         # Convert result to dict
         result_dict = result.model_dump() if hasattr(result, "model_dump") else result.dict()
-        
+
+        # Redact then truncate scan log
+        raw_log = result_dict.get("scan_log") or ""
+        from analysis.surface.scanner import _redact_log, _truncate_log
+        safe_log = _truncate_log(_redact_log(raw_log)) if raw_log else None
+
         # Update database
         self._update_scan_status(
             scan_id,
@@ -778,26 +786,59 @@ def execute_scan_task(
             summary=result_dict.get("summary"),
             contracts_scanned=result_dict.get("contracts_scanned", 0),
             contracts_total=result_dict.get("contracts_total", 0),
+            scan_log=safe_log,
         )
         
         publisher.publish_status(
             "completed",
             f"Scan complete. Risk score: {result_dict.get('risk_score', 0)}"
         )
-        
+
+        # Post findings to PR if this was triggered by a PR event
+        if pr_number and repo_full_name and installation_id:
+            try:
+                from integrations.pr_bot import PRCommentBot
+                bot = PRCommentBot(
+                    installation_id=installation_id,
+                    repo_full_name=repo_full_name,
+                    pr_number=pr_number,
+                )
+                # Convert surface findings to the format PRCommentBot expects
+                pr_findings = []
+                for f in result_dict.get("findings", []):
+                    pr_findings.append({
+                        "title": f.get("title", ""),
+                        "severity": f.get("severity", "medium"),
+                        "type": f.get("category", "vulnerability"),
+                        "confidence": f.get("confidence", 0.5),
+                        "description": f.get("description", ""),
+                        "location": f.get("location", ""),
+                    })
+                bot.post_findings(
+                    pr_findings,
+                    scan_id=scan_id,
+                    include_inline=False,  # v1: summary only
+                    include_summary=True,
+                    delete_previous=False,  # We use find-and-update instead
+                )
+                publisher.publish_thought("PR comment posted", iteration=1)
+            except Exception as e:
+                # Non-fatal: scan succeeded even if PR comment fails
+                print(f"Failed to post PR comment: {e}")
+
         return {
             "status": "completed",
             "scan_id": scan_id,
             **result_dict,
         }
-        
+
     except Exception as e:
         error_msg = str(e)
         publisher.publish_error(error_msg, "scan_error")
         publisher.publish_status("failed", error_msg)
         self._update_scan_status(scan_id, "failed", error_message=error_msg)
         raise
-        
+
     finally:
         publisher.close()
 

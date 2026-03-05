@@ -295,6 +295,7 @@ class Project(Base):
     is_private = Column(Boolean, nullable=False, default=False)
     description = Column(Text, nullable=True)
     status = Column(String(50), nullable=False, default="active")
+    pr_comments_enabled = Column(Boolean, nullable=False, default=True)
     team_id = Column(Integer, ForeignKey("teams.id"), nullable=True, index=True)  # Link to team for access control
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     last_accessed = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
@@ -459,6 +460,9 @@ class ScanExecution(Base):
     # Artifact storage reference (S3/MinIO path for full reports, code snippets, etc.)
     artifacts_path = Column(String(1024), nullable=True)
     
+    # Scan log (timestamped execution log, max 64KB)
+    scan_log = Column(Text, nullable=True)
+
     # Error handling
     error_message = Column(Text, nullable=True)
     
@@ -739,6 +743,10 @@ def ensure_schema(engine):
             # Make GitHub fields nullable (safe — just removes constraint)
             conn.execute(text("ALTER TABLE users ALTER COLUMN github_id DROP NOT NULL"))
             conn.execute(text("ALTER TABLE users ALTER COLUMN github_login DROP NOT NULL"))
+            # Scan logs
+            conn.execute(text("ALTER TABLE scan_executions ADD COLUMN IF NOT EXISTS scan_log TEXT"))
+            # PR comments toggle
+            conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS pr_comments_enabled BOOLEAN NOT NULL DEFAULT TRUE"))
 
 
 def init_database(engine):

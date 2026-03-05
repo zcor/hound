@@ -53,6 +53,7 @@ class ScanResult(BaseModel):
     scan_duration_seconds: float = Field(default=0.0, description="Scan duration in seconds")
     summary: str = Field(default="", description="LLM-generated summary")
     error: str | None = Field(default=None, description="Error message if scan failed")
+    scan_log: str | None = Field(default=None, description="Timestamped execution log")
 
     @property
     def finding_counts(self) -> dict[str, int]:

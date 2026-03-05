@@ -22,6 +22,59 @@ from .patterns import PatternDetector, PatternMatch
 
 console = Console()
 
+# Max scan log size in bytes (64KB)
+_MAX_LOG_BYTES = 65536
+
+# Patterns for secret redaction
+_SECRET_PATTERNS = [
+    # Stripe keys
+    re.compile(r'sk_live_[A-Za-z0-9]+'),
+    re.compile(r'sk_test_[A-Za-z0-9]+'),
+    # GitHub tokens
+    re.compile(r'ghp_[A-Za-z0-9]+'),
+    re.compile(r'ghu_[A-Za-z0-9]+'),
+    re.compile(r'ghs_[A-Za-z0-9]+'),
+    # PEM blocks
+    re.compile(r'-----BEGIN[A-Z ]*KEY-----[\s\S]*?-----END[A-Z ]*KEY-----'),
+    # High-entropy token-like strings (>40 chars)
+    re.compile(r'[A-Za-z0-9+/=_-]{40,}'),
+    # URL query param secrets
+    re.compile(r'([?&](?:token|key|secret|password|api_key|apikey)=)[^\s&]+', re.IGNORECASE),
+]
+
+# The URL param pattern replaces only the value portion
+_URL_SECRET_PATTERN = re.compile(r'([?&](?:token|key|secret|password|api_key|apikey)=)[^\s&]+', re.IGNORECASE)
+
+
+def _redact_log(text: str) -> str:
+    """Redact secrets from log text before storage."""
+    if not text:
+        return text
+    # URL params: keep the param name, redact the value
+    text = _URL_SECRET_PATTERN.sub(r'\1[REDACTED]', text)
+    # PEM blocks
+    text = re.sub(r'-----BEGIN[A-Z ]*KEY-----[\s\S]*?-----END[A-Z ]*KEY-----', '[REDACTED]', text)
+    # Token patterns
+    for pattern in _SECRET_PATTERNS:
+        if pattern is _URL_SECRET_PATTERN:
+            continue
+        if pattern.pattern.startswith('-----BEGIN'):
+            continue
+        text = pattern.sub('[REDACTED]', text)
+    return text
+
+
+def _truncate_log(text: str, max_bytes: int = _MAX_LOG_BYTES) -> str:
+    """Truncate log to max_bytes, appending a truncation notice."""
+    if not text or len(text.encode('utf-8')) <= max_bytes:
+        return text
+    # Truncate by bytes, find last newline to avoid splitting a line
+    truncated = text.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore')
+    last_nl = truncated.rfind('\n')
+    if last_nl > 0:
+        truncated = truncated[:last_nl]
+    return truncated + '\n[log truncated at 64KB]'
+
 
 class SurfaceScanner:
     """Lightweight security scanner for smart contract repositories."""
@@ -47,9 +100,16 @@ class SurfaceScanner:
         self.quiet = quiet
         self.llm_calls_made = 0
         self.pattern_detector = PatternDetector()
+        self._log_lines: list[str] = []
+        self._start_time: float = 0.0
 
         # GitHub API settings
         self.github_token = os.environ.get("GITHUB_TOKEN")
+
+    def _log(self, msg: str) -> None:
+        """Append a timestamped log line."""
+        elapsed = time.time() - self._start_time if self._start_time else 0.0
+        self._log_lines.append(f"[{elapsed:.1f}s] {msg}")
 
     def scan(self, target: str) -> ScanResult:
         """Scan a repository for vulnerabilities.
@@ -61,11 +121,15 @@ class SurfaceScanner:
             ScanResult with findings and risk score
         """
         start_time = time.time()
+        self._start_time = start_time
+        self._log_lines = []
         self.llm_calls_made = 0
 
         try:
             # Resolve target to local path
+            self._log(f"Resolving target: {target}")
             repo_path, repo_url, cleanup_fn = self._resolve_target(target)
+            self._log(f"Cloned/resolved to: {repo_path.name}")
 
             if not self.quiet:
                 console.print(f"[cyan]Scanning:[/cyan] {repo_path.name}")
@@ -73,6 +137,7 @@ class SurfaceScanner:
             # Find smart contracts
             contracts = self._find_contracts(repo_path)
             if not contracts:
+                self._log("No Solidity or Vyper contracts found")
                 return ScanResult(
                     repo_url=repo_url,
                     repo_path=str(repo_path),
@@ -81,7 +146,11 @@ class SurfaceScanner:
                     risk_level="low",
                     summary="No Solidity or Vyper contracts found in repository.",
                     error="No smart contracts found",
+                    scan_log="\n".join(self._log_lines),
                 )
+
+            total_loc = sum(c.read_text(errors='ignore').count('\n') for c in contracts)
+            self._log(f"Found {len(contracts)} contract(s), {total_loc} LOC")
 
             # Run static pattern detection
             all_matches: list[PatternMatch] = []
@@ -133,10 +202,13 @@ class SurfaceScanner:
 
             # Convert matches to findings
             findings = self._matches_to_findings(all_matches, repo_path)
+            self._log(f"Pattern detection: {len(all_matches)} raw matches, {len(findings)} unique findings")
 
             # LLM verification (if budget allows)
             if self.llm_budget > 0 and findings:
+                self._log(f"Starting LLM verification (budget: {self.llm_budget})")
                 findings, summary = self._llm_verify(findings, contracts, quality_metrics, repo_path)
+                self._log(f"LLM verification complete: {self.llm_calls_made} call(s) used")
             else:
                 summary = self._generate_basic_summary(findings, quality_metrics)
 
@@ -149,6 +221,7 @@ class SurfaceScanner:
                 cleanup_fn()
 
             duration = time.time() - start_time
+            self._log(f"Scan complete: risk_score={risk_score} ({risk_level}), {len(findings)} finding(s), {duration:.1f}s")
 
             return ScanResult(
                 repo_url=repo_url,
@@ -163,10 +236,12 @@ class SurfaceScanner:
                 llm_calls_used=self.llm_calls_made,
                 scan_duration_seconds=duration,
                 summary=summary,
+                scan_log="\n".join(self._log_lines),
             )
 
         except Exception as e:
             duration = time.time() - start_time
+            self._log(f"Scan failed: {e}")
             return ScanResult(
                 repo_url=target if target.startswith("http") else None,
                 repo_path=target,
@@ -175,6 +250,7 @@ class SurfaceScanner:
                 risk_level="low",
                 scan_duration_seconds=duration,
                 error=str(e),
+                scan_log="\n".join(self._log_lines),
             )
 
     def scan_batch(
@@ -509,18 +585,21 @@ class SurfaceScanner:
         # Call 1: Verify critical/high findings
         critical_high = [f for f in findings if f.severity in ("critical", "high")]
         if critical_high and self.llm_calls_made < self.llm_budget:
+            self._log(f"LLM verifying {len(critical_high)} critical/high finding(s)")
             findings = self._verify_findings_batch(client, critical_high, findings)
             self.llm_calls_made += 1
 
         # Call 2: Verify medium findings
         medium = [f for f in findings if f.severity == "medium" and not f.llm_verified]
         if medium and self.llm_calls_made < self.llm_budget:
+            self._log(f"LLM verifying {len(medium)} medium finding(s)")
             findings = self._verify_findings_batch(client, medium, findings)
             self.llm_calls_made += 1
 
         # Call 3: Generate summary
         summary = self._generate_basic_summary(findings, quality)
         if self.llm_calls_made < self.llm_budget:
+            self._log("LLM generating summary")
             summary = self._generate_llm_summary(client, findings, quality, repo_path)
             self.llm_calls_made += 1
 

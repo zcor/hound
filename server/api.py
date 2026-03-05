@@ -5492,6 +5492,33 @@ async def create_repository(
     except Exception:
         pass  # non-critical
 
+    # Auto-trigger initial surface scan (fire-and-forget)
+    if project.git_url:
+        try:
+            from worker.tasks import execute_scan_task
+            initial_execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
+            initial_scan = ScanExecution(
+                execution_id=initial_execution_id,
+                project_id=project.id,
+                tenant_id=tenant_id,
+                repo_name=project.name,
+                repo_url=project.git_url,
+                status="pending",
+                scan_config={"trigger_source": "repo_added"},
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.add(initial_scan)
+            db.commit()
+            execute_scan_task.delay(
+                repo_url=project.git_url,
+                scan_id=initial_execution_id,
+                tenant_id=tenant_id,
+            )
+            logger.info(f"Auto-triggered initial scan {initial_execution_id} for new repo {project.name}")
+        except Exception as e:
+            logger.warning(f"Failed to auto-trigger initial scan for {project.name}: {e}")
+
     return RepositoryResponse(
         id=project.id,
         name=project.name,

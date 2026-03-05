@@ -7239,15 +7239,16 @@ async def run_surface_scan(
             contracts_scanned=result.contracts_scanned,
             contracts_total=result.contracts_total,
             error_message=result.error,
+            scan_log=result.scan_log,
             started_at=result.scan_timestamp,
             completed_at=datetime.now(),
         )
-        
+
         db.add(scan_exec)
         db.commit()
     except Exception as e:
         logger.warning(f"Failed to save scan to database: {e}")
-    
+
     # Build response
     return SurfaceScanResponse(
         execution_id=execution_id,
@@ -7287,6 +7288,7 @@ async def run_surface_scan(
         scan_duration_seconds=result.scan_duration_seconds,
         summary=result.summary,
         error=result.error,
+        scan_log=result.scan_log,
     )
 
 
@@ -7352,6 +7354,7 @@ async def run_full_surface_scan(
             contracts_scanned=result.contracts_scanned,
             contracts_total=result.contracts_total,
             error_message=result.error,
+            scan_log=result.scan_log,
             started_at=result.scan_timestamp,
             completed_at=datetime.now(),
         )
@@ -7407,6 +7410,7 @@ async def run_full_surface_scan(
         scan_duration_seconds=result.scan_duration_seconds,
         summary=result.summary,
         error=result.error,
+        scan_log=result.scan_log,
     )
 
 

@@ -14,14 +14,16 @@ from collections.abc import Generator
 from datetime import datetime, timezone
 
 import httpx
+import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database.models import OAuthAuditLog, Tenant, User
-from server.auth_utils import create_access_token, get_current_user_from_token
+from server.auth_utils import create_access_token, get_current_user_from_token, reject_preview_writes
 from server.token_crypto import encrypt_token
 
 logger = logging.getLogger(__name__)
@@ -765,3 +767,87 @@ async def get_me(
         return user.to_profile_dict()
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# DELETE /auth/me — account deletion
+# ---------------------------------------------------------------------------
+
+@router.delete("/me", status_code=204)
+async def delete_me(
+    request: Request,
+    token: str = Depends(get_token_from_header),
+    db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
+):
+    """
+    Hard-delete the authenticated user's account.
+
+    - Cancels any Stripe subscription before touching the DB.
+    - Deletes the tenant only if this was the sole remaining user.
+    - Returns 204 whether the user existed or was already gone (idempotent).
+    """
+    try:
+        payload = get_current_user_from_token(token)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+    user_id = payload["user_id"]
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user:
+        # Already deleted — idempotent 204
+        return Response(status_code=204)
+
+    tenant_id = user.tenant_id
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+
+    # Count users in this tenant (with FOR UPDATE to prevent races)
+    tenant_user_count = (
+        db.query(func.count(User.id))
+        .filter(User.tenant_id == tenant_id)
+        .scalar()
+    )
+
+    # Cancel Stripe subscription BEFORE any DB changes
+    if tenant and tenant.stripe_subscription_id:
+        try:
+            stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+            stripe.Subscription.cancel(tenant.stripe_subscription_id)
+            logger.info(
+                "Cancelled Stripe subscription %s for tenant %d (user deletion)",
+                tenant.stripe_subscription_id,
+                tenant_id,
+            )
+        except stripe.StripeError as e:
+            logger.error(
+                "Failed to cancel Stripe subscription %s: %s",
+                tenant.stripe_subscription_id,
+                str(e),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to cancel subscription. Account not deleted.",
+            )
+
+    # All DB changes in one transaction
+    try:
+        # Explicit delete of audit logs (belt-and-suspenders with CASCADE)
+        db.query(OAuthAuditLog).filter(OAuthAuditLog.user_id == user_id).delete()
+
+        # Delete the user
+        db.query(User).filter(User.id == user_id).delete()
+
+        # If this was the last user, delete the tenant (cascades to projects, scans, etc.)
+        if tenant and tenant_user_count == 1:
+            db.delete(tenant)
+            logger.info("Deleted tenant %d (last user removed)", tenant_id)
+
+        db.commit()
+        logger.info("Deleted user %d (tenant_id=%d)", user_id, tenant_id)
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to delete user %d", user_id)
+        raise HTTPException(status_code=500, detail="Account deletion failed.")
+
+    return Response(status_code=204)

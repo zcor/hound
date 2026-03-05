@@ -206,7 +206,7 @@ class OAuthAuditLog(Base):
     __tablename__ = "oauth_audit_log"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     action = Column(String(50), nullable=False)       # 'link', 'unlink', 'login', 'login_new'
     provider = Column(String(50), nullable=False)      # 'github', 'google'
     provider_user_id = Column(String(255), nullable=True)

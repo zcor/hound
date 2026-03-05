@@ -65,6 +65,7 @@ from slowapi import Limiter  # noqa: E402
 from slowapi.errors import RateLimitExceeded  # noqa: E402
 from slowapi.util import get_remote_address  # noqa: E402
 from sqlalchemy import func, text  # noqa: E402
+from sqlalchemy.exc import IntegrityError  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 from starlette.middleware.sessions import SessionMiddleware  # noqa: E402
 
@@ -84,7 +85,7 @@ from database.models import (  # noqa: E402
     create_db_engine,
     create_db_session,
 )
-from integrations.telegram import notify_new_repo_synced  # noqa: E402
+from integrations.telegram import notify_new_repo_synced, notify_repo_added, notify_app_installed  # noqa: E402
 from server.auth_utils import reject_preview_writes  # noqa: E402
 from server.token_crypto import decrypt_token  # noqa: E402
 
@@ -4015,8 +4016,64 @@ async def handle_github_webhook(request: Request, db: Session = Depends(get_db))
     if event_type == "installation":
         action = payload.get("action")
         installation = payload.get("installation", {})
-        logger.info(f"Installation event: {action} for {installation.get('id')}")
-        
+        installation_id = installation.get("id")
+        account = installation.get("account", {})
+        account_login = account.get("login", "")
+        account_type = account.get("type", "User")
+        logger.info(f"Installation event: {action} for {installation_id} ({account_login})")
+
+        if action == "created" and installation_id:
+            # Idempotent tenant creation: check by installation_id first, then by name
+            tenant = db.query(Tenant).filter(Tenant.installation_id == installation_id).first()
+            if not tenant:
+                tenant_name = f"github_{account_login}" if account_login else f"installation_{installation_id}"
+                tenant = db.query(Tenant).filter(Tenant.name == tenant_name).first()
+                if tenant:
+                    # Reinstall: update installation_id on existing tenant
+                    tenant.installation_id = installation_id
+                    tenant.github_account_login = account_login or tenant.github_account_login
+                    tenant.github_account_type = account_type or tenant.github_account_type
+                    db.commit()
+                    db.refresh(tenant)
+                else:
+                    # New install: create tenant
+                    try:
+                        tenant = Tenant(
+                            name=tenant_name,
+                            installation_id=installation_id,
+                            status="pending",
+                            github_account_login=account_login or None,
+                            github_account_type=account_type or None,
+                        )
+                        db.add(tenant)
+                        db.commit()
+                        db.refresh(tenant)
+                    except IntegrityError:
+                        db.rollback()
+                        # Race condition: another request created it first
+                        tenant = db.query(Tenant).filter(Tenant.installation_id == installation_id).first()
+
+            # Send notification (fire-and-forget)
+            try:
+                await notify_app_installed(
+                    github_account=account_login or f"installation_{installation_id}",
+                    account_type=account_type,
+                    tenant_id=tenant.id if tenant else None,
+                    installation_id=installation_id,
+                )
+            except Exception:
+                pass  # non-critical
+
+            return {
+                "status": "ok",
+                "event": "installation",
+                "action": action,
+                "tenant_id": tenant.id if tenant else None,
+            }
+
+        elif action == "deleted":
+            logger.info(f"GitHub App uninstalled by {account_login} (installation {installation_id}) - tenant preserved")
+
         return {"status": "ok", "event": "installation", "action": action}
     
     # Handle pull request events - THIS TRIGGERS AUDITS
@@ -5359,7 +5416,14 @@ async def create_repository(
 
     # Send Telegram notification for new repo (fire-and-forget)
     try:
-        await notify_new_repo_synced(project.name, project.git_url or "")
+        tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+        await notify_repo_added(
+            repo_name=project.name,
+            repo_url=project.git_url or "",
+            github_account=tenant.github_account_login if tenant else None,
+            tenant_id=tenant_id,
+            full_name=project.full_name,
+        )
     except Exception:
         pass  # non-critical
 

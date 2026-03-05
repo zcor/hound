@@ -474,22 +474,30 @@ def test_github_webhook_invalid_json(client):
 
 def test_github_webhook_installation_event(client):
     """Test GitHub webhook handles installation events."""
+    from unittest.mock import AsyncMock, patch
+
     payload = {
         "action": "created",
-        "installation": {"id": 12345},
-    }
-    response = client.post(
-        "/webhooks/github",
-        json=payload,
-        headers={
-            "X-GitHub-Event": "installation",
-            "X-Hub-Signature-256": "",  # No signature verification in dev mode
+        "installation": {
+            "id": 12345,
+            "account": {"login": "test-org", "type": "Organization"},
         },
-    )
+    }
+    with patch("server.api.notify_app_installed", new_callable=AsyncMock) as mock_notify:
+        mock_notify.return_value = True
+        response = client.post(
+            "/webhooks/github",
+            json=payload,
+            headers={
+                "X-GitHub-Event": "installation",
+                "X-Hub-Signature-256": "",  # No signature verification in dev mode
+            },
+        )
     assert response.status_code == 200
     data = response.json()
     assert data["event"] == "installation"
     assert data["action"] == "created"
+    assert data["tenant_id"] is not None
 
 
 def test_github_webhook_pr_event_skipped(client):
@@ -1285,3 +1293,198 @@ def test_findings_stats_surface_scans_dont_affect_confirmed(
     assert data["by_status"]["confirmed"] == 1
     # scanner_detected should reflect surface scan findings
     assert data["by_status"]["scanner_detected"] >= 1
+
+
+# --- Telegram notification & webhook installation tests ---
+
+
+def test_github_webhook_installation_creates_tenant(client, test_db):
+    """Test GitHub webhook installation event creates a tenant with correct fields."""
+    from unittest.mock import AsyncMock, patch
+
+    with patch("server.api.notify_app_installed", new_callable=AsyncMock) as mock_notify:
+        mock_notify.return_value = True
+        payload = {
+            "action": "created",
+            "installation": {
+                "id": 12345,
+                "account": {"login": "acme-corp", "type": "Organization"},
+            },
+        }
+        response = client.post(
+            "/webhooks/github",
+            json=payload,
+            headers={
+                "X-GitHub-Event": "installation",
+                "X-Hub-Signature-256": "",
+            },
+        )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["event"] == "installation"
+    assert data["action"] == "created"
+    assert data["tenant_id"] is not None
+
+    # Verify tenant was created in DB
+    tenant = test_db.query(Tenant).filter(Tenant.installation_id == 12345).first()
+    assert tenant is not None
+    assert tenant.status == "pending"
+    assert tenant.github_account_login == "acme-corp"
+    assert tenant.github_account_type == "Organization"
+    assert tenant.name == "github_acme-corp"
+
+    # Verify notification was called
+    mock_notify.assert_called_once()
+    call_kwargs = mock_notify.call_args[1]
+    assert call_kwargs["github_account"] == "acme-corp"
+    assert call_kwargs["account_type"] == "Organization"
+    assert call_kwargs["installation_id"] == 12345
+    assert call_kwargs["tenant_id"] == tenant.id
+
+
+def test_github_webhook_installation_idempotent(client, test_db):
+    """Test that posting the same installation payload twice creates only one tenant."""
+    payload = {
+        "action": "created",
+        "installation": {
+            "id": 77777,
+            "account": {"login": "repeat-org", "type": "Organization"},
+        },
+    }
+    headers = {
+        "X-GitHub-Event": "installation",
+        "X-Hub-Signature-256": "",
+    }
+    from unittest.mock import AsyncMock, patch
+
+    with patch("server.api.notify_app_installed", new_callable=AsyncMock) as mock_notify:
+        mock_notify.return_value = True
+        response1 = client.post("/webhooks/github", json=payload, headers=headers)
+        response2 = client.post("/webhooks/github", json=payload, headers=headers)
+
+    assert response1.status_code == 200
+    assert response2.status_code == 200
+
+    tenants = test_db.query(Tenant).filter(Tenant.installation_id == 77777).all()
+    assert len(tenants) == 1
+
+
+def test_github_webhook_installation_deleted(client, test_db):
+    """Test that 'deleted' action preserves the tenant."""
+    tenant = Tenant(
+        name="github_deleteme",
+        installation_id=99999,
+        status="active",
+        github_account_login="deleteme",
+        github_account_type="User",
+    )
+    test_db.add(tenant)
+    test_db.commit()
+
+    payload = {
+        "action": "deleted",
+        "installation": {
+            "id": 99999,
+            "account": {"login": "deleteme", "type": "User"},
+        },
+    }
+    response = client.post(
+        "/webhooks/github",
+        json=payload,
+        headers={
+            "X-GitHub-Event": "installation",
+            "X-Hub-Signature-256": "",
+        },
+    )
+    assert response.status_code == 200
+
+    # Tenant should still exist
+    preserved = test_db.query(Tenant).filter(Tenant.installation_id == 99999).first()
+    assert preserved is not None
+    assert preserved.status == "active"
+
+
+def test_create_repository_sends_notification(client, test_db, sample_tenant):
+    """Test that POST /repositories sends notify_repo_added with correct kwargs."""
+    from unittest.mock import AsyncMock, patch
+
+    sample_tenant.github_account_login = "testacct"
+    test_db.commit()
+
+    with patch("server.api.notify_repo_added", new_callable=AsyncMock) as mock_notify:
+        mock_notify.return_value = True
+        response = client.post(
+            "/repositories",
+            json={
+                "name": "my-contract",
+                "full_name": "testacct/my-contract",
+                "git_url": "https://github.com/testacct/my-contract",
+                "default_branch": "main",
+            },
+            headers=auth_headers(sample_tenant),
+        )
+    assert response.status_code == 201
+
+    mock_notify.assert_called_once()
+    call_kwargs = mock_notify.call_args[1]
+    assert call_kwargs["repo_name"] == "my-contract"
+    assert call_kwargs["repo_url"] == "https://github.com/testacct/my-contract"
+    assert call_kwargs["github_account"] == "testacct"
+    assert call_kwargs["tenant_id"] == sample_tenant.id
+    assert call_kwargs["full_name"] == "testacct/my-contract"
+
+
+def test_github_webhook_installation_signed(client, test_db):
+    """Test that webhook signature verification works end-to-end."""
+    import hashlib
+    import hmac as hmac_mod
+    import json
+
+    from unittest.mock import AsyncMock, patch
+
+    secret = "test-webhook-secret"
+    payload = {
+        "action": "created",
+        "installation": {
+            "id": 55555,
+            "account": {"login": "signed-org", "type": "Organization"},
+        },
+    }
+    body = json.dumps(payload).encode()
+    sig = hmac_mod.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+    import server.api as api_module
+
+    original_secret = api_module.GITHUB_WEBHOOK_SECRET
+    api_module.GITHUB_WEBHOOK_SECRET = secret
+    try:
+        with patch("server.api.notify_app_installed", new_callable=AsyncMock) as mock_notify:
+            mock_notify.return_value = True
+            # Valid signature → 200
+            response = client.post(
+                "/webhooks/github",
+                content=body,
+                headers={
+                    "X-GitHub-Event": "installation",
+                    "X-Hub-Signature-256": f"sha256={sig}",
+                    "Content-Type": "application/json",
+                },
+            )
+        assert response.status_code == 200
+        tenant = test_db.query(Tenant).filter(Tenant.installation_id == 55555).first()
+        assert tenant is not None
+        assert tenant.github_account_login == "signed-org"
+
+        # Bad signature → 401
+        response_bad = client.post(
+            "/webhooks/github",
+            content=body,
+            headers={
+                "X-GitHub-Event": "installation",
+                "X-Hub-Signature-256": "sha256=badsignature",
+                "Content-Type": "application/json",
+            },
+        )
+        assert response_bad.status_code == 401
+    finally:
+        api_module.GITHUB_WEBHOOK_SECRET = original_secret

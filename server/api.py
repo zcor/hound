@@ -4151,7 +4151,7 @@ async def handle_github_webhook(request: Request, db: Session = Depends(get_db))
             repo_url=clone_url,
             repo_name=repo_full_name,
             status="pending",
-            scan_config={"trigger_source": "pr", "pr_number": pr_number, "head_sha": head_sha},
+            scan_config={"trigger_source": "pr", "pr_number": pr_number, "head_sha": head_sha, "scan_type": "surface"},
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
         )
@@ -4893,6 +4893,7 @@ class ScanHistoryItem(BaseModel):
     findings_count: int
     started_at: datetime | None
     completed_at: datetime | None
+    scan_type: str = "surface"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -5504,7 +5505,7 @@ async def create_repository(
                 repo_name=project.name,
                 repo_url=project.git_url,
                 status="pending",
-                scan_config={"trigger_source": "repo_added"},
+                scan_config={"trigger_source": "repo_added", "scan_type": "surface"},
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             )
@@ -5908,6 +5909,7 @@ async def trigger_repository_scan(
         repo_name=project.name,
         repo_url=project.git_url,
         status="pending",
+        scan_config={"scan_type": "surface"},
         created_at=datetime.now(timezone.utc),
     )
     db.add(scan)
@@ -5994,6 +5996,7 @@ async def list_repository_scans(
             findings_count=findings_count,
             started_at=scan.started_at,
             completed_at=scan.completed_at,
+            scan_type=scan.scan_config.get("scan_type", "surface") if scan.scan_config else "surface",
         ))
     
     return ScanHistoryResponse(
@@ -7178,6 +7181,7 @@ class SurfaceScanResponse(BaseModel):
     summary: str
     error: str | None = None
     scan_log: str | None = None
+    scan_type: str = "surface"
 
 
 class SurfaceScanListItem(BaseModel):
@@ -7261,6 +7265,7 @@ async def run_surface_scan(
             scan_config={
                 "llm_budget": request.llm_budget,
                 "model": request.model,
+                "scan_type": "surface",
             },
             llm_calls_made=result.llm_calls_used,
             contracts_scanned=result.contracts_scanned,
@@ -7376,6 +7381,7 @@ async def run_full_surface_scan(
                 "llm_budget": request_body.llm_budget,
                 "model": request_body.model,
                 "paid": True,
+                "scan_type": "surface",
             },
             llm_calls_made=result.llm_calls_used,
             contracts_scanned=result.contracts_scanned,
@@ -7617,6 +7623,7 @@ async def get_surface_scan(
         summary=scan.summary or "",
         error=scan.error_message,
         scan_log=scan.scan_log,
+        scan_type=scan.scan_config.get("scan_type", "surface") if scan.scan_config else "surface",
     )
 
 

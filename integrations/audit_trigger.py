@@ -113,6 +113,7 @@ def run_audit_task(
             scan_config={
                 "trigger_source": "push",
                 "commit_sha": commit_sha,
+                "scan_type": "surface",
             },
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),

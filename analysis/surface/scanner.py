@@ -457,7 +457,7 @@ class SurfaceScanner:
                 # Skip if the file or its immediate parent is clearly a test/mock
                 skip_file = any(skip in filename for skip in ['.t.sol', 'test', 'mock', 'script'])
                 skip_dir = parent_name in ['test', 'tests', 'mocks', 'scripts', 'forge-std', 'node_modules']
-                if not skip_file and not skip_dir:
+                if not skip_file and not skip_dir and c.is_file():
                     filtered.append(c)
 
         return filtered

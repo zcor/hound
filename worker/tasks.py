@@ -775,10 +775,14 @@ def execute_scan_task(
         from analysis.surface.scanner import _redact_log, _truncate_log
         safe_log = _truncate_log(_redact_log(raw_log)) if raw_log else None
 
+        # If scanner returned an error, mark as failed
+        scan_error = result_dict.get("error")
+        final_status = "failed" if scan_error else "completed"
+
         # Update database
         self._update_scan_status(
             scan_id,
-            "completed",
+            final_status,
             risk_score=result_dict.get("risk_score"),
             risk_level=result_dict.get("risk_level"),
             findings=result_dict.get("findings"),
@@ -787,11 +791,12 @@ def execute_scan_task(
             contracts_scanned=result_dict.get("contracts_scanned", 0),
             contracts_total=result_dict.get("contracts_total", 0),
             scan_log=safe_log,
+            error_message=scan_error,
         )
-        
+
         publisher.publish_status(
-            "completed",
-            f"Scan complete. Risk score: {result_dict.get('risk_score', 0)}"
+            final_status,
+            scan_error or f"Scan complete. Risk score: {result_dict.get('risk_score', 0)}"
         )
 
         # Post findings to PR if this was triggered by a PR event

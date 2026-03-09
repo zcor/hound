@@ -22,6 +22,8 @@ from celery.exceptions import SoftTimeLimitExceeded  # noqa: E402
 from .celery_app import celery_app  # noqa: E402
 from .redis_publisher import RedisPublisher  # noqa: E402
 
+from llm.token_tracker import set_token_context, clear_token_context  # noqa: E402
+
 
 class AuditTask(Task):
     """
@@ -60,6 +62,29 @@ class AuditTask(Task):
             
             # Update database
             self._update_scan_status(scan_id, "failed", error_message=str(exc))
+            
+            # Refund credit if this scan consumed one
+            self._refund_if_credit_used(scan_id)
+        
+        # Clear token context on failure
+        clear_token_context()
+    
+    def _refund_if_credit_used(self, scan_id: str):
+        """Refund a scan credit if the failed scan consumed one."""
+        try:
+            from database.models import ScanExecution
+            from server.tier_enforcement import refund_scan_credit
+            
+            db = self.get_db_session()
+            try:
+                scan = db.query(ScanExecution).filter_by(execution_id=scan_id).first()
+                if scan and scan.scan_config and scan.scan_config.get("uses_credit"):
+                    refund_scan_credit(db, scan.tenant_id, scan_id)
+                    print(f"Refunded scan credit for tenant {scan.tenant_id} (scan {scan_id})")
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"Failed to refund scan credit: {e}")
     
     def on_success(self, retval, task_id, args, kwargs):
         """Handle task success."""
@@ -160,6 +185,14 @@ def execute_audit_task(
     temp_dir = None
     
     try:
+        # Set token tracking context for cost attribution
+        set_token_context(
+            project_id=project_id,
+            session_id=scan_id,
+            tenant_id=tenant_id,
+            endpoint="audit",
+        )
+        
         # Publish start status
         publisher.publish_status("running", "Starting audit...")
         self._update_scan_status(scan_id, "running")
@@ -709,6 +742,7 @@ def execute_audit_task(
     finally:
         # Cleanup
         publisher.close()
+        clear_token_context()
         
         if temp_dir and os.path.exists(temp_dir):
             try:
@@ -750,6 +784,13 @@ def execute_scan_task(
     try:
         publisher.publish_status("running", "Starting surface scan...")
         self._update_scan_status(scan_id, "running")
+        
+        # Set token tracking context for cost attribution
+        set_token_context(
+            session_id=scan_id,
+            tenant_id=tenant_id,
+            endpoint="scan",
+        )
         
         from analysis.surface import SurfaceScanner
         from utils.config_loader import load_config
@@ -846,6 +887,7 @@ def execute_scan_task(
 
     finally:
         publisher.close()
+        clear_token_context()
 
 
 def _store_hypotheses_in_db(
@@ -990,6 +1032,14 @@ def build_graphs_task(
     try:
         publisher.publish_status("running", "Starting graph build")
         publisher.publish_thought("Initializing graph build task...", iteration=0)
+        
+        # Set token tracking context for cost attribution
+        set_token_context(
+            project_id=project_id,
+            session_id=scan_id,
+            tenant_id=tenant_id,
+            endpoint="build_graphs",
+        )
         
         # Step 1: Clone or locate repository
         if repo_url.startswith(("http://", "https://", "git@")):
@@ -1170,6 +1220,7 @@ def build_graphs_task(
         
     finally:
         publisher.close()
+        clear_token_context()
         
         # Note: We don't clean up temp_dir here as the graphs may be needed
         # Cleanup should happen after audit completes or via scheduled task

@@ -4119,6 +4119,16 @@ async def handle_github_webhook(request: Request, db: Session = Depends(get_db))
 
         logger.info(f"Triggering surface scan for PR #{pr_number} on {repo_full_name}")
 
+        # Tier enforcement: check plan limits before scanning
+        uses_credit = False
+        try:
+            from server.tier_enforcement import _check_sync
+            allowance = _check_sync(tenant.id, "scan", db)
+            uses_credit = allowance.get("uses_credit", False)
+        except HTTPException:
+            logger.info(f"Scan limit reached for tenant {tenant.id} ({tenant.name}), skipping PR scan for {repo_full_name}")
+            return {"status": "ok", "event": "pull_request", "skipped": True, "reason": "scan_limit_reached"}
+
         # Redis dedup: per PR + head SHA
         dedup_key = f"pr:scan:{project.id if project else 0}:{pr_number}:{head_sha}"
         try:
@@ -4151,7 +4161,7 @@ async def handle_github_webhook(request: Request, db: Session = Depends(get_db))
             repo_url=clone_url,
             repo_name=repo_full_name,
             status="pending",
-            scan_config={"trigger_source": "pr", "pr_number": pr_number, "head_sha": head_sha, "scan_type": "surface"},
+            scan_config={"trigger_source": "pr", "pr_number": pr_number, "head_sha": head_sha, "scan_type": "surface", "uses_credit": uses_credit},
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
         )
@@ -5496,6 +5506,16 @@ async def create_repository(
     # Auto-trigger initial surface scan (fire-and-forget)
     if project.git_url:
         try:
+            # Tier enforcement: check plan limits before auto-scanning
+            from server.tier_enforcement import _check_sync
+            auto_scan_uses_credit = False
+            try:
+                allowance = _check_sync(tenant_id, "scan", db)
+                auto_scan_uses_credit = allowance.get("uses_credit", False)
+            except HTTPException:
+                logger.info(f"Scan limit reached for tenant {tenant_id}, skipping auto-scan for {project.name}")
+                raise  # caught by outer except — repo add still succeeds
+
             from worker.tasks import execute_scan_task
             initial_execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
             initial_scan = ScanExecution(
@@ -5505,7 +5525,7 @@ async def create_repository(
                 repo_name=project.name,
                 repo_url=project.git_url,
                 status="pending",
-                scan_config={"trigger_source": "repo_added", "scan_type": "surface"},
+                scan_config={"trigger_source": "repo_added", "scan_type": "surface", "uses_credit": auto_scan_uses_credit},
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             )

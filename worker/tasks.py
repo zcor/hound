@@ -699,12 +699,17 @@ def execute_audit_task(
                     iteration=result.get("iterations", 0)
                 )
         
-        # Update final status
+        # Normalize hypotheses into SurfaceFinding-compatible shape for ScanExecution
+        normalized_findings, risk_score, risk_level = _normalize_hypotheses_for_scan(hypotheses)
+
+        # Update final status (writes to ScanExecution if present, else AuditSession)
         self._update_scan_status(
             scan_id,
             "completed",
-            findings=hypotheses,
-            summary=f"Found {len(hypotheses)} potential issues",
+            findings=normalized_findings,
+            summary=f"Deep audit found {len(hypotheses)} potential issues",
+            risk_score=risk_score,
+            risk_level=risk_level,
         )
         
         publisher.publish_status(
@@ -931,6 +936,52 @@ def _store_hypotheses_in_db(
         print(f"Failed to store hypotheses: {e}")
         import traceback
         traceback.print_exc()
+
+
+def _normalize_hypotheses_for_scan(hypotheses: list) -> tuple[list, int, str]:
+    """Normalize deep-audit hypotheses into SurfaceFinding-compatible shape.
+
+    Returns (normalized_findings, risk_score, risk_level).
+    The frontend serializer expects: pattern_id, title, severity,
+    category, confidence, location, code_snippet, description, llm_verified.
+    """
+    severity_weights = {"critical": 25, "high": 15, "medium": 5, "low": 1}
+    risk_score = min(100, sum(
+        severity_weights.get(h.get("severity", "medium"), 5)
+        for h in hypotheses
+    ))
+    risk_level = (
+        "critical" if risk_score >= 75
+        else "high" if risk_score >= 50
+        else "medium" if risk_score >= 25
+        else "low"
+    )
+
+    normalized = []
+    for h in hypotheses:
+        node_ids = h.get("node_ids", []) or []
+        location = ", ".join(str(n) for n in node_ids[:3]) if node_ids else ""
+        evidence = h.get("evidence", [])
+        code_snippet = ""
+        if isinstance(evidence, list):
+            for ev in evidence[:1]:
+                if isinstance(ev, dict) and "code" in ev:
+                    code_snippet = ev["code"][:500]
+
+        normalized.append({
+            "pattern_id": h.get("id", ""),
+            "title": h.get("title") or h.get("description", "")[:80],
+            "severity": h.get("severity", "medium"),
+            "category": h.get("vulnerability_type", "vulnerability"),
+            "confidence": float(h.get("confidence", 0.5)),
+            "location": location,
+            "code_snippet": code_snippet,
+            "description": h.get("description", ""),
+            "llm_verified": True,
+            "llm_notes": None,
+        })
+
+    return normalized, risk_score, risk_level
 
 
 def _convert_hypotheses_to_findings(hypotheses: list) -> list[dict]:

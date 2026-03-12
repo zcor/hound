@@ -128,11 +128,14 @@ def _check_sync(tenant_id: int, operation: str, db: Session) -> dict:
         return {"uses_credit": True}
 
     elif operation == "audit":
-        from database.models import AuditSession
+        from database.models import AuditSession, Project
         now = datetime.now(timezone.utc)
         month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
+        # Tenant-scoped: only count audits linked to this tenant's projects
+        tenant_project_ids = db.query(Project.id).filter(Project.tenant_id == tenant_id).subquery()
         audit_count = db.query(AuditSession).filter(
+            AuditSession.project_id.in_(tenant_project_ids),
             AuditSession.start_time >= month_start,
         ).count()
 

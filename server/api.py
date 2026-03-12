@@ -2905,29 +2905,66 @@ async def start_audit(
     """
     Start a new security audit (async, returns immediately).
     PAID: $5.00 via x402 for AI agent customers.
+    SaaS subscribers bypass x402 (they pay via Stripe).
 
     This endpoint:
-    1. Checks x402 payment gate (for agent customers)
-    2. Creates an AuditSession record with status "queued"
-    3. Dispatches work to the Celery worker queue
-    4. Returns immediately with a session_id for tracking
+    1. Validates project ownership (if project_id provided)
+    2. Checks x402 payment gate (skipped for SaaS subscribers)
+    3. Enforces audit quota for SaaS subscribers
+    4. Creates an AuditSession record with status "queued"
+    5. Creates a ScanExecution row (dashboard path only)
+    6. Dispatches work to the Celery worker queue
+    7. Returns immediately with a session_id for tracking
 
     The actual audit runs in a background Celery worker. Connect to the
     WebSocket endpoint to receive real-time progress updates.
     """
-    # x402 payment gate
     from server.x402_deps import PaymentGate, create_paid_job, mark_job_failed, require_payment
 
-    gate_fn = require_payment("POST /audits/start")
-    gate = await gate_fn(request=request, tenant_id=tenant_id, db=db)
+    # Step 1: Validate project ownership (if project_id provided)
+    project = None
+    if request_body.project_id:
+        project = db.query(Project).filter(
+            Project.id == request_body.project_id,
+            Project.tenant_id == tenant_id,
+        ).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
 
-    if gate.status == "already_processed":
-        return AuditStartResponse(
-            session_id=gate.job_id or "",
-            status="already_processed",
-            message="Already processed",
-            websocket_url=f"/ws/sessions/{gate.job_id}",
-        )
+    # Step 2: SaaS bypass for x402 — SaaS subscribers pay via Stripe, not x402
+    tenant = project.tenant if project else db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        tenant = Tenant(name="default")
+        db.add(tenant)
+        db.commit()
+
+    has_saas_sub = tenant.stripe_subscription_id and tenant.plan not in (None, "free")
+
+    gate = PaymentGate(enabled=False, status="disabled")
+
+    if has_saas_sub:
+        # SaaS tenant — enforce audit quota via tier enforcement
+        from server.tier_enforcement import _check_sync
+        _check_sync(tenant_id, "audit", db)  # Raises 403 if over quota
+
+        # Require project_id for SaaS tenants (dashboard path)
+        if not request_body.project_id:
+            raise HTTPException(
+                status_code=422,
+                detail="project_id is required for SaaS subscribers",
+            )
+    else:
+        # Agent customer — require x402 payment
+        gate_fn = require_payment("POST /audits/start")
+        gate = await gate_fn(request=request, tenant_id=tenant_id, db=db)
+
+        if gate.status == "already_processed":
+            return AuditStartResponse(
+                session_id=gate.job_id or "",
+                status="already_processed",
+                message="Already processed",
+                websocket_url=f"/ws/sessions/{gate.job_id}",
+            )
 
     # Import worker tasks (done here to avoid circular imports)
     try:
@@ -2941,15 +2978,6 @@ async def start_audit(
     # Generate unique session ID
     session_id = f"audit_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
 
-    # Get or create tenant
-    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
-    if not tenant:
-        tenant = db.query(Tenant).first()
-        if not tenant:
-            tenant = Tenant(name="default")
-            db.add(tenant)
-            db.commit()
-
     # Create AuditSession record with status "queued"
     audit_session = AuditSession(
         session_id=session_id,
@@ -2960,6 +2988,23 @@ async def start_audit(
     )
     db.add(audit_session)
     db.commit()
+
+    # Create ScanExecution so deep audit appears in scan history (dashboard path only)
+    if project:
+        from database.models import ScanExecution as ScanExecutionModel
+
+        deep_scan = ScanExecutionModel(
+            execution_id=session_id,
+            project_id=request_body.project_id,
+            tenant_id=tenant_id,
+            repo_url=request_body.repo_url,
+            repo_name=project.name,
+            status="queued",
+            started_at=datetime.now(timezone.utc),
+            scan_config={"scan_type": "deep", "mode": request_body.mode},
+        )
+        db.add(deep_scan)
+        db.commit()
 
     logger.info(f"Created audit session {session_id} for {request_body.repo_url}")
 
@@ -3026,12 +3071,19 @@ async def get_audit_status(
             .filter(Hypothesis.project_id == session.project_id)
             .count()
         )
-    
+
+    # Read error_message from ScanExecution if available (dashboard-linked audits)
+    error_message = None
+    scan_exec = db.query(ScanExecution).filter_by(execution_id=session_id).first()
+    if scan_exec and scan_exec.error_message:
+        error_message = scan_exec.error_message
+
     return AuditStatusResponse(
         session_id=session.session_id,
         status=session.status,
         progress=session.token_usage,  # Contains progress info
         findings_count=findings_count,
+        error_message=error_message,
         started_at=session.start_time,
         completed_at=session.end_time,
     )

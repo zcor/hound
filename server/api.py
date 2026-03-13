@@ -5201,27 +5201,53 @@ async def get_current_month_usage(
     )
 
 
-def _count_findings_for_project(db: Session, project_id: int) -> int:
-    """Count current findings for a project.
+def _latest_scan_by_type(db: Session, project_id: int, scan_type: str):
+    """Get the latest completed scan of a given type for a project.
 
-    Uses the LATEST completed surface scan (not cumulative) to avoid
-    inflating counts on rescan. Also includes deep audit hypotheses.
+    Filters in Python (not SQL) because scan_config is JSONB on Postgres
+    but plain JSON on SQLite (tests), and JSONB path operators like
+    ['scan_type'].astext don't work on SQLite.
     """
-    # Latest completed surface scan findings
-    latest_scan = db.query(ScanExecution).filter(
+    scans = db.query(ScanExecution).filter(
         ScanExecution.project_id == project_id,
         ScanExecution.status == "completed",
         ScanExecution.findings.isnot(None),
-    ).order_by(ScanExecution.created_at.desc()).first()
+    ).order_by(ScanExecution.created_at.desc()).all()
 
-    surface_findings = len(latest_scan.findings) if latest_scan and latest_scan.findings else 0
+    for scan in scans:
+        cfg = scan.scan_config or {}
+        actual_type = cfg.get("scan_type", "surface") if isinstance(cfg, dict) else "surface"
+        if actual_type == scan_type:
+            return scan
+    return None
 
-    # Deep audit hypotheses (if any exist)
-    deep_findings = db.query(func.count(Hypothesis.id)).filter(
-        Hypothesis.project_id == project_id
-    ).scalar() or 0
 
-    return surface_findings + deep_findings
+def _count_findings_for_project(db: Session, project_id: int) -> int:
+    """Count current findings for a project.
+
+    Uses the LATEST completed scan per type (surface + deep separately)
+    to avoid deep audits eclipsing surface findings or vice versa.
+    """
+    count = 0
+
+    # Latest completed surface scan findings
+    latest_surface = _latest_scan_by_type(db, project_id, "surface")
+    if latest_surface and latest_surface.findings:
+        count += len(latest_surface.findings)
+
+    # Latest completed deep audit findings (from ScanExecution, not Hypothesis table)
+    latest_deep = _latest_scan_by_type(db, project_id, "deep")
+    if latest_deep and latest_deep.findings:
+        count += len(latest_deep.findings)
+
+    # Deep audit hypotheses not backed by a ScanExecution (CLI/agent path)
+    if not latest_deep:
+        deep_findings = db.query(func.count(Hypothesis.id)).filter(
+            Hypothesis.project_id == project_id
+        ).scalar() or 0
+        count += deep_findings
+
+    return count
 
 
 @app.get("/repositories", response_model=RepositoryListResponse)
@@ -6136,10 +6162,11 @@ async def list_all_findings(
             updated_at=h.updated_at,
         ))
 
-    # Include surface scan findings (latest completed scan per project).
-    # This is a current-state view: only the most recent completed scan per
-    # project is included, matching /findings/stats semantics.  Historical
-    # scan data is available via /repositories/{id}/scans.
+    # Include scan findings (latest completed scan per type per project).
+    # Surface and deep scans are independent analyses — both contribute.
+    # This is a current-state view: the most recent completed scan of each
+    # type per project is included.  Historical scan data is available via
+    # /repositories/{id}/scans.
     tenant_projects = db.query(Project.id, Project.name).filter(
         Project.tenant_id == tenant_id,
         Project.status != "removed",
@@ -6151,44 +6178,43 @@ async def list_all_findings(
         if repository_id and proj_id != repository_id:
             continue
 
-        latest_scan = db.query(ScanExecution).filter(
-            ScanExecution.project_id == proj_id,
-            ScanExecution.status == "completed",
-            ScanExecution.findings.isnot(None),
-        ).order_by(ScanExecution.created_at.desc()).first()
+        # Get latest surface scan AND latest deep scan separately
+        scans_to_include = []
+        for stype in ("surface", "deep"):
+            scan = _latest_scan_by_type(db, proj_id, stype)
+            if scan and scan.findings:
+                scans_to_include.append(scan)
 
-        if not latest_scan or not latest_scan.findings:
-            continue
-
-        scan_ts = latest_scan.completed_at or latest_scan.created_at
-        for sf in latest_scan.findings:
-            if not isinstance(sf, dict):
-                continue
-            sf_severity = sf.get("severity", "medium")
-            sf_status = "scanner_detected"
-            # Apply severity/status filters
-            if severity and sf_severity != severity:
-                continue
-            if status and sf_status != status:
-                continue
-            surface_findings.append(FindingResponse(
-                id=None,
-                hypothesis_id=None,
-                pattern_id=sf.get("pattern_id"),
-                title=sf.get("title", "Untitled"),
-                description=sf.get("description", ""),
-                vulnerability_type=sf.get("category"),
-                status=sf_status,
-                confidence=sf.get("confidence", 0.5),
-                severity=sf_severity,
-                node_refs=None,
-                evidence={"scan_execution_id": latest_scan.execution_id},
-                location=sf.get("location"),
-                code_snippet=sf.get("code_snippet"),
-                project_id=proj_id,
-                created_at=scan_ts,
-                updated_at=scan_ts,
-            ))
+        for latest_scan in scans_to_include:
+            scan_ts = latest_scan.completed_at or latest_scan.created_at
+            for sf in latest_scan.findings:
+                if not isinstance(sf, dict):
+                    continue
+                sf_severity = sf.get("severity", "medium")
+                sf_status = "scanner_detected"
+                # Apply severity/status filters
+                if severity and sf_severity != severity:
+                    continue
+                if status and sf_status != status:
+                    continue
+                surface_findings.append(FindingResponse(
+                    id=None,
+                    hypothesis_id=None,
+                    pattern_id=sf.get("pattern_id"),
+                    title=sf.get("title", "Untitled"),
+                    description=sf.get("description", ""),
+                    vulnerability_type=sf.get("category"),
+                    status=sf_status,
+                    confidence=sf.get("confidence", 0.5),
+                    severity=sf_severity,
+                    node_refs=None,
+                    evidence={"scan_execution_id": latest_scan.execution_id},
+                    location=sf.get("location"),
+                    code_snippet=sf.get("code_snippet"),
+                    project_id=proj_id,
+                    created_at=scan_ts,
+                    updated_at=scan_ts,
+                ))
 
     # Combine, sort by created_at descending, then paginate in-memory.
     # Acceptable at current scale (tens to low hundreds per tenant).
@@ -6261,29 +6287,25 @@ async def get_findings_statistics(
             repo_name = finding.project.name
             by_repository[repo_name] = by_repository.get(repo_name, 0) + 1
 
-    # Also include surface scan findings (latest scan per project)
+    # Also include scan findings (latest scan per type per project)
     tenant_projects = db.query(Project.id, Project.name).filter(
         Project.tenant_id == tenant_id,
         Project.status != "removed",
     ).all()
 
     for proj_id, proj_name in tenant_projects:
-        latest_scan = db.query(ScanExecution).filter(
-            ScanExecution.project_id == proj_id,
-            ScanExecution.status == "completed",
-            ScanExecution.findings.isnot(None),
-        ).order_by(ScanExecution.created_at.desc()).first()
+        for stype in ("surface", "deep"):
+            latest_scan = _latest_scan_by_type(db, proj_id, stype)
+            if not latest_scan or not latest_scan.findings:
+                continue
 
-        if not latest_scan or not latest_scan.findings:
-            continue
-
-        for finding in latest_scan.findings:
-            total += 1
-            sev = finding.get("severity", "low") if isinstance(finding, dict) else "low"
-            if sev in by_severity:
-                by_severity[sev] += 1
-            by_status["scanner_detected"] += 1
-            by_repository[proj_name] = by_repository.get(proj_name, 0) + 1
+            for finding in latest_scan.findings:
+                total += 1
+                sev = finding.get("severity", "low") if isinstance(finding, dict) else "low"
+                if sev in by_severity:
+                    by_severity[sev] += 1
+                by_status["scanner_detected"] += 1
+                by_repository[proj_name] = by_repository.get(proj_name, 0) + 1
 
     return FindingStatsResponse(
         total=total,

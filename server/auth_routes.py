@@ -260,6 +260,21 @@ async def github_callback(
         )
         github_user = user_response.json()
 
+        # 2b. Fetch primary email if not public
+        if not github_user.get("email"):
+            emails_response = await client.get(
+                "https://api.github.com/user/emails",
+                headers={
+                    "Authorization": f"Bearer {github_token}",
+                    "Accept": "application/json",
+                },
+            )
+            if emails_response.status_code == 200:
+                for entry in emails_response.json():
+                    if entry.get("primary") and entry.get("verified"):
+                        github_user["email"] = entry["email"]
+                        break
+
     # 3. Create or update user in database
     user = db.query(User).filter(User.github_id == github_user["id"]).first()
     is_new_user = False

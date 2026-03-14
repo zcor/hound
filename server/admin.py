@@ -464,7 +464,11 @@ class ProjectAdmin(ModelView, model=Project):
                             async with httpx.AsyncClient(timeout=300.0) as client:
                                 # Use localhost for internal API calls to avoid proxy authentication
                                 base_url = "http://localhost:8000"
-                                
+                                headers = {}
+                                admin_key = os.environ.get("HOUND_ADMIN_KEY", "")
+                                if admin_key:
+                                    headers["X-Admin-Key"] = admin_key
+
                                 response = await client.post(
                                     f"{base_url}/sessions/{latest_session.session_id}/report",
                                     json={
@@ -472,12 +476,13 @@ class ProjectAdmin(ModelView, model=Project):
                                         "title": f"Security Audit Report: {project.name}",
                                         "auditors": "Security Team",
                                         "include_all": False  # Only confirmed findings
-                                    }
+                                    },
+                                    headers=headers,
                                 )
                                 return response
-                        
+
                         response = await generate_report_request()
-                        
+
                         if response.status_code == 200:
                             data = response.json()
                             report_path = Path(data['output_path'])
@@ -663,7 +668,11 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
                             async with httpx.AsyncClient(timeout=300.0) as client:
                                 # Use localhost for internal API calls to avoid proxy authentication
                                 base_url = "http://localhost:8000"
-                                
+                                headers = {}
+                                admin_key = os.environ.get("HOUND_ADMIN_KEY", "")
+                                if admin_key:
+                                    headers["X-Admin-Key"] = admin_key
+
                                 response = await client.post(
                                     f"{base_url}/sessions/{session.session_id}/report",
                                     json={
@@ -671,12 +680,13 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
                                         "title": f"Security Audit Report: {project.name}",
                                         "auditors": "Security Team",
                                         "include_all": False  # Only confirmed findings
-                                    }
+                                    },
+                                    headers=headers,
                                 )
                                 return response
-                        
+
                         response = await generate_report_request()
-                        
+
                         if response.status_code == 200:
                             data = response.json()
                             report_path = Path(data['output_path'])
@@ -1430,12 +1440,16 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
             
             # Generate report
             import httpx
-            
+
             async def generate_report_request():
                 async with httpx.AsyncClient(timeout=300.0) as client:
                     # Use localhost for internal API calls to avoid proxy authentication
                     base_url = "http://localhost:8000"
-                    
+                    headers = {}
+                    admin_key = os.environ.get("HOUND_ADMIN_KEY", "")
+                    if admin_key:
+                        headers["X-Admin-Key"] = admin_key
+
                     response = await client.post(
                         f"{base_url}/sessions/{latest_session.session_id}/report",
                         json={
@@ -1443,7 +1457,8 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
                             "title": f"Security Audit Report: {project.name}",
                             "auditors": "Security Team",
                             "include_all": False
-                        }
+                        },
+                        headers=headers,
                     )
                     return response
             

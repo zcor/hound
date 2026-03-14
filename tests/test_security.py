@@ -24,7 +24,9 @@ from database.models import (
     Graph,
     Hypothesis,
     Project,
+    ScanExecution,
     Tenant,
+    User,
 )
 
 # Set test database URL before importing app
@@ -538,3 +540,184 @@ class TestPublicEndpointsStillWork:
         )
         # Should not return 401 — webhooks use signature verification, not JWT
         assert response.status_code != 401
+
+
+# =============================================================================
+# Fixtures for endpoint auth tests
+# =============================================================================
+
+
+@pytest.fixture
+def scan_a(test_db, project_a, tenant_a):
+    """Create a scan execution owned by tenant A."""
+    scan = ScanExecution(
+        execution_id="scan_a_001",
+        project_id=project_a.id,
+        tenant_id=tenant_a.id,
+        repo_name="project_a",
+        repo_url="https://github.com/a/repo",
+        status="completed",
+        scan_config={"scan_type": "surface"},
+        created_at=datetime.now(timezone.utc),
+    )
+    test_db.add(scan)
+    test_db.commit()
+    test_db.refresh(scan)
+    return scan
+
+
+@pytest.fixture
+def github_user_a(test_db, tenant_a):
+    """Create a user with GitHub linked for tenant A."""
+    user = User(
+        tenant_id=tenant_a.id,
+        email="user_a@test.com",
+        github_id=111,
+        github_login="user_a",
+        github_access_token="ghp_fake_token_a",
+    )
+    test_db.add(user)
+    test_db.commit()
+    test_db.refresh(user)
+    return user
+
+
+@pytest.fixture
+def github_user_b(test_db, tenant_b):
+    """Create a user with GitHub linked for tenant B."""
+    user = User(
+        tenant_id=tenant_b.id,
+        email="user_b@test.com",
+        github_id=222,
+        github_login="user_b",
+        github_access_token="ghp_fake_token_b",
+    )
+    test_db.add(user)
+    test_db.commit()
+    test_db.refresh(user)
+    return user
+
+
+def jwt_headers_for_user(tenant, user):
+    """Create JWT auth headers with user_id matching a real User row."""
+    token = create_access_token({
+        "tenant_id": tenant.id,
+        "user_id": user.id,
+        "github_login": user.github_login,
+    })
+    return {"Authorization": f"Bearer {token}"}
+
+
+# =============================================================================
+# TestEndpointAuth — auth enforcement on previously-unauthenticated endpoints
+# =============================================================================
+
+
+class TestEndpointAuth:
+    """Test that previously-unauthenticated endpoints now require auth."""
+
+    def test_delete_scan_requires_auth(self, client):
+        """DELETE /surface/scans/xxx without auth header returns 401."""
+        response = client.delete("/surface/scans/nonexistent")
+        assert response.status_code == 401
+
+    def test_delete_scan_cross_tenant(self, client, scan_a, tenant_b):
+        """Tenant B cannot delete tenant A's scan."""
+        response = client.delete(
+            f"/surface/scans/{scan_a.execution_id}",
+            headers=jwt_headers(tenant_b),
+        )
+        assert response.status_code == 404
+
+    def test_delete_scan_own_tenant(self, client, scan_a, tenant_a):
+        """Tenant A can delete their own scan."""
+        response = client.delete(
+            f"/surface/scans/{scan_a.execution_id}",
+            headers=jwt_headers(tenant_a),
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "deleted"
+
+    def test_trigger_scan_cross_tenant(
+        self, client, project_b, tenant_a, github_user_a
+    ):
+        """Tenant A cannot trigger scan on tenant B's repo."""
+        response = client.post(
+            f"/repositories/{project_b.id}/scan",
+            headers=jwt_headers_for_user(tenant_a, github_user_a),
+        )
+        assert response.status_code == 404
+
+    def test_finalize_requires_auth(self, client):
+        """POST /sessions/xxx/finalize without auth returns 401."""
+        response = client.post(
+            "/sessions/nonexistent/finalize",
+            json={"threshold": 0.5},
+        )
+        assert response.status_code == 401
+
+    def test_poc_requires_auth(self, client):
+        """POST /sessions/xxx/poc without auth returns 401."""
+        response = client.post(
+            "/sessions/nonexistent/poc",
+            json={},
+        )
+        assert response.status_code == 401
+
+    def test_report_requires_auth(self, client, admin_key):
+        """POST /sessions/xxx/report without auth returns 401."""
+        response = client.post(
+            "/sessions/nonexistent/report",
+            json={"format": "html"},
+        )
+        assert response.status_code == 401
+
+    def test_report_admin_auth_passes(self, client, admin_key):
+        """Request with valid X-Admin-Key gets past auth (404 for nonexistent session)."""
+        response = client.post(
+            "/sessions/nonexistent/report",
+            json={"format": "html"},
+            headers={"X-Admin-Key": admin_key},
+        )
+        # 404 proves auth passed — it reached the session lookup
+        assert response.status_code == 404
+
+    def test_session_finalize_own_tenant(self, client, session_a, tenant_a):
+        """Tenant A can finalize own session (empty result — no pending hypotheses)."""
+        response = client.post(
+            f"/sessions/{session_a.session_id}/finalize",
+            json={"threshold": 0.5},
+            headers=jwt_headers(tenant_a),
+        )
+        assert response.status_code == 200
+        assert response.json()["total_reviewed"] == 0
+
+    def test_session_endpoints_cross_tenant(
+        self, client, session_b, tenant_a, project_b
+    ):
+        """Tenant A cannot access tenant B's session via finalize, poc, or report."""
+        headers = jwt_headers(tenant_a)
+
+        # /finalize
+        r1 = client.post(
+            f"/sessions/{session_b.session_id}/finalize",
+            json={"threshold": 0.5},
+            headers=headers,
+        )
+        assert r1.status_code == 404
+
+        # /poc
+        r2 = client.post(
+            f"/sessions/{session_b.session_id}/poc",
+            json={},
+            headers=headers,
+        )
+        assert r2.status_code == 404
+
+        # /report
+        r3 = client.post(
+            f"/sessions/{session_b.session_id}/report",
+            json={"format": "html"},
+            headers=headers,
+        )
+        assert r3.status_code == 404

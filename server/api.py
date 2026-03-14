@@ -160,6 +160,36 @@ def require_admin(request: Request):
         raise HTTPException(status_code=401, detail="Admin authentication required. Set X-Admin-Key header or admin_key query param.")
 
 
+def _verify_explicit_admin_header(request: Request) -> bool:
+    """Check admin credentials via X-Admin-Key header ONLY.
+
+    Unlike verify_admin_auth(), this:
+    - Does NOT auto-allow when ADMIN_API_KEY is unset (no open-dev shortcut)
+    - Does NOT accept session cookies (CSRF risk on side-effecting endpoints)
+    - Does NOT accept query-param auth (leaks into logs/referrers)
+
+    Use this for data endpoints called by admin.py internally.
+    """
+    if not ADMIN_API_KEY:
+        return False  # No open-dev shortcut
+
+    api_key = request.headers.get("X-Admin-Key") or ""
+    return api_key == ADMIN_API_KEY
+
+
+async def require_tenant_or_admin(request: Request) -> int | None:
+    """Accept either tenant JWT or explicit admin header auth.
+
+    Returns tenant_id (int) for tenant callers, None for admin callers.
+    Raises 401 if neither succeeds. Does NOT auto-allow in open-dev mode.
+    """
+    if _verify_explicit_admin_header(request):
+        return None  # Admin caller — skip tenant ownership check
+
+    # Fall through to tenant JWT (raises 401 if invalid/missing)
+    return await get_current_tenant_id(request)
+
+
 # Create engine lazily to avoid connection errors during import
 _engine = None
 
@@ -5975,6 +6005,7 @@ async def github_status(
 async def trigger_repository_scan(
     repository_id: int,
     request: Request,
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
     _: None = Depends(reject_preview_writes),
     __: User = Depends(require_github_linked),
@@ -5986,15 +6017,18 @@ async def trigger_repository_scan(
     Checks plan limits before allowing the scan.
     Returns the execution ID for tracking.
     """
-    # Tier enforcement: check plan limits
+    # 1. Ownership check FIRST — before any credit consumption
+    project = db.query(Project).filter(
+        Project.id == repository_id,
+        Project.tenant_id == tenant_id,
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    # 2. Tier enforcement SECOND — only after we know the repo is theirs
     from server.tier_enforcement import require_plan_allowance
     tier_check = require_plan_allowance("scan")
     allowance = await tier_check(request)
-
-    # Verify repository exists
-    project = db.query(Project).filter(Project.id == repository_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Repository not found")
 
     # Generate scan execution ID
     execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
@@ -6351,11 +6385,13 @@ async def finalize_session_hypotheses(
     session_id: str,
     request: QAFinalizeRequest,
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db)
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Run QA finalization on hypotheses from a session.
-    
+
     Uses an LLM to review hypotheses above the confidence threshold
     and confirm/reject them based on source code analysis.
     """
@@ -6363,11 +6399,14 @@ async def finalize_session_hypotheses(
     session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Get the project
-    project = db.query(Project).filter(Project.id == session.project_id).first()
+
+    # Get the project — verify tenant ownership
+    project = db.query(Project).filter(
+        Project.id == session.project_id,
+        Project.tenant_id == tenant_id,
+    ).first()
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(status_code=404, detail="Session not found")
     
     # Get hypotheses for this project
     query = db.query(Hypothesis).filter(
@@ -6696,11 +6735,13 @@ class PoCGenerateResponse(BaseModel):
 async def generate_poc_prompts(
     session_id: str,
     request: PoCGenerateRequest,
-    db: Session = Depends(get_db)
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Generate proof-of-concept prompts for hypotheses from a session.
-    
+
     Uses an LLM strategist to generate detailed PoC prompts that can be
     given to a coding agent to create actual exploit code.
     """
@@ -6708,11 +6749,14 @@ async def generate_poc_prompts(
     session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Get the project
-    project = db.query(Project).filter(Project.id == session.project_id).first()
+
+    # Get the project — verify tenant ownership
+    project = db.query(Project).filter(
+        Project.id == session.project_id,
+        Project.tenant_id == tenant_id,
+    ).first()
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(status_code=404, detail="Session not found")
     
     # Get hypotheses for this project
     query = db.query(Hypothesis).filter(
@@ -6925,42 +6969,50 @@ class ReportGenerateResponse(BaseModel):
 async def generate_report(
     session_id: str,
     request: ReportGenerateRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    tenant_id: int | None = Depends(require_tenant_or_admin),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Generate a security audit report for a session's findings.
-    
+
     Creates a professional HTML or Markdown report with:
     - Executive summary (AI-generated)
     - Vulnerability findings with severity ratings
     - Code snippets and remediation advice
     - Testing methodology
-    
+
     This endpoint uses LLM to generate executive summary and takes 30-60 seconds.
+
+    Auth: tenant JWT (ownership check) OR X-Admin-Key header (admin bypass).
     """
     import re
     import subprocess
     import tempfile
     import traceback
     from datetime import datetime
-    
+
     logger.info(f"Starting report generation for session {session_id}")
-    
+
     try:
         # Get the session
         session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
         if not session:
             logger.error(f"Session not found: {session_id}")
             raise HTTPException(status_code=404, detail="Session not found")
-        
+
         # Get the project
         project = db.query(Project).filter(Project.id == session.project_id).first()
         if not project:
             logger.error(f"Project not found for session {session_id}")
-            raise HTTPException(status_code=404, detail="Project not found")
-        
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Tenant callers must own the session; admin callers skip ownership check
+        if tenant_id is not None and project.tenant_id != tenant_id:
+            raise HTTPException(status_code=404, detail="Session not found")
+
         logger.info(f"Generating report for project: {project.name}")
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -7725,13 +7777,17 @@ async def get_surface_scan(
 async def delete_surface_scan(
     execution_id: str,
     request: Request,
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
     _: None = Depends(reject_preview_writes),
 ):
     """
     Delete a surface scan from the database.
     """
-    scan = db.query(ScanExecution).filter(ScanExecution.execution_id == execution_id).first()
+    scan = db.query(ScanExecution).filter(
+        ScanExecution.execution_id == execution_id,
+        ScanExecution.tenant_id == tenant_id,
+    ).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     

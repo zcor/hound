@@ -27,6 +27,11 @@ from database.models import ScanExecution, Tenant
 logger = logging.getLogger(__name__)
 
 
+def has_paid_subscription(tenant: Tenant) -> bool:
+    """Canonical check: does this tenant have an active paid SaaS subscription?"""
+    return bool(tenant.stripe_subscription_id) and tenant.plan not in (None, "free")
+
+
 def _load_plans() -> dict:
     """Load plan config from stripe_plans.json."""
     config_path = Path(__file__).parent.parent / "config" / "stripe_plans.json"

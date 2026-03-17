@@ -38,7 +38,19 @@ def run_migration():
         # Create indexes
         "CREATE INDEX IF NOT EXISTS idx_projects_github_repo_id ON projects(github_repo_id)",
         "CREATE INDEX IF NOT EXISTS idx_projects_installation_id ON projects(installation_id)",
-        
+
+        # Analytics events table
+        """CREATE TABLE IF NOT EXISTS analytics_events (
+            id SERIAL PRIMARY KEY,
+            tenant_id INTEGER NOT NULL REFERENCES tenants(id),
+            event VARCHAR(100) NOT NULL,
+            properties JSONB NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_analytics_events_tenant_id ON analytics_events(tenant_id)",
+        "CREATE INDEX IF NOT EXISTS idx_analytics_events_event ON analytics_events(event)",
+        "CREATE INDEX IF NOT EXISTS idx_analytics_events_created_at ON analytics_events(created_at)",
+
         # Update existing records
         "UPDATE tenants SET status = 'active' WHERE status = 'pending' AND created_at < NOW()",
         "UPDATE projects SET status = 'active' WHERE status != 'active'",

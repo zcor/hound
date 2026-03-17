@@ -13,6 +13,7 @@ from typing import Optional
 
 from github import Github
 from github.GithubException import GithubException
+from github.IssueComment import IssueComment
 from github.PullRequest import PullRequest
 from github.Repository import Repository
 
@@ -94,6 +95,9 @@ class PRCommentBot:
     
     # Comment header to identify Hound comments
     COMMENT_HEADER = "<!-- hound-security-bot -->"
+
+    # FirePan scan marker for single-thread updates
+    FIREPAN_SCAN_MARKER = "<!-- firepan-scan -->"
     
     def __init__(
         self,
@@ -560,6 +564,59 @@ class PRCommentBot:
         
         return deleted
     
+    def find_existing_comment(self, marker: str = "") -> IssueComment | None:
+        """Find an existing bot comment with the given marker.
+
+        Only matches comments authored by a Bot user that contain the marker.
+        Never returns user comments even if they happen to contain the marker.
+        """
+        marker = marker or self.FIREPAN_SCAN_MARKER
+        try:
+            for comment in self.pr.get_issue_comments():
+                if not comment.user or comment.user.type != "Bot":
+                    continue
+                if marker in (comment.body or ""):
+                    return comment
+        except GithubException:
+            pass
+        return None
+
+    def update_or_create_comment(
+        self,
+        findings: list[dict],
+        scan_id: str = "",
+        marker: str = "",
+    ) -> dict:
+        """Find and update an existing FirePan comment, or create a new one.
+
+        This implements single-thread PR commenting: one comment per PR,
+        updated on each new push rather than creating new comments.
+        """
+        marker = marker or self.FIREPAN_SCAN_MARKER
+        body = self._format_summary_comment(findings, scan_id)
+        # Prepend marker if not already in the body
+        if marker not in body:
+            body = f"{marker}\n{body}"
+
+        existing = self.find_existing_comment(marker)
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        result = {"success": True, "action": "created", "errors": []}
+
+        try:
+            if existing:
+                existing.edit(body + f"\n\n*Updated {timestamp}*")
+                result["action"] = "updated"
+                result["comment_id"] = existing.id
+            else:
+                new_comment = self.pr.create_issue_comment(body)
+                result["comment_id"] = new_comment.id
+        except GithubException as e:
+            result["success"] = False
+            result["errors"].append(str(e))
+
+        return result
+
     def post_findings(
         self,
         findings: list[dict],
@@ -596,13 +653,22 @@ class PRCommentBot:
         }
         
         try:
+            # Single-thread mode: find and update existing comment
+            if not delete_previous and include_summary and not include_inline:
+                uoc_result = self.update_or_create_comment(findings, scan_id)
+                result["summary_posted"] = uoc_result.get("success", False)
+                result["comment_action"] = uoc_result.get("action", "unknown")
+                if not uoc_result.get("success"):
+                    result["errors"].extend(uoc_result.get("errors", []))
+                return result
+
             # Delete previous comments if requested
             if delete_previous:
                 result["previous_deleted"] = self.delete_previous_comments()
-            
+
             # Get the head commit SHA for inline comments
             head_sha = self.pr.head.sha
-            
+
             # Post inline comments for findings in the diff
             if include_inline and findings:
                 inline_count = 0

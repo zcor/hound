@@ -11,6 +11,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Float,
@@ -23,6 +24,8 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     func,
+    or_,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, JSONB
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
@@ -104,31 +107,112 @@ class Tenant(Base):
 
 class User(Base):
     """
-    User table for GitHub OAuth authentication.
-    
-    Stores user information from GitHub OAuth for authentication
-    and authorization using JWT tokens.
+    User table for OAuth authentication (GitHub + Google).
+
+    Stores user information from OAuth providers for authentication
+    and authorization using JWT tokens. At least one provider must be linked.
     """
     __tablename__ = "users"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
-    github_id = Column(BigInteger, unique=True, index=True, nullable=False)
-    github_login = Column(String(255), unique=True, index=True, nullable=False)
-    email = Column(String(255), index=True)  # Not unique - users can have null/private emails
-    name = Column(String(255))
-    avatar_url = Column(String(500))
+
+    # GitHub provider (nullable — Google-only users won't have these)
+    github_id = Column(BigInteger, unique=True, index=True, nullable=True)
+    github_login = Column(String(255), unique=True, index=True, nullable=True)
     github_token_encrypted = Column(Text, nullable=True)  # Fernet-encrypted GitHub OAuth token
     github_connected_at = Column(DateTime, nullable=True)  # When the GitHub token was stored
     github_access_token = Column(String(500), nullable=True)  # GitHub OAuth access token for API calls
-    
+
+    # Google provider (nullable — GitHub-only users won't have these)
+    google_id = Column(String(255), unique=True, index=True, nullable=True)
+    google_email = Column(String(255), nullable=True)
+    google_name = Column(String(255), nullable=True)
+    google_avatar_url = Column(String(500), nullable=True)
+    google_connected_at = Column(DateTime, nullable=True)
+
+    # Shared profile fields
+    email = Column(String(255), index=True)  # Not unique - users can have null/private emails
+    name = Column(String(255))
+    avatar_url = Column(String(500))
+
+    # Immutable after creation — tracks how the user originally signed up
+    signup_provider = Column(String(50), nullable=False, default="github")
+
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
     tenant = relationship("Tenant", back_populates="users")
-    
+
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-    
+
+    __table_args__ = (
+        CheckConstraint(
+            "github_id IS NOT NULL OR google_id IS NOT NULL",
+            name="chk_at_least_one_provider",
+        ),
+        CheckConstraint(
+            "signup_provider IN ('github', 'google')",
+            name="chk_signup_provider_values",
+        ),
+    )
+
+    # --- Helper properties ---
+
+    @property
+    def primary_provider(self) -> str:
+        """The provider the user originally signed up with."""
+        return self.signup_provider
+
+    @property
+    def display_name(self) -> str:
+        """Best available display name."""
+        return self.github_login or self.google_name or self.email or f"User {self.id}"
+
+    @property
+    def has_github(self) -> bool:
+        return self.github_id is not None
+
+    @property
+    def has_google(self) -> bool:
+        return self.google_id is not None
+
+    def to_profile_dict(self) -> dict:
+        """Full profile for /auth/me — null-safe for all optional fields."""
+        return {
+            "id": self.id,
+            "tenant_id": self.tenant_id,
+            # GitHub (optional)
+            "github_username": self.github_login,
+            "github_avatar_url": self.avatar_url if self.has_github else None,
+            # Google (optional)
+            "google_email": self.google_email,
+            "google_name": self.google_name,
+            "google_avatar_url": self.google_avatar_url,
+            # Unified
+            "email": self.email or self.google_email or "",
+            "name": self.name or self.google_name,
+            "avatar_url": self.avatar_url or self.google_avatar_url or "",
+            "display_name": self.display_name,
+            "primary_provider": self.primary_provider,
+            "has_github": self.has_github,
+            "has_google": self.has_google,
+        }
+
     def __repr__(self):
-        return f"<User(github_login='{self.github_login}', tenant_id={self.tenant_id})>"
+        return f"<User(id={self.id}, display_name='{self.display_name}', tenant_id={self.tenant_id})>"
+
+
+class OAuthAuditLog(Base):
+    """Audit log for OAuth link/unlink/login events."""
+    __tablename__ = "oauth_audit_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    action = Column(String(50), nullable=False)       # 'link', 'unlink', 'login', 'login_new'
+    provider = Column(String(50), nullable=False)      # 'github', 'google'
+    provider_user_id = Column(String(255), nullable=True)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
 
 class Team(Base):
@@ -211,6 +295,7 @@ class Project(Base):
     is_private = Column(Boolean, nullable=False, default=False)
     description = Column(Text, nullable=True)
     status = Column(String(50), nullable=False, default="active")
+    pr_comments_enabled = Column(Boolean, nullable=False, default=True)
     team_id = Column(Integer, ForeignKey("teams.id"), nullable=True, index=True)  # Link to team for access control
     created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
     last_accessed = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
@@ -375,6 +460,9 @@ class ScanExecution(Base):
     # Artifact storage reference (S3/MinIO path for full reports, code snippets, etc.)
     artifacts_path = Column(String(1024), nullable=True)
     
+    # Scan log (timestamped execution log, max 64KB)
+    scan_log = Column(Text, nullable=True)
+
     # Error handling
     error_message = Column(Text, nullable=True)
     
@@ -465,6 +553,8 @@ class PaymentLog(Base):
     payer_address = Column(String, nullable=True, index=True)  # NULL while reserved
     endpoint = Column(String, nullable=False)  # Route key e.g. "POST /surface/scan/full"
     status = Column(String, default="reserved")  # reserved, paid, job_created, job_failed, expired
+    discount_code = Column(String(50), nullable=True)  # x402 discount code applied
+    resolved_price_cents = Column(Integer, nullable=True)  # Actual price charged (cents) after discount
     settled_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=func.now())
 
@@ -477,6 +567,70 @@ class PaymentLog(Base):
 
     def __repr__(self):
         return f"<PaymentLog(id={self.id}, endpoint='{self.endpoint}', status='{self.status}', amount_usd={self.amount_usd})>"
+
+
+class X402Discount(Base):
+    """
+    x402 discount/coupon definitions.
+
+    Supports fixed-price overrides (fixed_price_cents) and percentage discounts.
+    Can be scoped to a specific endpoint or apply globally (endpoint=NULL).
+    """
+    __tablename__ = "x402_discounts"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(50), unique=True, nullable=False, index=True)
+    percentage_off = Column(Integer, nullable=True)  # 0-100
+    fixed_price_cents = Column(Integer, nullable=True)  # cents, e.g. 1 = $0.01
+    endpoint = Column(String(255), nullable=True)  # NULL = all routes
+    max_uses = Column(Integer, nullable=True)  # NULL = unlimited
+    current_uses = Column(Integer, nullable=False, default=0)
+    max_uses_per_tenant = Column(Integer, nullable=True)
+    active = Column(Boolean, nullable=False, default=True)
+    expires_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=func.now())
+
+    def __repr__(self):
+        return f"<X402Discount(code='{self.code}', active={self.active})>"
+
+
+class TenantDiscount(Base):
+    """
+    Links a discount to a tenant (created on coupon redemption).
+
+    The unique constraint on (tenant_id, discount_id) prevents double-redemption.
+    """
+    __tablename__ = "tenant_discounts"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    discount_id = Column(Integer, ForeignKey("x402_discounts.id"), nullable=False)
+    uses = Column(Integer, nullable=False, default=0)
+    redeemed_at = Column(DateTime, nullable=False, default=func.now())
+
+    discount = relationship("X402Discount")
+    tenant = relationship("Tenant")
+
+    __table_args__ = (
+        UniqueConstraint('tenant_id', 'discount_id', name='uq_tenant_discount'),
+    )
+
+    def __repr__(self):
+        return f"<TenantDiscount(tenant_id={self.tenant_id}, discount_id={self.discount_id})>"
+
+
+class AnalyticsEvent(Base):
+    """Funnel analytics events tracked from the dashboard."""
+    __tablename__ = "analytics_events"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
+    event = Column(String(100), nullable=False, index=True)
+    properties = Column(JSONType, nullable=False, default=dict)
+    created_at = Column(DateTime, nullable=False, default=func.now())
+
+    def __repr__(self):
+        return f"<AnalyticsEvent(tenant_id={self.tenant_id}, event={self.event})>"
 
 
 # Model pricing table (per 1M tokens) - Updated January 2026
@@ -579,14 +733,45 @@ def create_db_session(engine):
     return Session()
 
 
+def ensure_schema(engine):
+    """Idempotent schema patches for columns that create_all() can't add to existing tables.
+
+    Postgres: ADD COLUMN IF NOT EXISTS (atomic, safe under concurrent multi-worker startup).
+    SQLite: no-op — tests use create_all() which builds complete tables from scratch.
+    """
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS discount_code VARCHAR(50)"
+            ))
+            conn.execute(text(
+                "ALTER TABLE payment_logs ADD COLUMN IF NOT EXISTS resolved_price_cents INTEGER"
+            ))
+            # Google OAuth fields
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255) UNIQUE"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_email VARCHAR(255)"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_name VARCHAR(255)"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_avatar_url VARCHAR(500)"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_connected_at TIMESTAMP WITH TIME ZONE"))
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS signup_provider VARCHAR(50) NOT NULL DEFAULT 'github'"))
+            # Make GitHub fields nullable (safe — just removes constraint)
+            conn.execute(text("ALTER TABLE users ALTER COLUMN github_id DROP NOT NULL"))
+            conn.execute(text("ALTER TABLE users ALTER COLUMN github_login DROP NOT NULL"))
+            # Scan logs
+            conn.execute(text("ALTER TABLE scan_executions ADD COLUMN IF NOT EXISTS scan_log TEXT"))
+            # PR comments toggle
+            conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS pr_comments_enabled BOOLEAN NOT NULL DEFAULT TRUE"))
+
+
 def init_database(engine):
     """
-    Initialize the database by creating all tables.
-    
+    Initialize the database by creating all tables, then apply schema patches.
+
     Args:
         engine: SQLAlchemy Engine instance
     """
     Base.metadata.create_all(engine)
+    ensure_schema(engine)
 
 
 def drop_all_tables(engine):

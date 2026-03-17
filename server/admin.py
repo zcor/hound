@@ -11,6 +11,7 @@ from pathlib import Path
 
 from markupsafe import Markup
 from sqladmin import Admin, BaseView, ModelView, action, expose
+from sqladmin.authentication import AuthenticationBackend
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
 
@@ -18,12 +19,15 @@ from database.models import (
     AuditSession,
     Graph,
     Hypothesis,
+    PaymentLog,
     Project,
     ScanExecution,
     Team,
     TeamMember,
     Tenant,
+    TenantDiscount,
     TokenUsageLog,
+    X402Discount,
 )
 
 
@@ -125,6 +129,28 @@ class TenantAdmin(ModelView, model=Tenant):
     icon = "fa-solid fa-building"
     name = "Tenant / Organization"
     name_plural = "Tenants / Organizations"
+
+    @action(
+        name="preview_dashboard",
+        label="Preview Dashboard",
+        confirmation_message=None,
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def preview_dashboard_action(self, request: Request) -> RedirectResponse:
+        """Open the tenant's dashboard in admin preview mode."""
+        pks = request.query_params.get("pks", "").split(",")
+        if not pks or pks == [""]:
+            return RedirectResponse(
+                request.url_for("admin:list", identity=self.identity),
+                status_code=302,
+            )
+        tenant_id = pks[0]
+        # Mark session so the preview endpoint can verify admin auth.
+        # This is secure: Starlette session cookie is signed with HOUND_SECRET_KEY,
+        # and this action only runs inside an authenticated admin context.
+        request.session["admin_preview_authorized"] = True
+        return RedirectResponse(f"/admin/tenant/{tenant_id}/preview", status_code=302)
 
 
 class ProjectAdmin(ModelView, model=Project):
@@ -438,7 +464,11 @@ class ProjectAdmin(ModelView, model=Project):
                             async with httpx.AsyncClient(timeout=300.0) as client:
                                 # Use localhost for internal API calls to avoid proxy authentication
                                 base_url = "http://localhost:8000"
-                                
+                                headers = {}
+                                admin_key = os.environ.get("HOUND_ADMIN_KEY", "")
+                                if admin_key:
+                                    headers["X-Admin-Key"] = admin_key
+
                                 response = await client.post(
                                     f"{base_url}/sessions/{latest_session.session_id}/report",
                                     json={
@@ -446,12 +476,13 @@ class ProjectAdmin(ModelView, model=Project):
                                         "title": f"Security Audit Report: {project.name}",
                                         "auditors": "Security Team",
                                         "include_all": False  # Only confirmed findings
-                                    }
+                                    },
+                                    headers=headers,
                                 )
                                 return response
-                        
+
                         response = await generate_report_request()
-                        
+
                         if response.status_code == 200:
                             data = response.json()
                             report_path = Path(data['output_path'])
@@ -637,7 +668,11 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
                             async with httpx.AsyncClient(timeout=300.0) as client:
                                 # Use localhost for internal API calls to avoid proxy authentication
                                 base_url = "http://localhost:8000"
-                                
+                                headers = {}
+                                admin_key = os.environ.get("HOUND_ADMIN_KEY", "")
+                                if admin_key:
+                                    headers["X-Admin-Key"] = admin_key
+
                                 response = await client.post(
                                     f"{base_url}/sessions/{session.session_id}/report",
                                     json={
@@ -645,12 +680,13 @@ class AuditSessionAdmin(ModelView, model=AuditSession):
                                         "title": f"Security Audit Report: {project.name}",
                                         "auditors": "Security Team",
                                         "include_all": False  # Only confirmed findings
-                                    }
+                                    },
+                                    headers=headers,
                                 )
                                 return response
-                        
+
                         response = await generate_report_request()
-                        
+
                         if response.status_code == 200:
                             data = response.json()
                             report_path = Path(data['output_path'])
@@ -1404,12 +1440,16 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
             
             # Generate report
             import httpx
-            
+
             async def generate_report_request():
                 async with httpx.AsyncClient(timeout=300.0) as client:
                     # Use localhost for internal API calls to avoid proxy authentication
                     base_url = "http://localhost:8000"
-                    
+                    headers = {}
+                    admin_key = os.environ.get("HOUND_ADMIN_KEY", "")
+                    if admin_key:
+                        headers["X-Admin-Key"] = admin_key
+
                     response = await client.post(
                         f"{base_url}/sessions/{latest_session.session_id}/report",
                         json={
@@ -1417,7 +1457,8 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
                             "title": f"Security Audit Report: {project.name}",
                             "auditors": "Security Team",
                             "include_all": False
-                        }
+                        },
+                        headers=headers,
                     )
                     return response
             
@@ -1582,6 +1623,103 @@ class TokenUsageAdmin(ModelView, model=TokenUsageLog):
     can_create = False
     can_edit = False
     can_delete = True  # Allow cleanup of old logs
+
+
+class PaymentLogAdmin(ModelView, model=PaymentLog):
+    """Admin view for PaymentLog model — x402 payment tracking."""
+
+    page_size = 50
+    column_list = [
+        PaymentLog.id,
+        PaymentLog.endpoint,
+        PaymentLog.status,
+        PaymentLog.amount_usd,
+        PaymentLog.discount_code,
+        PaymentLog.resolved_price_cents,
+        PaymentLog.payer_address,
+        PaymentLog.created_at,
+    ]
+    column_searchable_list = [PaymentLog.endpoint, PaymentLog.discount_code, PaymentLog.payer_address]
+    column_sortable_list = [PaymentLog.id, PaymentLog.status, PaymentLog.amount_usd, PaymentLog.created_at]
+    column_default_sort = [(PaymentLog.created_at, True)]
+    column_formatters = {
+        PaymentLog.status: lambda m, a: status_formatter(m.status),
+        PaymentLog.amount_usd: lambda m, a: Markup(
+            f'<span class="badge bg-success">${m.amount_usd:.2f}</span>'
+        ) if m.amount_usd else "",
+        PaymentLog.discount_code: lambda m, a: Markup(
+            f'<span class="badge bg-warning">{m.discount_code}</span>'
+        ) if m.discount_code else "",
+    }
+    icon = "fa-solid fa-credit-card"
+    name = "Payment Log"
+    name_plural = "Payment Logs"
+    can_create = False
+    can_edit = False
+    can_delete = True
+
+
+class X402DiscountAdmin(ModelView, model=X402Discount):
+    """Admin view for X402Discount model — coupon management."""
+
+    page_size = 50
+    column_list = [
+        X402Discount.id,
+        X402Discount.code,
+        X402Discount.fixed_price_cents,
+        X402Discount.percentage_off,
+        X402Discount.endpoint,
+        X402Discount.active,
+        X402Discount.current_uses,
+        X402Discount.max_uses,
+        X402Discount.max_uses_per_tenant,
+        X402Discount.expires_at,
+        X402Discount.created_at,
+    ]
+    column_searchable_list = [X402Discount.code, X402Discount.endpoint]
+    column_sortable_list = [X402Discount.id, X402Discount.code, X402Discount.active, X402Discount.created_at]
+    column_default_sort = [(X402Discount.created_at, True)]
+    column_formatters = {
+        X402Discount.active: lambda m, a: Markup(
+            f'<span class="badge bg-{"success" if m.active else "danger"}">{"Active" if m.active else "Inactive"}</span>'
+        ),
+        X402Discount.fixed_price_cents: lambda m, a: Markup(
+            f'<span class="badge bg-info">${m.fixed_price_cents / 100:.2f}</span>'
+        ) if m.fixed_price_cents is not None else "",
+        X402Discount.percentage_off: lambda m, a: Markup(
+            f'<span class="badge bg-info">{m.percentage_off}% off</span>'
+        ) if m.percentage_off is not None else "",
+        X402Discount.current_uses: lambda m, a: Markup(
+            f'{m.current_uses}/{m.max_uses if m.max_uses is not None else "∞"}'
+        ),
+    }
+    icon = "fa-solid fa-tags"
+    name = "X402 Discount"
+    name_plural = "X402 Discounts"
+    can_create = True
+    can_edit = True
+    can_delete = True
+
+
+class TenantDiscountAdmin(ModelView, model=TenantDiscount):
+    """Admin view for TenantDiscount model — coupon redemptions."""
+
+    page_size = 50
+    column_list = [
+        TenantDiscount.id,
+        TenantDiscount.tenant,
+        TenantDiscount.discount,
+        TenantDiscount.uses,
+        TenantDiscount.redeemed_at,
+    ]
+    column_sortable_list = [TenantDiscount.id, TenantDiscount.uses, TenantDiscount.redeemed_at]
+    column_default_sort = [(TenantDiscount.redeemed_at, True)]
+    icon = "fa-solid fa-ticket"
+    name = "Tenant Discount"
+    name_plural = "Tenant Discounts"
+    can_create = True
+    can_edit = True
+    can_delete = True
 
 
 class ReportsView(BaseView):
@@ -1879,27 +2017,67 @@ class ScanFindingsView(BaseView):
             db.close()
 
 
+class AdminAuth(AuthenticationBackend):
+    """SQLAdmin auth backend using HOUND_ADMIN_KEY + Starlette signed sessions."""
+
+    def __init__(self, secret_key: str) -> None:
+        # Do NOT call super().__init__() — that adds a second SessionMiddleware.
+        # The outer FastAPI app already has one (api.py:197) with the same secret.
+        # Sharing the same cookie lets admin_preview_authorized flow between apps.
+        self.middlewares = []  # Empty — reuse outer SessionMiddleware
+
+    async def login(self, request: Request) -> bool:
+        form = await request.form()
+        # SQLAdmin login template posts "username" and "password" fields
+        admin_key = form.get("password", "") or form.get("username", "")
+        expected = os.environ.get("HOUND_ADMIN_KEY", "")
+        if expected and admin_key == expected:
+            request.session["admin_logged_in"] = True
+            return True
+        return False
+
+    async def logout(self, request: Request) -> bool:
+        request.session.clear()
+        return True
+
+    async def authenticate(self, request: Request) -> bool:
+        if not os.environ.get("HOUND_ADMIN_KEY", ""):
+            return True  # Dev mode — no key configured
+        return request.session.get("admin_logged_in", False)
+
+
 def setup_admin(app, engine):
     """
     Set up SQLAdmin with all model views.
-    
+
     Args:
         app: FastAPI application instance
         engine: SQLAlchemy engine instance
-        
+
     Returns:
         Admin instance
     """
-    
+
     # Get base URL from environment or use default
-    # This is important for port forwarding scenarios (Codespaces, ngrok, etc.)
     base_url = os.environ.get("ADMIN_BASE_URL", "/admin")
-    
+    admin_key = os.environ.get("HOUND_ADMIN_KEY", "")
+    secret = os.environ.get("HOUND_SECRET_KEY", "")
+
+    # Fail closed: if admin auth is enabled, require a signing secret
+    if admin_key and not secret:
+        raise RuntimeError(
+            "HOUND_SECRET_KEY is required when HOUND_ADMIN_KEY is set. "
+            "Admin panel cannot start without a session signing secret."
+        )
+
+    auth_backend = AdminAuth(secret_key=secret) if admin_key else None
+
     admin = Admin(
         app,
         engine,
         title="Firepan Admin",
         base_url=base_url,
+        authentication_backend=auth_backend,
     )
     
     # Register all admin views
@@ -1912,6 +2090,9 @@ def setup_admin(app, engine):
     admin.add_view(TokenUsageAdmin)
     admin.add_view(TeamAdmin)
     admin.add_view(TeamMemberAdmin)
+    admin.add_view(PaymentLogAdmin)
+    admin.add_view(X402DiscountAdmin)
+    admin.add_view(TenantDiscountAdmin)
     admin.add_view(ReportsView)
     # Note: ScanFindingsView not added to navigation - accessible only via "View Findings" action
     

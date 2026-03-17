@@ -49,7 +49,6 @@ import httpx  # noqa: E402
 import redis.asyncio as aioredis  # noqa: E402
 from fastapi import (  # noqa: E402
     BackgroundTasks,
-    Cookie,
     Depends,
     FastAPI,
     HTTPException,
@@ -66,6 +65,7 @@ from slowapi import Limiter  # noqa: E402
 from slowapi.errors import RateLimitExceeded  # noqa: E402
 from slowapi.util import get_remote_address  # noqa: E402
 from sqlalchemy import func, text  # noqa: E402
+from sqlalchemy.exc import IntegrityError  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 from starlette.middleware.sessions import SessionMiddleware  # noqa: E402
 
@@ -85,7 +85,8 @@ from database.models import (  # noqa: E402
     create_db_engine,
     create_db_session,
 )
-from integrations.telegram import notify_new_repo_synced  # noqa: E402
+from integrations.telegram import notify_new_repo_synced, notify_repo_added, notify_app_installed  # noqa: E402
+from server.auth_utils import reject_preview_writes  # noqa: E402
 from server.token_crypto import decrypt_token  # noqa: E402
 
 # Configure logging
@@ -118,49 +119,75 @@ def rate_limit_key_tenant_or_ip(request: Request) -> str:
 # Set HOUND_ADMIN_KEY environment variable to protect admin panel
 # If not set, admin panel is open (for local development)
 ADMIN_API_KEY = os.environ.get("HOUND_ADMIN_KEY", "")
-ADMIN_SESSION_COOKIE = "hound_admin_session"
-# Store valid session tokens (in production, use Redis)
-_admin_sessions: set = set()
 
 
-def generate_session_token() -> str:
-    """Generate a secure session token."""
-    return secrets.token_urlsafe(32)
-
-
-def verify_admin_auth(request: Request, admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)) -> bool:
+def verify_admin_auth(request: Request) -> bool:
     """
     Verify admin authentication.
-    Returns True if authenticated, raises HTTPException if not.
+    Returns True if authenticated, False if not.
     """
     # If no admin key is set, allow access (local development)
     if not ADMIN_API_KEY:
         return True
-    
-    # Check session cookie
-    if admin_session and admin_session in _admin_sessions:
+
+    # Starlette session (set by SQLAdmin auth backend login)
+    if request.session.get("admin_logged_in"):
         return True
-    
-    # Check API key in header
+
+    # Admin preview marker (set by preview_dashboard_action)
+    if request.session.get("admin_preview_authorized"):
+        return True
+
+    # API key in header (programmatic access)
     api_key = request.headers.get("X-Admin-Key") or request.headers.get("Authorization", "").replace("Bearer ", "")
     if api_key == ADMIN_API_KEY:
         return True
-    
-    # Check API key in query param (for browser access)
+
+    # API key in query param (browser access)
     api_key = request.query_params.get("admin_key")
     if api_key == ADMIN_API_KEY:
         return True
-    
+
     return False
 
 
-def require_admin(request: Request, admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)):
+def require_admin(request: Request):
     """Dependency to require admin authentication."""
-    if not verify_admin_auth(request, admin_session):
+    if not verify_admin_auth(request):
         # For HTML pages, redirect to login
         if "text/html" in request.headers.get("accept", ""):
             raise HTTPException(status_code=303, detail="Redirect to login", headers={"Location": "/admin/login"})
         raise HTTPException(status_code=401, detail="Admin authentication required. Set X-Admin-Key header or admin_key query param.")
+
+
+def _verify_explicit_admin_header(request: Request) -> bool:
+    """Check admin credentials via X-Admin-Key header ONLY.
+
+    Unlike verify_admin_auth(), this:
+    - Does NOT auto-allow when ADMIN_API_KEY is unset (no open-dev shortcut)
+    - Does NOT accept session cookies (CSRF risk on side-effecting endpoints)
+    - Does NOT accept query-param auth (leaks into logs/referrers)
+
+    Use this for data endpoints called by admin.py internally.
+    """
+    if not ADMIN_API_KEY:
+        return False  # No open-dev shortcut
+
+    api_key = request.headers.get("X-Admin-Key") or ""
+    return api_key == ADMIN_API_KEY
+
+
+async def require_tenant_or_admin(request: Request) -> int | None:
+    """Accept either tenant JWT or explicit admin header auth.
+
+    Returns tenant_id (int) for tenant callers, None for admin callers.
+    Raises 401 if neither succeeds. Does NOT auto-allow in open-dev mode.
+    """
+    if _verify_explicit_admin_header(request):
+        return None  # Admin caller — skip tenant ownership check
+
+    # Fall through to tenant JWT (raises 401 if invalid/missing)
+    return await get_current_tenant_id(request)
 
 
 # Create engine lazily to avoid connection errors during import
@@ -268,8 +295,12 @@ def get_admin():
 # Initialize admin and validate x402 on startup
 @app.on_event("startup")
 async def startup_event():
-    """Initialize admin panel and validate x402 config on startup."""
+    """Initialize admin panel, apply schema patches, and validate x402 config on startup."""
     get_admin()
+
+    # Apply idempotent schema patches (e.g. new columns on existing tables)
+    from database.models import ensure_schema
+    ensure_schema(get_engine())
 
     # Fail-fast: validate x402 config if enabled
     from server.x402_config import get_x402_config
@@ -297,6 +328,11 @@ try:
 except Exception as e:
     logger.warning("Stripe routes not loaded (stripe package may not be installed): %s", e)
 
+# Register x402 discount/coupon routes
+from server.x402_routes import router as x402_router  # noqa: E402
+
+app.include_router(x402_router)
+
 
 # Redirect for URL compatibility - auditsession -> audit-session
 from starlette.responses import RedirectResponse as StarletteRedirect  # noqa: E402
@@ -309,139 +345,16 @@ async def redirect_auditsession(path: str):
 
 
 # =============================================================================
-# ADMIN LOGIN/LOGOUT ENDPOINTS
+# ADMIN TENANT PREVIEW (read-only impersonation)
 # =============================================================================
 
-@app.get("/admin/login", response_class=HTMLResponse)
-def admin_login_page(request: Request, error: str | None = None):
-    """Admin login page."""
-    # If no admin key is set, redirect to home (no auth needed)
-    if not ADMIN_API_KEY:
-        return RedirectResponse("/admin/home", status_code=303)
-    
-    error_html = f'<div class="error">{error}</div>' if error else ''
-    
-    return f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Hound Admin Login</title>
-        <style>
-            * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-                min-height: 100vh;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }}
-            .login-box {{
-                background: #1e1e2e;
-                padding: 40px;
-                border-radius: 12px;
-                box-shadow: 0 10px 40px rgba(0,0,0,0.3);
-                width: 100%;
-                max-width: 400px;
-            }}
-            h1 {{
-                color: #30a14e;
-                margin-bottom: 8px;
-                font-size: 24px;
-            }}
-            p {{
-                color: #888;
-                margin-bottom: 24px;
-                font-size: 14px;
-            }}
-            .error {{
-                background: #da3633;
-                color: white;
-                padding: 12px;
-                border-radius: 6px;
-                margin-bottom: 16px;
-                font-size: 14px;
-            }}
-            input {{
-                width: 100%;
-                padding: 12px 16px;
-                border: 1px solid #30363d;
-                border-radius: 6px;
-                background: #0d1117;
-                color: #e6edf3;
-                font-size: 16px;
-                margin-bottom: 16px;
-            }}
-            input:focus {{
-                outline: none;
-                border-color: #30a14e;
-            }}
-            button {{
-                width: 100%;
-                padding: 12px;
-                background: #238636;
-                color: white;
-                border: none;
-                border-radius: 6px;
-                font-size: 16px;
-                cursor: pointer;
-                transition: background 0.2s;
-            }}
-            button:hover {{
-                background: #2ea043;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="login-box">
-            <h1>🐕 Hound Admin</h1>
-            <p>Enter your admin key to access the dashboard</p>
-            {error_html}
-            <form method="POST" action="/admin/login">
-                <input type="password" name="admin_key" placeholder="Admin Key" required autofocus>
-                <button type="submit">Login</button>
-            </form>
-        </div>
-    </body>
-    </html>
-    """
+class PreviewExchangeRequest(BaseModel):
+    code: str
 
-
-@app.post("/admin/login")
-async def admin_login(request: Request):
-    """Handle admin login."""
-    form = await request.form()
-    admin_key = form.get("admin_key", "")
-    
-    if admin_key == ADMIN_API_KEY:
-        # Create session token
-        session_token = generate_session_token()
-        _admin_sessions.add(session_token)
-        
-        # Set cookie and redirect to home
-        response = RedirectResponse("/admin/home", status_code=303)
-        response.set_cookie(
-            key=ADMIN_SESSION_COOKIE,
-            value=session_token,
-            httponly=True,
-            secure=False,  # Set to True when using HTTPS
-            samesite="lax",
-            max_age=86400 * 7  # 7 days
-        )
-        return response
-    
-    return RedirectResponse("/admin/login?error=Invalid+admin+key", status_code=303)
-
-
-@app.get("/admin/logout")
-def admin_logout(admin_session: str | None = Cookie(default=None, alias=ADMIN_SESSION_COOKIE)):
-    """Logout and clear session."""
-    if admin_session and admin_session in _admin_sessions:
-        _admin_sessions.discard(admin_session)
-    
-    response = RedirectResponse("/admin/login", status_code=303)
-    response.delete_cookie(ADMIN_SESSION_COOKIE)
-    return response
+class PreviewExchangeResponse(BaseModel):
+    token: str
+    tenant_id: int
+    tenant_name: str
 
 
 # Dependency for database session
@@ -549,6 +462,99 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)) -> U
     except ValueError as e:
         raise HTTPException(status_code=401, detail=f"Invalid or expired token: {str(e)}")
 
+
+# =============================================================================
+# GITHUB CAPABILITY GATE — require linked GitHub for scan operations
+# =============================================================================
+
+async def require_github_linked(request: Request, db: Session = Depends(get_db)) -> User:
+    """Require that the current user has a linked GitHub account with token.
+
+    Use as a FastAPI dependency on scan-triggering endpoints.
+    Google-only users must link GitHub before running scans.
+    """
+    from server.auth_routes import get_token_from_header
+    from server.auth_utils import get_current_user_from_token
+
+    token = get_token_from_header(request)
+    try:
+        payload = get_current_user_from_token(token)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user = db.query(User).filter(User.id == payload["user_id"]).first()
+    if not user or not user.github_id or not user.github_access_token:
+        raise HTTPException(
+            status_code=403,
+            detail="GitHub account required. Connect GitHub in Settings to run scans.",
+            headers={"X-Requires-Github": "true"},
+        )
+    return user
+
+
+# =============================================================================
+# ADMIN TENANT PREVIEW — endpoints (after get_db is defined)
+# =============================================================================
+
+@app.get("/admin/tenant/{tenant_id}/preview")
+async def admin_generate_preview_code(
+    tenant_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Generate a one-time preview code and redirect to the dashboard."""
+    if not verify_admin_auth(request):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    # Consume the session marker so it can't be reused
+    request.session.pop("admin_preview_authorized", None)
+
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    code = secrets.token_urlsafe(32)
+    redis_client = get_auth_redis_client()
+    try:
+        await redis_client.setex(
+            f"admin_preview:{code}",
+            120,  # 2 min TTL
+            json.dumps({"tenant_id": tenant_id, "tenant_name": tenant.name}),
+        )
+    finally:
+        await redis_client.aclose()
+
+    frontend_url = os.environ.get("FRONTEND_URL", "https://app.firepan.com")
+    return RedirectResponse(f"{frontend_url}/admin-preview?code={code}", status_code=302)
+
+
+@app.post("/admin/preview/exchange", response_model=PreviewExchangeResponse)
+@limiter.limit("10/minute")
+async def exchange_preview_code(request: Request, body: PreviewExchangeRequest):
+    """Exchange a one-time preview code for a short-lived read-only JWT."""
+    redis_client = get_auth_redis_client()
+    try:
+        key = f"admin_preview:{body.code}"
+        data_raw = await redis_client.getdel(key)  # atomic consume
+        if not data_raw:
+            raise HTTPException(status_code=400, detail="Invalid or expired preview code")
+    finally:
+        await redis_client.aclose()
+
+    data = json.loads(data_raw)
+    from server.auth_utils import create_access_token
+    token = create_access_token(
+        data={
+            "user_id": 0,
+            "tenant_id": data["tenant_id"],
+            "admin_preview": True,
+        },
+        expires_delta=timedelta(hours=1),
+    )
+
+    return PreviewExchangeResponse(
+        token=token,
+        tenant_id=data["tenant_id"],
+        tenant_name=data["tenant_name"],
+    )
 
 
 # ============================================================================
@@ -2841,21 +2847,30 @@ class GraphResponse(BaseModel):
 
 
 class FindingResponse(BaseModel):
-    """Response model for hypothesis/finding data."""
+    """Response model for hypothesis/finding data.
 
-    id: int
-    hypothesis_id: str
+    Supports both deep-audit hypotheses (from Hypothesis table) and surface scan
+    findings (from ScanExecution.findings JSONB).  Nullable fields accommodate
+    surface scan findings which lack hypothesis-specific metadata.
+    """
+
+    id: int | None = None
+    hypothesis_id: str | None = None
     title: str
     description: str
-    vulnerability_type: str
-    status: str
+    vulnerability_type: str | None = None
+    status: str = "confirmed"
     confidence: float
     severity: str
-    node_refs: list[str] | None
+    node_refs: list[str] | None = None
     evidence: Any | None = None  # Can be dict or list
-    reported_by_model: str | None
-    junior_model: str | None
-    senior_model: str | None
+    reported_by_model: str | None = None
+    junior_model: str | None = None
+    senior_model: str | None = None
+    project_id: int | None = None  # Explicit repo linkage
+    pattern_id: str | None = None  # Surface scan pattern identifier
+    location: str | None = None  # Code location from surface scan
+    code_snippet: str | None = None  # Code snippet from surface scan
     created_at: datetime
     updated_at: datetime
 
@@ -2915,33 +2930,72 @@ async def start_audit(
     request: Request,
     db: Session = Depends(get_db),
     tenant_id: int = Depends(get_current_tenant_id),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Start a new security audit (async, returns immediately).
     PAID: $5.00 via x402 for AI agent customers.
+    SaaS subscribers bypass x402 (they pay via Stripe).
 
     This endpoint:
-    1. Checks x402 payment gate (for agent customers)
-    2. Creates an AuditSession record with status "queued"
-    3. Dispatches work to the Celery worker queue
-    4. Returns immediately with a session_id for tracking
+    1. Validates project ownership (if project_id provided)
+    2. Checks x402 payment gate (skipped for SaaS subscribers)
+    3. Enforces audit quota for SaaS subscribers
+    4. Creates an AuditSession record with status "queued"
+    5. Creates a ScanExecution row (dashboard path only)
+    6. Dispatches work to the Celery worker queue
+    7. Returns immediately with a session_id for tracking
 
     The actual audit runs in a background Celery worker. Connect to the
     WebSocket endpoint to receive real-time progress updates.
     """
-    # x402 payment gate
     from server.x402_deps import PaymentGate, create_paid_job, mark_job_failed, require_payment
 
-    gate_fn = require_payment("POST /audits/start")
-    gate = await gate_fn(request=request, tenant_id=tenant_id, db=db)
+    # Step 1: Validate project ownership (if project_id provided)
+    project = None
+    if request_body.project_id:
+        project = db.query(Project).filter(
+            Project.id == request_body.project_id,
+            Project.tenant_id == tenant_id,
+        ).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
 
-    if gate.status == "already_processed":
-        return AuditStartResponse(
-            session_id=gate.job_id or "",
-            status="already_processed",
-            message="Already processed",
-            websocket_url=f"/ws/sessions/{gate.job_id}",
-        )
+    # Step 2: SaaS bypass for x402 — SaaS subscribers pay via Stripe, not x402
+    tenant = project.tenant if project else db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        tenant = Tenant(name="default")
+        db.add(tenant)
+        db.commit()
+
+    from server.tier_enforcement import has_paid_subscription
+    has_saas_sub = has_paid_subscription(tenant)
+
+    gate = PaymentGate(enabled=False, status="disabled")
+
+    if has_saas_sub:
+        # SaaS tenant — enforce audit quota via tier enforcement
+        from server.tier_enforcement import _check_sync
+        _check_sync(tenant_id, "audit", db)  # Raises 403 if over quota
+
+        # Require project_id for SaaS tenants (dashboard path)
+        if not request_body.project_id:
+            raise HTTPException(
+                status_code=422,
+                detail="project_id is required for SaaS subscribers",
+            )
+    else:
+        # Agent customer — require x402 payment
+        gate_fn = require_payment("POST /audits/start")
+        gate = await gate_fn(request=request, tenant_id=tenant_id, db=db)
+
+        if gate.status == "already_processed":
+            return AuditStartResponse(
+                session_id=gate.job_id or "",
+                status="already_processed",
+                message="Already processed",
+                websocket_url=f"/ws/sessions/{gate.job_id}",
+            )
 
     # Import worker tasks (done here to avoid circular imports)
     try:
@@ -2955,15 +3009,6 @@ async def start_audit(
     # Generate unique session ID
     session_id = f"audit_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
 
-    # Get or create tenant
-    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
-    if not tenant:
-        tenant = db.query(Tenant).first()
-        if not tenant:
-            tenant = Tenant(name="default")
-            db.add(tenant)
-            db.commit()
-
     # Create AuditSession record with status "queued"
     audit_session = AuditSession(
         session_id=session_id,
@@ -2974,6 +3019,23 @@ async def start_audit(
     )
     db.add(audit_session)
     db.commit()
+
+    # Create ScanExecution so deep audit appears in scan history (dashboard path only)
+    if project:
+        from database.models import ScanExecution as ScanExecutionModel
+
+        deep_scan = ScanExecutionModel(
+            execution_id=session_id,
+            project_id=request_body.project_id,
+            tenant_id=tenant_id,
+            repo_url=request_body.repo_url,
+            repo_name=project.name,
+            status="queued",
+            started_at=datetime.now(timezone.utc),
+            scan_config={"scan_type": "deep", "mode": request_body.mode},
+        )
+        db.add(deep_scan)
+        db.commit()
 
     logger.info(f"Created audit session {session_id} for {request_body.repo_url}")
 
@@ -3012,17 +3074,26 @@ async def start_audit(
 
 
 @app.get("/audits/{session_id}/status", response_model=AuditStatusResponse)
-async def get_audit_status(session_id: str, db: Session = Depends(get_db)):
+async def get_audit_status(
+    session_id: str,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Get the current status of an audit.
-    
+
     Returns the current status, progress information, and findings count.
     """
     session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
-    
     if not session:
         raise HTTPException(status_code=404, detail="Audit session not found")
-    
+
+    # Verify tenant ownership via project
+    if session.project_id:
+        project = db.query(Project).filter(Project.id == session.project_id).first()
+        if not project or project.tenant_id != tenant_id:
+            raise HTTPException(status_code=404, detail="Audit session not found")
+
     # Count findings
     findings_count = 0
     if session.project_id:
@@ -3031,12 +3102,19 @@ async def get_audit_status(session_id: str, db: Session = Depends(get_db)):
             .filter(Hypothesis.project_id == session.project_id)
             .count()
         )
-    
+
+    # Read error_message from ScanExecution if available (dashboard-linked audits)
+    error_message = None
+    scan_exec = db.query(ScanExecution).filter_by(execution_id=session_id).first()
+    if scan_exec and scan_exec.error_message:
+        error_message = scan_exec.error_message
+
     return AuditStatusResponse(
         session_id=session.session_id,
         status=session.status,
         progress=session.token_usage,  # Contains progress info
         findings_count=findings_count,
+        error_message=error_message,
         started_at=session.start_time,
         completed_at=session.end_time,
     )
@@ -3073,7 +3151,8 @@ class AutoFixPRResponse(BaseModel):
 async def create_auto_fix_pr(
     session_id: str,
     request: AutoFixPRRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
 ):
     """
     Create a PR with automatic fixes for detected security issues.
@@ -3159,7 +3238,10 @@ async def create_auto_fix_pr(
 
 
 @app.post("/github/create-fix-pr", response_model=AutoFixPRResponse)
-async def create_fix_pr_standalone(request: AutoFixPRRequest):
+async def create_fix_pr_standalone(
+    request: AutoFixPRRequest,
+    _: None = Depends(require_admin),
+):
     """
     Create a fix PR without an audit session (standalone).
     
@@ -3230,7 +3312,11 @@ class GraphBuildResponse(BaseModel):
 
 
 @app.post("/graphs/build", response_model=GraphBuildResponse)
-async def build_graphs(request: GraphBuildRequest, db: Session = Depends(get_db)):
+async def build_graphs(
+    request: GraphBuildRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+):
     """
     Build knowledge graphs for a repository (async, returns immediately).
     
@@ -3295,12 +3381,21 @@ async def build_graphs(request: GraphBuildRequest, db: Session = Depends(get_db)
 
 
 @app.get("/projects/{project_id}/graphs")
-async def get_project_graphs(project_id: int, db: Session = Depends(get_db)):
+async def get_project_graphs(
+    project_id: int,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Get all graphs for a project.
-    
+
     Returns a list of graphs with their metadata (excludes full graph data).
     """
+    # Verify project belongs to tenant
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project or project.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Project not found")
+
     graphs = db.query(Graph).filter(Graph.project_id == project_id).all()
     
     return [
@@ -3318,13 +3413,19 @@ async def get_project_graphs(project_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/graphs/{graph_id}")
-async def get_graph(graph_id: int, db: Session = Depends(get_db)):
+async def get_graph(
+    graph_id: int,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Get a specific graph with full data.
     """
     graph = db.query(Graph).filter(Graph.id == graph_id).first()
-    
     if not graph:
+        raise HTTPException(status_code=404, detail="Graph not found")
+    project = db.query(Project).filter(Project.id == graph.project_id).first()
+    if not project or project.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Graph not found")
     
     return {
@@ -3362,7 +3463,11 @@ class SyncGraphBuildResponse(BaseModel):
 
 
 @app.post("/graphs/build-sync", response_model=SyncGraphBuildResponse)
-async def build_graphs_sync(request: SyncGraphBuildRequest, db: Session = Depends(get_db)):
+async def build_graphs_sync(
+    request: SyncGraphBuildRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+):
     """
     Build knowledge graphs SYNCHRONOUSLY (blocking call).
     
@@ -3542,7 +3647,11 @@ class SyncAuditResponse(BaseModel):
 
 
 @app.post("/audits/run-sync", response_model=SyncAuditResponse)
-async def run_audit_sync(request: SyncAuditRequest, db: Session = Depends(get_db)):
+async def run_audit_sync(
+    request: SyncAuditRequest,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+):
     """
     Run a security audit SYNCHRONOUSLY (blocking call).
     
@@ -3990,96 +4099,227 @@ async def handle_github_webhook(request: Request, db: Session = Depends(get_db))
     if event_type == "installation":
         action = payload.get("action")
         installation = payload.get("installation", {})
-        logger.info(f"Installation event: {action} for {installation.get('id')}")
-        
+        installation_id = installation.get("id")
+        account = installation.get("account", {})
+        account_login = account.get("login", "")
+        account_type = account.get("type", "User")
+        logger.info(f"Installation event: {action} for {installation_id} ({account_login})")
+
+        if action == "created" and installation_id:
+            # Idempotent tenant creation: check by installation_id first, then by name
+            tenant = db.query(Tenant).filter(Tenant.installation_id == installation_id).first()
+            if not tenant:
+                tenant_name = f"github_{account_login}" if account_login else f"installation_{installation_id}"
+                tenant = db.query(Tenant).filter(Tenant.name == tenant_name).first()
+                if tenant:
+                    # Reinstall: update installation_id on existing tenant
+                    tenant.installation_id = installation_id
+                    tenant.github_account_login = account_login or tenant.github_account_login
+                    tenant.github_account_type = account_type or tenant.github_account_type
+                    db.commit()
+                    db.refresh(tenant)
+                else:
+                    # New install: create tenant
+                    try:
+                        tenant = Tenant(
+                            name=tenant_name,
+                            installation_id=installation_id,
+                            status="pending",
+                            github_account_login=account_login or None,
+                            github_account_type=account_type or None,
+                        )
+                        db.add(tenant)
+                        db.commit()
+                        db.refresh(tenant)
+                    except IntegrityError:
+                        db.rollback()
+                        # Race condition: another request created it first
+                        tenant = db.query(Tenant).filter(Tenant.installation_id == installation_id).first()
+
+            # Send notification (fire-and-forget)
+            try:
+                await notify_app_installed(
+                    github_account=account_login or f"installation_{installation_id}",
+                    account_type=account_type,
+                    tenant_id=tenant.id if tenant else None,
+                    installation_id=installation_id,
+                )
+            except Exception:
+                pass  # non-critical
+
+            return {
+                "status": "ok",
+                "event": "installation",
+                "action": action,
+                "tenant_id": tenant.id if tenant else None,
+            }
+
+        elif action == "deleted":
+            logger.info(f"GitHub App uninstalled by {account_login} (installation {installation_id}) - tenant preserved")
+
         return {"status": "ok", "event": "installation", "action": action}
     
-    # Handle pull request events - THIS TRIGGERS AUDITS
+    # Handle pull request events — trigger surface scan + PR comment
     if event_type == "pull_request":
         action = payload.get("action")
-        
-        # Only audit on PR open or synchronize (new commits pushed)
+
+        # Only scan on PR open or synchronize (new commits pushed)
         if action not in ("opened", "synchronize", "reopened"):
             return {"status": "ok", "event": "pull_request", "action": action, "skipped": True}
-        
+
         pr = payload.get("pull_request", {})
         repo = payload.get("repository", {})
         installation = payload.get("installation", {})
-        
+
         pr_number = pr.get("number")
         repo_full_name = repo.get("full_name")
         clone_url = repo.get("clone_url")
-        installation_id = installation.get("id")
-        
-        if not all([pr_number, repo_full_name, clone_url, installation_id]):
+        pr_installation_id = installation.get("id")
+        head_sha = pr.get("head", {}).get("sha", "")
+        github_repo_id = repo.get("id")
+
+        if not all([pr_number, repo_full_name, clone_url, pr_installation_id]):
             logger.warning("Missing required fields in PR webhook payload")
             return {"status": "error", "message": "Missing required fields"}
-        
-        logger.info(f"Triggering audit for PR #{pr_number} on {repo_full_name}")
-        
-        # Import and dispatch task
+
+        # Look up project to check pr_comments_enabled
+        project = db.query(Project).filter(Project.github_repo_id == github_repo_id).first() if github_repo_id else None
+
+        # Check pr_comments_enabled guard
+        if project and hasattr(project, 'pr_comments_enabled') and not project.pr_comments_enabled:
+            logger.info(f"PR comments disabled for {repo_full_name}, skipping")
+            return {"status": "ok", "event": "pull_request", "skipped": True, "reason": "PR comments disabled"}
+
+        # Look up tenant via installation_id
+        tenant = db.query(Tenant).filter(Tenant.installation_id == pr_installation_id).first()
+        if not tenant and project:
+            tenant = db.query(Tenant).filter(Tenant.id == project.tenant_id).first()
+        if not tenant:
+            tenant = db.query(Tenant).first()
+        if not tenant:
+            logger.warning(f"No tenant found for PR webhook from {repo_full_name}")
+            return {"status": "error", "message": "No tenant found"}
+
+        logger.info(f"Triggering surface scan for PR #{pr_number} on {repo_full_name}")
+
+        # Tier enforcement: check plan limits before scanning
+        uses_credit = False
         try:
-            from worker.tasks import execute_audit_task
+            from server.tier_enforcement import _check_sync
+            allowance = _check_sync(tenant.id, "scan", db)
+            uses_credit = allowance.get("uses_credit", False)
+        except HTTPException:
+            logger.info(f"Scan limit reached for tenant {tenant.id} ({tenant.name}), skipping PR scan for {repo_full_name}")
+            return {"status": "ok", "event": "pull_request", "skipped": True, "reason": "scan_limit_reached"}
+
+        # Redis dedup: per PR + head SHA
+        dedup_key = f"pr:scan:{project.id if project else 0}:{pr_number}:{head_sha}"
+        try:
+            import redis as redis_lib
+            redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+            r = redis_lib.from_url(redis_url)
+            acquired = r.set(dedup_key, "1", ex=300, nx=True)
+        except Exception:
+            acquired = True  # fail open
+
+        if not acquired:
+            logger.info(f"Duplicate PR scan for {repo_full_name}#{pr_number}@{head_sha[:8]}, skipping")
+            return {"status": "ok", "event": "pull_request", "skipped": True, "reason": "Duplicate"}
+
+        # Import and dispatch surface scan task
+        try:
+            from worker.tasks import execute_scan_task
         except ImportError as e:
             logger.error(f"Worker module not available: {e}")
             return {"status": "error", "message": "Worker not available"}
-        
-        # Generate session ID
-        session_id = f"pr_{repo_full_name.replace('/', '_')}_{pr_number}_{uuid.uuid4().hex[:8]}"
-        
-        # Get or create tenant
-        tenant = db.query(Tenant).first()
-        if not tenant:
-            tenant = Tenant(name="default")
-            db.add(tenant)
-            db.commit()
-            db.refresh(tenant)
-        
-        # Create audit session (project_id is null for webhook-triggered scans)
-        audit_session = AuditSession(
-            session_id=session_id,
-            project_id=None,  # Will be linked to project if one exists/is created
-            status="queued",
-            start_time=datetime.now(timezone.utc),
-            models={"trigger": "github_webhook", "pr_number": pr_number},
-        )
-        db.add(audit_session)
-        db.commit()
-        
-        # Dispatch to worker
-        task = execute_audit_task.delay(
-            repo_url=clone_url,
-            scan_id=session_id,
+
+        # Create ScanExecution record
+        timestamp = int(datetime.now(timezone.utc).timestamp())
+        execution_id = f"scan_{uuid.uuid4().hex[:12]}_{timestamp}"
+
+        scan_execution = ScanExecution(
+            execution_id=execution_id,
+            project_id=project.id if project else None,
             tenant_id=tenant.id,
-            installation_id=installation_id,
+            repo_url=clone_url,
+            repo_name=repo_full_name,
+            status="pending",
+            scan_config={"trigger_source": "pr", "pr_number": pr_number, "head_sha": head_sha, "scan_type": "surface", "uses_credit": uses_credit},
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        db.add(scan_execution)
+        db.commit()
+
+        # Dispatch surface scan with PR params
+        task = execute_scan_task.delay(
+            repo_url=clone_url,
+            scan_id=execution_id,
+            tenant_id=tenant.id,
+            llm_budget=5,
             pr_number=pr_number,
             repo_full_name=repo_full_name,
+            installation_id=pr_installation_id,
         )
-        
-        logger.info(f"Dispatched PR audit task {task.id} for session {session_id}")
-        
+
+        logger.info(f"Dispatched PR scan task {task.id} for {execution_id}")
+
         return {
             "status": "ok",
             "event": "pull_request",
             "action": action,
-            "session_id": session_id,
+            "execution_id": execution_id,
             "task_id": task.id,
         }
     
-    # Handle push events (optional: audit on push to main branch)
+    # Handle push events — trigger surface scan on contract changes
     if event_type == "push":
         ref = payload.get("ref", "")
         repo = payload.get("repository", {})
-        
-        # Only trigger on main/master branch pushes
+        installation = payload.get("installation", {})
+
+        # Only trigger on default branch pushes
         default_branch = repo.get("default_branch", "main")
         if ref not in (f"refs/heads/{default_branch}", "refs/heads/main", "refs/heads/master"):
             return {"status": "ok", "event": "push", "skipped": True, "reason": "Not default branch"}
-        
-        # TODO: Optionally trigger audit on main branch pushes
-        logger.info(f"Push to {ref} on {repo.get('full_name')} - audit not triggered (configure as needed)")
-        
-        return {"status": "ok", "event": "push", "branch": ref}
+
+        github_repo_id = repo.get("id")
+        repo_full_name = repo.get("full_name", "")
+        clone_url = repo.get("clone_url", "")
+        push_installation_id = installation.get("id")
+        head_commit = payload.get("head_commit", {})
+        commit_sha = head_commit.get("id", payload.get("after", ""))
+
+        # Look up project by github_repo_id
+        project = db.query(Project).filter(Project.github_repo_id == github_repo_id).first()
+        if not project:
+            logger.info(f"Push to {repo_full_name}: no matching project, skipping")
+            return {"status": "ok", "event": "push", "skipped": True, "reason": "No matching project"}
+
+        if project.status != "active":
+            logger.info(f"Push to {repo_full_name}: project not active, skipping")
+            return {"status": "ok", "event": "push", "skipped": True, "reason": "Project not active"}
+
+        if not project.tenant_id:
+            logger.warning(f"Push to {repo_full_name}: project has no tenant_id")
+            return {"status": "error", "message": "Project has no tenant"}
+
+        # Dispatch scan via audit_trigger
+        from integrations.audit_trigger import run_audit_task
+        execution_id = run_audit_task(
+            project_id=project.id,
+            project_name=repo_full_name,
+            commit_sha=commit_sha,
+            repo_url=clone_url,
+            tenant_id=project.tenant_id,
+            installation_id=push_installation_id,
+            payload=payload,
+        )
+
+        if execution_id:
+            return {"status": "ok", "event": "push", "execution_id": execution_id}
+        else:
+            return {"status": "ok", "event": "push", "skipped": True, "reason": "No contract changes or duplicate"}
     
     # Unknown event type
     return {"status": "ok", "event": event_type, "handled": False}
@@ -4121,9 +4361,12 @@ async def root():
 
 
 @app.get("/projects", response_model=list[ProjectResponse])
-async def list_projects(db: Session = Depends(get_db)):
+async def list_projects(
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
-    List all projects from the database.
+    List all projects for the authenticated tenant.
 
     Returns project metadata with statistics including:
     - Number of graphs
@@ -4131,7 +4374,7 @@ async def list_projects(db: Session = Depends(get_db)):
     - Number of hypotheses
     - Number of confirmed hypotheses
     """
-    projects = db.query(Project).all()
+    projects = db.query(Project).filter(Project.tenant_id == tenant_id).all()
 
     response = []
     for project in projects:
@@ -4166,17 +4409,27 @@ async def list_projects(db: Session = Depends(get_db)):
 
 
 @app.post("/projects", response_model=ProjectResponse)
-async def create_project(project_data: ProjectCreate, db: Session = Depends(get_db)):
+async def create_project(
+    project_data: ProjectCreate,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+):
     """
     Create a new project for manual git URLs or source paths.
 
     Accepts either git_url or source_path. Creates the project using
     the ProjectManager and stores it in the database.
-    
+
     Note: If git_url is provided without source_path, the repository
     should be cloned first. This is currently a placeholder for future
     git clone functionality.
     """
+    # Path traversal validation
+    if ".." in project_data.name:
+        raise HTTPException(status_code=400, detail="Invalid project name: path traversal not allowed")
+    if project_data.source_path and ".." in project_data.source_path:
+        raise HTTPException(status_code=400, detail="Invalid source_path: path traversal not allowed")
+
     # Validate that at least one source is provided
     if not project_data.git_url and not project_data.source_path:
         raise HTTPException(
@@ -4259,7 +4512,11 @@ async def create_project(project_data: ProjectCreate, db: Session = Depends(get_
 
 
 @app.get("/projects/{project_id}/sessions", response_model=list[SessionResponse])
-async def list_project_sessions(project_id: int, db: Session = Depends(get_db)):
+async def list_project_sessions(
+    project_id: int,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     List all audit sessions for a project.
 
@@ -4271,9 +4528,9 @@ async def list_project_sessions(project_id: int, db: Session = Depends(get_db)):
     - Coverage information
     - Number of investigations
     """
-    # Verify project exists
+    # Verify project exists and belongs to tenant
     project = db.query(Project).filter(Project.id == project_id).first()
-    if not project:
+    if not project or project.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Query sessions for the project
@@ -4306,7 +4563,11 @@ async def list_project_sessions(project_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/sessions/{session_id}/graph")
-async def get_session_graph(session_id: str, db: Session = Depends(get_db)):
+async def get_session_graph(
+    session_id: str,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Return the system_graph JSON for visualization.
 
@@ -4320,9 +4581,9 @@ async def get_session_graph(session_id: str, db: Session = Depends(get_db)):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Get the project's graphs
+    # Get the project's graphs and verify tenant ownership
     project = db.query(Project).filter(Project.id == session.project_id).first()
-    if not project:
+    if not project or project.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Project not found for session")
 
     # Try to get SystemArchitecture graph from database
@@ -4361,18 +4622,22 @@ async def get_session_graph(session_id: str, db: Session = Depends(get_db)):
 
 @app.get("/projects/{project_id}/hypotheses", response_model=list[FindingResponse])
 async def get_project_hypotheses(
-    project_id: int, 
+    project_id: int,
     status: str | None = None,
-    db: Session = Depends(get_db)
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
 ):
     """
     Return all hypotheses for a project, optionally filtered by status.
-    
+
     Query params:
         - status: Filter by status (proposed, investigating, confirmed, rejected, resolved)
     """
-    # Verify project exists
-    project = db.query(Project).filter(Project.id == project_id).first()
+    # Verify project exists and belongs to tenant
+    project = db.query(Project).filter(
+        Project.id == project_id,
+        Project.tenant_id == tenant_id,
+    ).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     
@@ -4410,7 +4675,11 @@ async def get_project_hypotheses(
 
 
 @app.get("/sessions/{session_id}/findings", response_model=list[FindingResponse])
-async def get_session_findings(session_id: str, db: Session = Depends(get_db)):
+async def get_session_findings(
+    session_id: str,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Return the list of confirmed hypotheses (findings).
 
@@ -4422,6 +4691,12 @@ async def get_session_findings(session_id: str, db: Session = Depends(get_db)):
 
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+
+    # Verify tenant ownership via project
+    if session.project_id:
+        project = db.query(Project).filter(Project.id == session.project_id).first()
+        if not project or project.tenant_id != tenant_id:
+            raise HTTPException(status_code=404, detail="Session not found")
 
     # Get confirmed hypotheses for the project
     hypotheses = (
@@ -4467,7 +4742,10 @@ class FindingStatusUpdate(BaseModel):
 
 @app.post("/findings/{finding_id}/status")
 async def update_finding_status(
-    finding_id: int, status_update: FindingStatusUpdate, db: Session = Depends(get_db)
+    finding_id: int,
+    status_update: FindingStatusUpdate,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
 ):
     """
     Update the status of a finding (hypothesis) by database ID.
@@ -4505,7 +4783,10 @@ async def update_finding_status(
 
 @app.put("/api/findings/{finding_id}/status")
 async def update_finding_status_by_hyp_id(
-    finding_id: str, status_update: FindingStatusUpdate, db: Session = Depends(get_db)
+    finding_id: str,
+    status_update: FindingStatusUpdate,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
 ):
     """
     Update the status of a finding (hypothesis) by hypothesis_id string.
@@ -4607,6 +4888,7 @@ class SubscriptionResponse(BaseModel):
     plan_limits: dict = {}  # { repos, audits_per_month, scans_per_month }
     usage_this_month: dict = {}  # { scans_used, audits_used, repos_count }
     can_scan: bool = False
+    can_view_details: bool = False
     scan_credits: int = 0
     stripe_customer_id: str | None = None
 
@@ -4656,7 +4938,6 @@ class RepositoryListResponse(BaseModel):
 
 class RepositoryCreateRequest(BaseModel):
     """Request model for adding a new repository."""
-    tenant_id: int
     github_repo_id: int | None = None
     name: str
     full_name: str
@@ -4706,6 +4987,7 @@ class ScanHistoryItem(BaseModel):
     findings_count: int
     started_at: datetime | None
     completed_at: datetime | None
+    scan_type: str = "surface"
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -4764,12 +5046,18 @@ async def get_current_user_profile(
 
 
 @app.get("/organizations/{org_id}", response_model=OrganizationResponse)
-async def get_organization(org_id: int, db: Session = Depends(get_db)):
+async def get_organization(
+    org_id: int,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     Get organization details by ID.
-    
+
     Returns organization metadata including GitHub account information.
     """
+    if org_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Organization not found")
     org = db.query(Tenant).filter(Tenant.id == org_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
@@ -4787,14 +5075,20 @@ async def get_organization(org_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/organizations/{org_id}/members", response_model=list[OrganizationMemberResponse])
-async def list_organization_members(org_id: int, db: Session = Depends(get_db)):
+async def list_organization_members(
+    org_id: int,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
     """
     List members of an organization.
-    
+
     Note: In the current GitHub App installation model, we don't track individual members.
     This returns the organization itself as a single member. Future enhancement could
     integrate with GitHub API to fetch actual org members.
     """
+    if org_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Organization not found")
     org = db.query(Tenant).filter(Tenant.id == org_id).first()
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
@@ -4812,7 +5106,7 @@ async def list_organization_members(org_id: int, db: Session = Depends(get_db)):
 
 @app.get("/subscriptions/current", response_model=SubscriptionResponse)
 async def get_current_subscription(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db)
 ):
     """
@@ -4863,6 +5157,10 @@ async def get_current_subscription(
     scans_limit = plan_limits.get("scans_per_month", 0)
     can_scan = scans_used < scans_limit or (tenant.scan_credits or 0) > 0
 
+    # Paid subscribers can see full finding details
+    from server.tier_enforcement import has_paid_subscription
+    can_view_details = has_paid_subscription(tenant)
+
     return SubscriptionResponse(
         tenant_id=tenant.id,
         org_name=tenant.name,
@@ -4872,14 +5170,56 @@ async def get_current_subscription(
         plan_limits=plan_limits,
         usage_this_month=usage,
         can_scan=can_scan,
+        can_view_details=can_view_details,
         scan_credits=tenant.scan_credits or 0,
         stripe_customer_id=tenant.stripe_customer_id,
     )
 
 
+ALLOWED_ANALYTICS_EVENTS = {
+    "scan_completed",
+    "paywall_viewed",
+    "upgrade_clicked",
+    "checkout_started",
+    "checkout_completed",
+    "checkout_canceled",
+}
+
+
+class AnalyticsEventRequest(BaseModel):
+    event: str
+    properties: dict = {}
+
+
+@app.post("/events", status_code=204)
+async def track_event(
+    body: AnalyticsEventRequest,
+    request: Request,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
+    """Track a funnel analytics event. Whitelisted event names only."""
+    if body.event not in ALLOWED_ANALYTICS_EVENTS:
+        raise HTTPException(400, f"Unknown event: {body.event}")
+
+    # Cap payload size
+    import json as _json
+    if len(body.properties) > 10 or len(_json.dumps(body.properties)) > 4096:
+        raise HTTPException(400, "Properties too large (max 10 keys, 4KB)")
+
+    from database.models import AnalyticsEvent
+    event = AnalyticsEvent(
+        tenant_id=tenant_id,
+        event=body.event,
+        properties=body.properties,
+    )
+    db.add(event)
+    db.commit()
+
+
 @app.get("/usage/current-month", response_model=UsageStatsResponse)
 async def get_current_month_usage(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db)
 ):
     """
@@ -4939,32 +5279,58 @@ async def get_current_month_usage(
     )
 
 
-def _count_findings_for_project(db: Session, project_id: int) -> int:
-    """Count current findings for a project.
+def _latest_scan_by_type(db: Session, project_id: int, scan_type: str):
+    """Get the latest completed scan of a given type for a project.
 
-    Uses the LATEST completed surface scan (not cumulative) to avoid
-    inflating counts on rescan. Also includes deep audit hypotheses.
+    Filters in Python (not SQL) because scan_config is JSONB on Postgres
+    but plain JSON on SQLite (tests), and JSONB path operators like
+    ['scan_type'].astext don't work on SQLite.
     """
-    # Latest completed surface scan findings
-    latest_scan = db.query(ScanExecution).filter(
+    scans = db.query(ScanExecution).filter(
         ScanExecution.project_id == project_id,
         ScanExecution.status == "completed",
         ScanExecution.findings.isnot(None),
-    ).order_by(ScanExecution.created_at.desc()).first()
+    ).order_by(ScanExecution.created_at.desc()).all()
 
-    surface_findings = len(latest_scan.findings) if latest_scan and latest_scan.findings else 0
+    for scan in scans:
+        cfg = scan.scan_config or {}
+        actual_type = cfg.get("scan_type", "surface") if isinstance(cfg, dict) else "surface"
+        if actual_type == scan_type:
+            return scan
+    return None
 
-    # Deep audit hypotheses (if any exist)
-    deep_findings = db.query(func.count(Hypothesis.id)).filter(
-        Hypothesis.project_id == project_id
-    ).scalar() or 0
 
-    return surface_findings + deep_findings
+def _count_findings_for_project(db: Session, project_id: int) -> int:
+    """Count current findings for a project.
+
+    Uses the LATEST completed scan per type (surface + deep separately)
+    to avoid deep audits eclipsing surface findings or vice versa.
+    """
+    count = 0
+
+    # Latest completed surface scan findings
+    latest_surface = _latest_scan_by_type(db, project_id, "surface")
+    if latest_surface and latest_surface.findings:
+        count += len(latest_surface.findings)
+
+    # Latest completed deep audit findings (from ScanExecution, not Hypothesis table)
+    latest_deep = _latest_scan_by_type(db, project_id, "deep")
+    if latest_deep and latest_deep.findings:
+        count += len(latest_deep.findings)
+
+    # Deep audit hypotheses not backed by a ScanExecution (CLI/agent path)
+    if not latest_deep:
+        deep_findings = db.query(func.count(Hypothesis.id)).filter(
+            Hypothesis.project_id == project_id
+        ).scalar() or 0
+        count += deep_findings
+
+    return count
 
 
 @app.get("/repositories", response_model=RepositoryListResponse)
 async def list_repositories(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    tenant_id: int = Depends(get_current_tenant_id),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     search: str | None = Query(None, description="Search repository name"),
@@ -5071,7 +5437,7 @@ async def _get_current_user_with_token(
 @app.get("/github/repos", response_model=GitHubRepoListResponse, tags=["github"])
 async def list_github_repos(
     request: Request,
-    tenant_id: int = Query(..., description="Tenant ID"),
+    tenant_id: int = Depends(get_current_tenant_id),
     page: int = Query(1, ge=1, description="Page number"),
     per_page: int = Query(30, ge=1, le=100, description="Results per page"),
     search: str | None = Query(None, description="Filter repos by name"),
@@ -5226,7 +5592,10 @@ async def list_github_repos(
 @app.post("/repositories", status_code=201, response_model=RepositoryResponse, tags=["repositories"])
 async def create_repository(
     body: RepositoryCreateRequest,
+    request: Request,
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Add a GitHub repository to the tenant's monitored repositories.
@@ -5245,7 +5614,7 @@ async def create_repository(
 
     # Check for duplicates (github_repo_id OR git_url within tenant, excluding removed)
     dup_query = db.query(Project).filter(
-        Project.tenant_id == body.tenant_id,
+        Project.tenant_id == tenant_id,
         Project.status != "removed",
     )
     if body.github_repo_id:
@@ -5261,7 +5630,7 @@ async def create_repository(
 
     now = datetime.now(timezone.utc)
     project = Project(
-        tenant_id=body.tenant_id,
+        tenant_id=tenant_id,
         name=body.name,
         full_name=body.full_name,
         git_url=body.git_url,
@@ -5279,9 +5648,53 @@ async def create_repository(
 
     # Send Telegram notification for new repo (fire-and-forget)
     try:
-        await notify_new_repo_synced(project.name, project.git_url or "")
+        tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+        await notify_repo_added(
+            repo_name=project.name,
+            repo_url=project.git_url or "",
+            github_account=tenant.github_account_login if tenant else None,
+            tenant_id=tenant_id,
+            full_name=project.full_name,
+        )
     except Exception:
         pass  # non-critical
+
+    # Auto-trigger initial surface scan (fire-and-forget)
+    if project.git_url:
+        try:
+            # Tier enforcement: check plan limits before auto-scanning
+            from server.tier_enforcement import _check_sync
+            auto_scan_uses_credit = False
+            try:
+                allowance = _check_sync(tenant_id, "scan", db)
+                auto_scan_uses_credit = allowance.get("uses_credit", False)
+            except HTTPException:
+                logger.info(f"Scan limit reached for tenant {tenant_id}, skipping auto-scan for {project.name}")
+                raise  # caught by outer except — repo add still succeeds
+
+            from worker.tasks import execute_scan_task
+            initial_execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
+            initial_scan = ScanExecution(
+                execution_id=initial_execution_id,
+                project_id=project.id,
+                tenant_id=tenant_id,
+                repo_name=project.name,
+                repo_url=project.git_url,
+                status="pending",
+                scan_config={"trigger_source": "repo_added", "scan_type": "surface", "uses_credit": auto_scan_uses_credit},
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.add(initial_scan)
+            db.commit()
+            execute_scan_task.delay(
+                repo_url=project.git_url,
+                scan_id=initial_execution_id,
+                tenant_id=tenant_id,
+            )
+            logger.info(f"Auto-triggered initial scan {initial_execution_id} for new repo {project.name}")
+        except Exception as e:
+            logger.warning(f"Failed to auto-trigger initial scan for {project.name}: {e}")
 
     return RepositoryResponse(
         id=project.id,
@@ -5305,7 +5718,7 @@ async def create_repository(
 @app.get("/repositories/{repository_id}", response_model=RepositoryResponse, tags=["repositories"])
 async def get_repository(
     repository_id: int,
-    tenant_id: int = Query(..., description="Tenant ID"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
 ):
     """
@@ -5361,8 +5774,10 @@ async def get_repository(
 @app.delete("/repositories/{repository_id}", status_code=204, tags=["repositories"])
 async def delete_repository(
     repository_id: int,
-    tenant_id: int = Query(..., description="Tenant ID"),
+    request: Request,
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Remove a repository from monitoring (soft delete).
@@ -5396,8 +5811,10 @@ async def delete_repository(
 @app.post("/repositories/{repo_id}/sync-team", tags=["teams"])
 async def sync_team_from_github(
     repo_id: int,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Sync team members from GitHub repository collaborators.
@@ -5570,7 +5987,7 @@ async def get_team_members(
 @app.get("/github/status", response_model=GitHubStatusResponse, tags=["github"])
 async def github_status(
     request: Request,
-    tenant_id: int = Query(..., description="Tenant ID"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
 ):
     """
@@ -5636,7 +6053,10 @@ async def github_status(
 async def trigger_repository_scan(
     repository_id: int,
     request: Request,
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
+    __: User = Depends(require_github_linked),
 ):
     """
     Trigger a new scan for a repository.
@@ -5645,15 +6065,18 @@ async def trigger_repository_scan(
     Checks plan limits before allowing the scan.
     Returns the execution ID for tracking.
     """
-    # Tier enforcement: check plan limits
+    # 1. Ownership check FIRST — before any credit consumption
+    project = db.query(Project).filter(
+        Project.id == repository_id,
+        Project.tenant_id == tenant_id,
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    # 2. Tier enforcement SECOND — only after we know the repo is theirs
     from server.tier_enforcement import require_plan_allowance
     tier_check = require_plan_allowance("scan")
     allowance = await tier_check(request)
-
-    # Verify repository exists
-    project = db.query(Project).filter(Project.id == repository_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Repository not found")
 
     # Generate scan execution ID
     execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
@@ -5666,6 +6089,7 @@ async def trigger_repository_scan(
         repo_name=project.name,
         repo_url=project.git_url,
         status="pending",
+        scan_config={"scan_type": "surface"},
         created_at=datetime.now(timezone.utc),
     )
     db.add(scan)
@@ -5714,15 +6138,19 @@ async def list_repository_scans(
     repository_id: int,
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
-    db: Session = Depends(get_db)
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
 ):
     """
     List scan history for a repository.
-    
+
     Returns paginated list of all scan executions for the specified repository.
     """
-    # Verify repository exists
-    project = db.query(Project).filter(Project.id == repository_id).first()
+    # Verify repository exists and belongs to tenant
+    project = db.query(Project).filter(
+        Project.id == repository_id,
+        Project.tenant_id == tenant_id,
+    ).first()
     if not project:
         raise HTTPException(status_code=404, detail="Repository not found")
     
@@ -5748,6 +6176,7 @@ async def list_repository_scans(
             findings_count=findings_count,
             started_at=scan.started_at,
             completed_at=scan.completed_at,
+            scan_type=scan.scan_config.get("scan_type", "surface") if scan.scan_config else "surface",
         ))
     
     return ScanHistoryResponse(
@@ -5761,7 +6190,7 @@ async def list_repository_scans(
 
 @app.get("/findings", response_model=FindingListResponse)
 async def list_all_findings(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    tenant_id: int = Depends(get_current_tenant_id),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     severity: str | None = Query(None, description="Filter by severity (critical, high, medium, low)"),
@@ -5770,16 +6199,19 @@ async def list_all_findings(
     db: Session = Depends(get_db)
 ):
     """
-    List all findings (hypotheses) for organization/user.
-    
+    List all findings for a tenant: deep-audit hypotheses + surface scan findings.
+
+    Surface scan findings are a current-state view (latest completed scan per
+    project only).  Deep-audit hypotheses include all linked findings.
     Supports filtering by severity, status, and repository.
     Returns paginated list with full finding details.
     """
-    # Build query - join with projects to filter by tenant
+    # Query all hypothesis findings for tenant (pagination applied after
+    # combining with surface scan findings below).
     query = db.query(Hypothesis).join(
         Project, Hypothesis.project_id == Project.id
     ).filter(Project.tenant_id == tenant_id)
-    
+
     # Apply filters
     if severity:
         query = query.filter(Hypothesis.severity == severity)
@@ -5787,37 +6219,96 @@ async def list_all_findings(
         query = query.filter(Hypothesis.status == status)
     if repository_id:
         query = query.filter(Hypothesis.project_id == repository_id)
+
+    findings = query.order_by(Hypothesis.created_at.desc()).all()
     
-    # Get total count
-    total = query.count()
-    
-    # Apply pagination
-    offset = (page - 1) * page_size
-    findings = query.order_by(Hypothesis.created_at.desc()).offset(offset).limit(page_size).all()
-    
-    # Build response
-    findings_list = []
-    for finding in findings:
-        findings_list.append(FindingResponse(
-            id=finding.id,
-            hypothesis_id=finding.hypothesis_id,
-            title=finding.title,
-            description=finding.description,
-            vulnerability_type=finding.vulnerability_type,
-            status=finding.status,
-            confidence=finding.confidence,
-            severity=finding.severity,
-            node_refs=finding.node_refs,
-            evidence=finding.evidence,
-            reported_by_model=finding.reported_by_model,
-            junior_model=finding.junior_model,
-            senior_model=finding.senior_model,
-            created_at=finding.created_at,
-            updated_at=finding.updated_at,
+    # Build hypothesis findings
+    hypothesis_findings = []
+    for h in findings:
+        hypothesis_findings.append(FindingResponse(
+            id=h.id,
+            hypothesis_id=h.hypothesis_id,
+            title=h.title,
+            description=h.description,
+            vulnerability_type=h.vulnerability_type,
+            status=h.status,
+            confidence=h.confidence,
+            severity=h.severity,
+            node_refs=h.node_refs,
+            evidence=h.evidence,
+            reported_by_model=h.reported_by_model,
+            junior_model=h.junior_model,
+            senior_model=h.senior_model,
+            project_id=h.project_id,
+            created_at=h.created_at,
+            updated_at=h.updated_at,
         ))
-    
+
+    # Include scan findings (latest completed scan per type per project).
+    # Surface and deep scans are independent analyses — both contribute.
+    # This is a current-state view: the most recent completed scan of each
+    # type per project is included.  Historical scan data is available via
+    # /repositories/{id}/scans.
+    tenant_projects = db.query(Project.id, Project.name).filter(
+        Project.tenant_id == tenant_id,
+        Project.status != "removed",
+    ).all()
+
+    surface_findings: list[FindingResponse] = []
+    for proj_id, proj_name in tenant_projects:
+        # Apply repository_id filter early if set
+        if repository_id and proj_id != repository_id:
+            continue
+
+        # Get latest surface scan AND latest deep scan separately
+        scans_to_include = []
+        for stype in ("surface", "deep"):
+            scan = _latest_scan_by_type(db, proj_id, stype)
+            if scan and scan.findings:
+                scans_to_include.append(scan)
+
+        for latest_scan in scans_to_include:
+            scan_ts = latest_scan.completed_at or latest_scan.created_at
+            for sf in latest_scan.findings:
+                if not isinstance(sf, dict):
+                    continue
+                sf_severity = sf.get("severity", "medium")
+                sf_status = "scanner_detected"
+                # Apply severity/status filters
+                if severity and sf_severity != severity:
+                    continue
+                if status and sf_status != status:
+                    continue
+                surface_findings.append(FindingResponse(
+                    id=None,
+                    hypothesis_id=None,
+                    pattern_id=sf.get("pattern_id"),
+                    title=sf.get("title", "Untitled"),
+                    description=sf.get("description", ""),
+                    vulnerability_type=sf.get("category"),
+                    status=sf_status,
+                    confidence=sf.get("confidence", 0.5),
+                    severity=sf_severity,
+                    node_refs=None,
+                    evidence={"scan_execution_id": latest_scan.execution_id},
+                    location=sf.get("location"),
+                    code_snippet=sf.get("code_snippet"),
+                    project_id=proj_id,
+                    created_at=scan_ts,
+                    updated_at=scan_ts,
+                ))
+
+    # Combine, sort by created_at descending, then paginate in-memory.
+    # Acceptable at current scale (tens to low hundreds per tenant).
+    # TODO: optimise with SQL UNION when finding volume grows.
+    combined = hypothesis_findings + surface_findings
+    combined.sort(key=lambda f: f.created_at, reverse=True)
+    total = len(combined)
+    offset = (page - 1) * page_size
+    page_items = combined[offset : offset + page_size]
+
     return FindingListResponse(
-        findings=findings_list,
+        findings=page_items,
         total=total,
         page=page,
         page_size=page_size,
@@ -5826,7 +6317,7 @@ async def list_all_findings(
 
 @app.get("/findings/stats", response_model=FindingStatsResponse)
 async def get_findings_statistics(
-    tenant_id: int = Query(..., description="Tenant ID from authentication context"),
+    tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db)
 ):
     """
@@ -5878,29 +6369,25 @@ async def get_findings_statistics(
             repo_name = finding.project.name
             by_repository[repo_name] = by_repository.get(repo_name, 0) + 1
 
-    # Also include surface scan findings (latest scan per project)
+    # Also include scan findings (latest scan per type per project)
     tenant_projects = db.query(Project.id, Project.name).filter(
         Project.tenant_id == tenant_id,
         Project.status != "removed",
     ).all()
 
     for proj_id, proj_name in tenant_projects:
-        latest_scan = db.query(ScanExecution).filter(
-            ScanExecution.project_id == proj_id,
-            ScanExecution.status == "completed",
-            ScanExecution.findings.isnot(None),
-        ).order_by(ScanExecution.created_at.desc()).first()
+        for stype in ("surface", "deep"):
+            latest_scan = _latest_scan_by_type(db, proj_id, stype)
+            if not latest_scan or not latest_scan.findings:
+                continue
 
-        if not latest_scan or not latest_scan.findings:
-            continue
-
-        for finding in latest_scan.findings:
-            total += 1
-            sev = finding.get("severity", "low") if isinstance(finding, dict) else "low"
-            if sev in by_severity:
-                by_severity[sev] += 1
-            by_status["scanner_detected"] += 1
-            by_repository[proj_name] = by_repository.get(proj_name, 0) + 1
+            for finding in latest_scan.findings:
+                total += 1
+                sev = finding.get("severity", "low") if isinstance(finding, dict) else "low"
+                if sev in by_severity:
+                    by_severity[sev] += 1
+                by_status["scanner_detected"] += 1
+                by_repository[proj_name] = by_repository.get(proj_name, 0) + 1
 
     return FindingStatsResponse(
         total=total,
@@ -5946,11 +6433,13 @@ async def finalize_session_hypotheses(
     session_id: str,
     request: QAFinalizeRequest,
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db)
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Run QA finalization on hypotheses from a session.
-    
+
     Uses an LLM to review hypotheses above the confidence threshold
     and confirm/reject them based on source code analysis.
     """
@@ -5958,11 +6447,14 @@ async def finalize_session_hypotheses(
     session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Get the project
-    project = db.query(Project).filter(Project.id == session.project_id).first()
+
+    # Get the project — verify tenant ownership
+    project = db.query(Project).filter(
+        Project.id == session.project_id,
+        Project.tenant_id == tenant_id,
+    ).first()
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(status_code=404, detail="Session not found")
     
     # Get hypotheses for this project
     query = db.query(Hypothesis).filter(
@@ -6291,11 +6783,13 @@ class PoCGenerateResponse(BaseModel):
 async def generate_poc_prompts(
     session_id: str,
     request: PoCGenerateRequest,
-    db: Session = Depends(get_db)
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Generate proof-of-concept prompts for hypotheses from a session.
-    
+
     Uses an LLM strategist to generate detailed PoC prompts that can be
     given to a coding agent to create actual exploit code.
     """
@@ -6303,11 +6797,14 @@ async def generate_poc_prompts(
     session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Get the project
-    project = db.query(Project).filter(Project.id == session.project_id).first()
+
+    # Get the project — verify tenant ownership
+    project = db.query(Project).filter(
+        Project.id == session.project_id,
+        Project.tenant_id == tenant_id,
+    ).first()
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+        raise HTTPException(status_code=404, detail="Session not found")
     
     # Get hypotheses for this project
     query = db.query(Hypothesis).filter(
@@ -6520,42 +7017,50 @@ class ReportGenerateResponse(BaseModel):
 async def generate_report(
     session_id: str,
     request: ReportGenerateRequest,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    tenant_id: int | None = Depends(require_tenant_or_admin),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Generate a security audit report for a session's findings.
-    
+
     Creates a professional HTML or Markdown report with:
     - Executive summary (AI-generated)
     - Vulnerability findings with severity ratings
     - Code snippets and remediation advice
     - Testing methodology
-    
+
     This endpoint uses LLM to generate executive summary and takes 30-60 seconds.
+
+    Auth: tenant JWT (ownership check) OR X-Admin-Key header (admin bypass).
     """
     import re
     import subprocess
     import tempfile
     import traceback
     from datetime import datetime
-    
+
     logger.info(f"Starting report generation for session {session_id}")
-    
+
     try:
         # Get the session
         session = db.query(AuditSession).filter(AuditSession.session_id == session_id).first()
         if not session:
             logger.error(f"Session not found: {session_id}")
             raise HTTPException(status_code=404, detail="Session not found")
-        
+
         # Get the project
         project = db.query(Project).filter(Project.id == session.project_id).first()
         if not project:
             logger.error(f"Project not found for session {session_id}")
-            raise HTTPException(status_code=404, detail="Project not found")
-        
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        # Tenant callers must own the session; admin callers skip ownership check
+        if tenant_id is not None and project.tenant_id != tenant_id:
+            raise HTTPException(status_code=404, detail="Session not found")
+
         logger.info(f"Generating report for project: {project.name}")
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -6869,6 +7374,8 @@ class SurfaceScanResponse(BaseModel):
     scan_duration_seconds: float
     summary: str
     error: str | None = None
+    scan_log: str | None = None
+    scan_type: str = "surface"
 
 
 class SurfaceScanListItem(BaseModel):
@@ -6952,20 +7459,22 @@ async def run_surface_scan(
             scan_config={
                 "llm_budget": request.llm_budget,
                 "model": request.model,
+                "scan_type": "surface",
             },
             llm_calls_made=result.llm_calls_used,
             contracts_scanned=result.contracts_scanned,
             contracts_total=result.contracts_total,
             error_message=result.error,
+            scan_log=result.scan_log,
             started_at=result.scan_timestamp,
             completed_at=datetime.now(),
         )
-        
+
         db.add(scan_exec)
         db.commit()
     except Exception as e:
         logger.warning(f"Failed to save scan to database: {e}")
-    
+
     # Build response
     return SurfaceScanResponse(
         execution_id=execution_id,
@@ -7005,6 +7514,7 @@ async def run_surface_scan(
         scan_duration_seconds=result.scan_duration_seconds,
         summary=result.summary,
         error=result.error,
+        scan_log=result.scan_log,
     )
 
 
@@ -7019,6 +7529,7 @@ async def run_full_surface_scan(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     tenant_id: int = Depends(get_current_tenant_id),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Run a full vulnerability surface scan (PAID: $0.50 via x402).
@@ -7064,11 +7575,13 @@ async def run_full_surface_scan(
                 "llm_budget": request_body.llm_budget,
                 "model": request_body.model,
                 "paid": True,
+                "scan_type": "surface",
             },
             llm_calls_made=result.llm_calls_used,
             contracts_scanned=result.contracts_scanned,
             contracts_total=result.contracts_total,
             error_message=result.error,
+            scan_log=result.scan_log,
             started_at=result.scan_timestamp,
             completed_at=datetime.now(),
         )
@@ -7124,6 +7637,7 @@ async def run_full_surface_scan(
         scan_duration_seconds=result.scan_duration_seconds,
         summary=result.summary,
         error=result.error,
+        scan_log=result.scan_log,
     )
 
 
@@ -7237,14 +7751,18 @@ async def list_surface_scans(
 @app.get("/surface/scans/{execution_id}", response_model=SurfaceScanResponse)
 async def get_surface_scan(
     execution_id: str,
-    db: Session = Depends(get_db)
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
 ):
     """
     Get details of a specific surface scan.
-    
+
     Returns full scan results including all findings and quality metrics.
     """
-    scan = db.query(ScanExecution).filter(ScanExecution.execution_id == execution_id).first()
+    scan = db.query(ScanExecution).filter(
+        ScanExecution.execution_id == execution_id,
+        ScanExecution.tenant_id == tenant_id,
+    ).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     
@@ -7298,18 +7816,26 @@ async def get_surface_scan(
         scan_duration_seconds=duration,
         summary=scan.summary or "",
         error=scan.error_message,
+        scan_log=scan.scan_log,
+        scan_type=scan.scan_config.get("scan_type", "surface") if scan.scan_config else "surface",
     )
 
 
 @app.delete("/surface/scans/{execution_id}")
 async def delete_surface_scan(
     execution_id: str,
-    db: Session = Depends(get_db)
+    request: Request,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """
     Delete a surface scan from the database.
     """
-    scan = db.query(ScanExecution).filter(ScanExecution.execution_id == execution_id).first()
+    scan = db.query(ScanExecution).filter(
+        ScanExecution.execution_id == execution_id,
+        ScanExecution.tenant_id == tenant_id,
+    ).first()
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
     
@@ -7321,7 +7847,8 @@ async def delete_surface_scan(
 
 @app.get("/surface/stats")
 async def get_surface_scan_stats(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
 ):
     """
     Get statistics for surface scans - useful for admin dashboard.

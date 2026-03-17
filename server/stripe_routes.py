@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from database.models import Tenant
 from integrations.telegram import notify_payment_event
+from server.auth_utils import reject_preview_writes
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,7 @@ def get_current_tenant_id(request: Request) -> int:
 class CheckoutRequest(BaseModel):
     plan: str  # starter, professional, enterprise
     period: str  # monthly, annual
+    return_path: str | None = None  # optional path to redirect after checkout
 
 
 class CheckoutResponse(BaseModel):
@@ -114,6 +116,7 @@ async def create_checkout_session(
     body: CheckoutRequest,
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """Create a Stripe Checkout Session for a subscription."""
     from server.api import get_current_tenant_id as _get_tid
@@ -144,12 +147,23 @@ async def create_checkout_session(
         tenant.stripe_customer_id = customer.id
         db.commit()
 
+    # Build return URLs — default to billing page, allow override via return_path
+    return_base = "/settings/billing"
+    if body.return_path:
+        rp = body.return_path
+        if not rp.startswith("/") or "://" in rp or "//" in rp or "\n" in rp or "\r" in rp:
+            raise HTTPException(400, "Invalid return_path")
+        return_base = rp
+
+    success_url = f"{FRONTEND_URL}{return_base}{'&' if '?' in return_base else '?'}success=true"
+    cancel_url = f"{FRONTEND_URL}{return_base}{'&' if '?' in return_base else '?'}canceled=true"
+
     session = stripe.checkout.Session.create(
         customer=tenant.stripe_customer_id,
         mode="subscription",
         line_items=[{"price": price_id, "quantity": 1}],
-        success_url=f"{FRONTEND_URL}/settings/billing?success=true",
-        cancel_url=f"{FRONTEND_URL}/settings/billing?canceled=true",
+        success_url=success_url,
+        cancel_url=cancel_url,
         allow_promotion_codes=True,
         metadata={"tenant_id": str(tenant.id), "plan": body.plan, "period": body.period},
     )
@@ -161,6 +175,7 @@ async def create_checkout_session(
 async def buy_credits(
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """Create a Stripe Checkout Session for a one-time credit tranche purchase."""
     from server.api import get_current_tenant_id as _get_tid
@@ -201,6 +216,7 @@ async def buy_credits(
 async def create_billing_portal(
     request: Request,
     db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
 ):
     """Create a Stripe Billing Portal session for plan management."""
     from server.api import get_current_tenant_id as _get_tid

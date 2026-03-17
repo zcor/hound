@@ -22,6 +22,8 @@ from celery.exceptions import SoftTimeLimitExceeded  # noqa: E402
 from .celery_app import celery_app  # noqa: E402
 from .redis_publisher import RedisPublisher  # noqa: E402
 
+from llm.token_tracker import set_token_context, clear_token_context  # noqa: E402
+
 
 class AuditTask(Task):
     """
@@ -60,6 +62,29 @@ class AuditTask(Task):
             
             # Update database
             self._update_scan_status(scan_id, "failed", error_message=str(exc))
+            
+            # Refund credit if this scan consumed one
+            self._refund_if_credit_used(scan_id)
+        
+        # Clear token context on failure
+        clear_token_context()
+    
+    def _refund_if_credit_used(self, scan_id: str):
+        """Refund a scan credit if the failed scan consumed one."""
+        try:
+            from database.models import ScanExecution
+            from server.tier_enforcement import refund_scan_credit
+            
+            db = self.get_db_session()
+            try:
+                scan = db.query(ScanExecution).filter_by(execution_id=scan_id).first()
+                if scan and scan.scan_config and scan.scan_config.get("uses_credit"):
+                    refund_scan_credit(db, scan.tenant_id, scan_id)
+                    print(f"Refunded scan credit for tenant {scan.tenant_id} (scan {scan_id})")
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"Failed to refund scan credit: {e}")
     
     def on_success(self, retval, task_id, args, kwargs):
         """Handle task success."""
@@ -160,6 +185,14 @@ def execute_audit_task(
     temp_dir = None
     
     try:
+        # Set token tracking context for cost attribution
+        set_token_context(
+            project_id=project_id,
+            session_id=scan_id,
+            tenant_id=tenant_id,
+            endpoint="audit",
+        )
+        
         # Publish start status
         publisher.publish_status("running", "Starting audit...")
         self._update_scan_status(scan_id, "running")
@@ -666,12 +699,17 @@ def execute_audit_task(
                     iteration=result.get("iterations", 0)
                 )
         
-        # Update final status
+        # Normalize hypotheses into SurfaceFinding-compatible shape for ScanExecution
+        normalized_findings, risk_score, risk_level = _normalize_hypotheses_for_scan(hypotheses)
+
+        # Update final status (writes to ScanExecution if present, else AuditSession)
         self._update_scan_status(
             scan_id,
             "completed",
-            findings=hypotheses,
-            summary=f"Found {len(hypotheses)} potential issues",
+            findings=normalized_findings,
+            summary=f"Deep audit found {len(hypotheses)} potential issues",
+            risk_score=risk_score,
+            risk_level=risk_level,
         )
         
         publisher.publish_status(
@@ -709,6 +747,7 @@ def execute_audit_task(
     finally:
         # Cleanup
         publisher.close()
+        clear_token_context()
         
         if temp_dir and os.path.exists(temp_dir):
             try:
@@ -725,6 +764,9 @@ def execute_scan_task(
     tenant_id: int,
     llm_budget: int = 5,
     model: str | None = None,
+    pr_number: int | None = None,
+    repo_full_name: str | None = None,
+    installation_id: int | None = None,
 ) -> dict:
     """
     Execute a lightweight surface scan.
@@ -748,6 +790,13 @@ def execute_scan_task(
         publisher.publish_status("running", "Starting surface scan...")
         self._update_scan_status(scan_id, "running")
         
+        # Set token tracking context for cost attribution
+        set_token_context(
+            session_id=scan_id,
+            tenant_id=tenant_id,
+            endpoint="scan",
+        )
+        
         from analysis.surface import SurfaceScanner
         from utils.config_loader import load_config
         
@@ -766,11 +815,20 @@ def execute_scan_task(
         
         # Convert result to dict
         result_dict = result.model_dump() if hasattr(result, "model_dump") else result.dict()
-        
+
+        # Redact then truncate scan log
+        raw_log = result_dict.get("scan_log") or ""
+        from analysis.surface.scanner import _redact_log, _truncate_log
+        safe_log = _truncate_log(_redact_log(raw_log)) if raw_log else None
+
+        # If scanner returned an error, mark as failed
+        scan_error = result_dict.get("error")
+        final_status = "failed" if scan_error else "completed"
+
         # Update database
         self._update_scan_status(
             scan_id,
-            "completed",
+            final_status,
             risk_score=result_dict.get("risk_score"),
             risk_level=result_dict.get("risk_level"),
             findings=result_dict.get("findings"),
@@ -778,28 +836,63 @@ def execute_scan_task(
             summary=result_dict.get("summary"),
             contracts_scanned=result_dict.get("contracts_scanned", 0),
             contracts_total=result_dict.get("contracts_total", 0),
+            scan_log=safe_log,
+            error_message=scan_error,
         )
-        
+
         publisher.publish_status(
-            "completed",
-            f"Scan complete. Risk score: {result_dict.get('risk_score', 0)}"
+            final_status,
+            scan_error or f"Scan complete. Risk score: {result_dict.get('risk_score', 0)}"
         )
-        
+
+        # Post findings to PR if this was triggered by a PR event
+        if pr_number and repo_full_name and installation_id:
+            try:
+                from integrations.pr_bot import PRCommentBot
+                bot = PRCommentBot(
+                    installation_id=installation_id,
+                    repo_full_name=repo_full_name,
+                    pr_number=pr_number,
+                )
+                # Convert surface findings to the format PRCommentBot expects
+                pr_findings = []
+                for f in result_dict.get("findings", []):
+                    pr_findings.append({
+                        "title": f.get("title", ""),
+                        "severity": f.get("severity", "medium"),
+                        "type": f.get("category", "vulnerability"),
+                        "confidence": f.get("confidence", 0.5),
+                        "description": f.get("description", ""),
+                        "location": f.get("location", ""),
+                    })
+                bot.post_findings(
+                    pr_findings,
+                    scan_id=scan_id,
+                    include_inline=False,  # v1: summary only
+                    include_summary=True,
+                    delete_previous=False,  # We use find-and-update instead
+                )
+                publisher.publish_thought("PR comment posted", iteration=1)
+            except Exception as e:
+                # Non-fatal: scan succeeded even if PR comment fails
+                print(f"Failed to post PR comment: {e}")
+
         return {
             "status": "completed",
             "scan_id": scan_id,
             **result_dict,
         }
-        
+
     except Exception as e:
         error_msg = str(e)
         publisher.publish_error(error_msg, "scan_error")
         publisher.publish_status("failed", error_msg)
         self._update_scan_status(scan_id, "failed", error_message=error_msg)
         raise
-        
+
     finally:
         publisher.close()
+        clear_token_context()
 
 
 def _store_hypotheses_in_db(
@@ -843,6 +936,52 @@ def _store_hypotheses_in_db(
         print(f"Failed to store hypotheses: {e}")
         import traceback
         traceback.print_exc()
+
+
+def _normalize_hypotheses_for_scan(hypotheses: list) -> tuple[list, int, str]:
+    """Normalize deep-audit hypotheses into SurfaceFinding-compatible shape.
+
+    Returns (normalized_findings, risk_score, risk_level).
+    The frontend serializer expects: pattern_id, title, severity,
+    category, confidence, location, code_snippet, description, llm_verified.
+    """
+    severity_weights = {"critical": 25, "high": 15, "medium": 5, "low": 1}
+    risk_score = min(100, sum(
+        severity_weights.get(h.get("severity", "medium"), 5)
+        for h in hypotheses
+    ))
+    risk_level = (
+        "critical" if risk_score >= 75
+        else "high" if risk_score >= 50
+        else "medium" if risk_score >= 25
+        else "low"
+    )
+
+    normalized = []
+    for h in hypotheses:
+        node_ids = h.get("node_ids", []) or []
+        location = ", ".join(str(n) for n in node_ids[:3]) if node_ids else ""
+        evidence = h.get("evidence", [])
+        code_snippet = ""
+        if isinstance(evidence, list):
+            for ev in evidence[:1]:
+                if isinstance(ev, dict) and "code" in ev:
+                    code_snippet = ev["code"][:500]
+
+        normalized.append({
+            "pattern_id": h.get("id", ""),
+            "title": h.get("title") or h.get("description", "")[:80],
+            "severity": h.get("severity", "medium"),
+            "category": h.get("vulnerability_type", "vulnerability"),
+            "confidence": float(h.get("confidence", 0.5)),
+            "location": location,
+            "code_snippet": code_snippet,
+            "description": h.get("description", ""),
+            "llm_verified": True,
+            "llm_notes": None,
+        })
+
+    return normalized, risk_score, risk_level
 
 
 def _convert_hypotheses_to_findings(hypotheses: list) -> list[dict]:
@@ -944,6 +1083,14 @@ def build_graphs_task(
     try:
         publisher.publish_status("running", "Starting graph build")
         publisher.publish_thought("Initializing graph build task...", iteration=0)
+        
+        # Set token tracking context for cost attribution
+        set_token_context(
+            project_id=project_id,
+            session_id=scan_id,
+            tenant_id=tenant_id,
+            endpoint="build_graphs",
+        )
         
         # Step 1: Clone or locate repository
         if repo_url.startswith(("http://", "https://", "git@")):
@@ -1124,6 +1271,7 @@ def build_graphs_task(
         
     finally:
         publisher.close()
+        clear_token_context()
         
         # Note: We don't clean up temp_dir here as the graphs may be needed
         # Cleanup should happen after audit completes or via scheduled task

@@ -30,7 +30,7 @@ from fastapi import Depends, HTTPException, Request
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database.models import PaymentLog
+from database.models import PaymentLog, TenantDiscount, X402Discount
 from server.x402_config import get_config, x402_enabled
 
 logger = logging.getLogger(__name__)
@@ -93,41 +93,170 @@ def canonical_request_hash(body: bytes) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _get_resource_config(config, endpoint: str):
-    """Get a ResourceConfig for the given endpoint from route pricing."""
+def cents_to_usd_string(cents: int) -> str:
+    """Convert cents to USD string for x402 SDK. 1 -> '$0.01', 50 -> '$0.50'."""
+    dollars = cents / 100
+    return f"${dollars:.2f}"
+
+
+def _usd_string_to_cents(usd_str: str) -> int:
+    """Convert USD string like '$0.50' to cents (50). Inverse of cents_to_usd_string."""
+    return int(Decimal(usd_str.replace("$", "")) * 100)
+
+
+def _lookup_tenant_discount(
+    db: Session, tenant_id: int, endpoint: str, base_price_cents: int,
+) -> tuple[int | None, str | None]:
+    """Find best active discount for tenant+endpoint. Returns (price_cents, code) or (None, None).
+
+    base_price_cents: the route's base price in cents (e.g. 50 for $0.50).
+
+    Precedence (when multiple active discounts exist):
+      1. Endpoint-specific over global
+      2. Fixed-price over percentage
+      3. Most recently redeemed
+    """
+    from sqlalchemy import or_, func as sa_func
+
+    td = db.query(TenantDiscount).join(X402Discount).filter(
+        TenantDiscount.tenant_id == tenant_id,
+        X402Discount.active == True,  # noqa: E712
+        or_(X402Discount.expires_at == None, X402Discount.expires_at > sa_func.now()),  # noqa: E711
+        or_(X402Discount.endpoint == None, X402Discount.endpoint == endpoint),  # noqa: E711
+    ).order_by(
+        # 1. endpoint-specific first (NULL sorts last)
+        X402Discount.endpoint.is_(None).asc(),
+        # 2. fixed_price_cents first (non-NULL before NULL)
+        X402Discount.fixed_price_cents.is_(None).asc(),
+        # 3. newest redemption first
+        TenantDiscount.redeemed_at.desc(),
+    ).first()
+
+    if not td:
+        return None, None
+
+    # Lock the discount row to prevent race on usage counters
+    discount = db.query(X402Discount).with_for_update().filter(
+        X402Discount.id == td.discount_id,
+    ).one_or_none()
+
+    if not discount:
+        return None, None
+
+    # Check global usage limit
+    if discount.max_uses is not None and discount.current_uses >= discount.max_uses:
+        return None, None
+
+    # Lock tenant_discount row too for per-tenant limit check (reviewer note #1)
+    td_locked = db.query(TenantDiscount).with_for_update().filter(
+        TenantDiscount.id == td.id,
+    ).one_or_none()
+
+    if not td_locked:
+        return None, None
+
+    # Check per-tenant usage limit
+    if discount.max_uses_per_tenant is not None and td_locked.uses >= discount.max_uses_per_tenant:
+        return None, None
+
+    if discount.fixed_price_cents is not None:
+        return discount.fixed_price_cents, discount.code
+
+    if discount.percentage_off is not None:
+        discounted = max(1, base_price_cents * (100 - discount.percentage_off) // 100)
+        return discounted, discount.code
+
+    return None, None
+
+
+def _consume_discount(db: Session, tenant_id: int, discount_code: str):
+    """Atomically increment usage counters. Called after settlement. Commits.
+
+    Uses WHERE guards to prevent exceeding limits even under concurrency.
+    """
+    from sqlalchemy import text
+
+    # Atomic global counter increment with WHERE guard
+    result = db.execute(text(
+        "UPDATE x402_discounts SET current_uses = current_uses + 1 "
+        "WHERE code = :code AND (max_uses IS NULL OR current_uses < max_uses)"
+    ), {"code": discount_code})
+
+    if result.rowcount == 0:
+        db.commit()
+        return  # Limit hit between lookup and settlement — benign race
+
+    # Atomic per-tenant counter with WHERE guard (reviewer note #1)
+    db.execute(text(
+        "UPDATE tenant_discounts SET uses = uses + 1 "
+        "FROM x402_discounts "
+        "WHERE tenant_discounts.discount_id = x402_discounts.id "
+        "AND tenant_discounts.tenant_id = :tid AND x402_discounts.code = :code "
+        "AND (x402_discounts.max_uses_per_tenant IS NULL OR tenant_discounts.uses < x402_discounts.max_uses_per_tenant)"
+    ), {"tid": tenant_id, "code": discount_code})
+
+    db.commit()
+
+
+def _get_resource_config(config, endpoint: str, tenant_id: int | None = None, db: Session | None = None):
+    """Get a ResourceConfig for the given endpoint, applying discount if applicable.
+
+    Returns (ResourceConfig, discount_code | None) tuple.
+    When tenant_id/db are provided, looks up discount and returns discounted price.
+    """
     from x402.schemas.config import ResourceConfig
 
     route_config = config.route_pricing.get(endpoint)
     if not route_config:
-        return None
+        return None, None
 
     # RouteConfig.accepts is a PaymentOption with scheme, pay_to, price, network
     option = route_config.accepts
     if isinstance(option, list):
         option = option[0]
 
-    return ResourceConfig(
+    base_price = option.price
+    discount_code = None
+    resolved_price_cents = _usd_string_to_cents(base_price)
+
+    # Look up tenant discount if context is available
+    if tenant_id is not None and db is not None:
+        discounted_cents, code = _lookup_tenant_discount(db, tenant_id, endpoint, resolved_price_cents)
+        if discounted_cents is not None:
+            resolved_price_cents = discounted_cents
+            base_price = cents_to_usd_string(discounted_cents)
+            discount_code = code
+
+    rc = ResourceConfig(
         scheme=option.scheme,
         pay_to=option.pay_to,
-        price=option.price,
+        price=base_price,
         network=option.network,
         max_timeout_seconds=option.max_timeout_seconds,
     )
+    return rc, discount_code
 
 
-def build_402_headers(config, endpoint: str, resource_id: str | None) -> dict[str, str]:
-    """Build 402 Payment Required response headers per x402 v2 spec."""
-    rc = _get_resource_config(config, endpoint)
+def build_402_headers(
+    config, endpoint: str, resource_id: str | None,
+    tenant_id: int | None = None, db: Session | None = None,
+) -> tuple[dict[str, str], str | None]:
+    """Build 402 Payment Required response headers per x402 v2 spec.
+
+    Returns (headers_dict, discount_code | None).
+    """
+    rc, discount_code = _get_resource_config(config, endpoint, tenant_id=tenant_id, db=db)
     if not rc:
-        return {}
+        return {}, None
 
     requirements = config.server.build_payment_requirements(rc)
     payment_required = config.server.create_payment_required_response(requirements)
 
-    return {
+    headers = {
         "X-Payment-Requirements": payment_required.model_dump_json(),
         "Content-Type": "application/json",
     }
+    return headers, discount_code
 
 
 # =============================================================================
@@ -235,6 +364,18 @@ async def process_payment_gate(
         else:
             raise HTTPException(500, f"Unexpected payment status: {existing.status}")
 
+    # -- STEP 2.5: Resolve discount ONCE at reservation time --
+    rc, discount_code = _get_resource_config(config, endpoint, tenant_id=tenant_id, db=db)
+    if not rc:
+        transition(log, PaymentStatus.EXPIRED, db)
+        raise HTTPException(500, f"No pricing configured for {endpoint}")
+
+    # Persist the resolved price on the PaymentLog (reviewer note #2)
+    resolved_cents = _usd_string_to_cents(rc.price)
+    log.discount_code = discount_code
+    log.resolved_price_cents = resolved_cents
+    db.commit()
+
     # -- STEP 3: Verify payment (only reservation owner reaches here) --
     payment_header = (
         request.headers.get("X-PAYMENT")
@@ -242,7 +383,13 @@ async def process_payment_gate(
     )
     if not payment_header:
         transition(log, PaymentStatus.EXPIRED, db)
-        headers = build_402_headers(config, endpoint, resource_id)
+        # Use the same rc for 402 headers (identical price path)
+        requirements = config.server.build_payment_requirements(rc)
+        payment_required = config.server.create_payment_required_response(requirements)
+        headers = {
+            "X-Payment-Requirements": payment_required.model_dump_json(),
+            "Content-Type": "application/json",
+        }
         raise HTTPException(status_code=402, detail="Payment required", headers=headers)
 
     # Parse payment payload and verify via facilitator
@@ -252,27 +399,37 @@ async def process_payment_gate(
         payload = PaymentPayload.model_validate_json(payment_header)
     except Exception:
         transition(log, PaymentStatus.EXPIRED, db)
-        headers = build_402_headers(config, endpoint, resource_id)
+        requirements = config.server.build_payment_requirements(rc)
+        payment_required = config.server.create_payment_required_response(requirements)
+        headers = {
+            "X-Payment-Requirements": payment_required.model_dump_json(),
+            "Content-Type": "application/json",
+        }
         raise HTTPException(status_code=402, detail="Invalid payment payload", headers=headers)
 
-    # Get the route's requirements for verification
-    rc = _get_resource_config(config, endpoint)
-    if not rc:
-        transition(log, PaymentStatus.EXPIRED, db)
-        raise HTTPException(500, f"No pricing configured for {endpoint}")
-
+    # Use the SAME rc for verification (identical price path — Fix #5)
     requirements_list = config.server.build_payment_requirements(rc)
     matched_req = config.server.find_matching_requirements(requirements_list, payload)
     if not matched_req:
         transition(log, PaymentStatus.EXPIRED, db)
-        headers = build_402_headers(config, endpoint, resource_id)
+        requirements = config.server.build_payment_requirements(rc)
+        payment_required = config.server.create_payment_required_response(requirements)
+        headers = {
+            "X-Payment-Requirements": payment_required.model_dump_json(),
+            "Content-Type": "application/json",
+        }
         raise HTTPException(status_code=402, detail="Payment does not match requirements")
 
     # Verify via facilitator
     verify_result = await config.server.verify_payment(payload, matched_req)
     if not verify_result.is_valid:
         transition(log, PaymentStatus.EXPIRED, db)
-        headers = build_402_headers(config, endpoint, resource_id)
+        requirements = config.server.build_payment_requirements(rc)
+        payment_required = config.server.create_payment_required_response(requirements)
+        headers = {
+            "X-Payment-Requirements": payment_required.model_dump_json(),
+            "Content-Type": "application/json",
+        }
         raise HTTPException(
             status_code=402,
             detail=f"Payment invalid: {verify_result.invalid_reason}",
@@ -287,6 +444,10 @@ async def process_payment_gate(
             status_code=402,
             detail=f"Settlement failed: {settle_result.error_reason}",
         )
+
+    # Consume discount usage after successful settlement
+    if discount_code:
+        _consume_discount(db, tenant_id, discount_code)
 
     # Bind payment proof — replay protection via unique index on payment_id
     try:

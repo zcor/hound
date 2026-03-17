@@ -136,6 +136,85 @@ async def notify_new_repo_synced(
     return await send_telegram_message(message)
 
 
+async def notify_repo_added(
+    repo_name: str,
+    repo_url: str,
+    github_account: str | None = None,
+    tenant_id: int | None = None,
+    full_name: str | None = None,
+) -> bool:
+    """
+    Send notification when an existing user adds a repository.
+
+    Args:
+        repo_name: Repository name (e.g., "my-contract")
+        repo_url: Git URL or HTTPS URL of the repo
+        github_account: GitHub username or org that owns the repo
+        tenant_id: Database tenant ID
+        full_name: Full repo name (e.g., "acme/my-contract")
+
+    Returns:
+        True if notification was sent successfully
+    """
+    display_name = full_name or repo_name
+    # Build clickable repo link
+    repo_link = f'<a href="{_escape_html(repo_url)}">{_escape_html(display_name)}</a>' if repo_url else _escape_html(display_name)
+
+    message_parts = [
+        "📦 <b>Repo Added!</b>",
+        "",
+        f"📁 <b>Repo:</b> {repo_link}",
+    ]
+
+    if github_account:
+        account_link = f'<a href="https://github.com/{_escape_html(github_account)}">{_escape_html(github_account)}</a>'
+        message_parts.append(f"👤 <b>Account:</b> {account_link}")
+
+    if tenant_id:
+        message_parts.append(f"🆔 <b>Tenant ID:</b> {tenant_id}")
+
+    message = "\n".join(message_parts)
+    return await send_telegram_message(message)
+
+
+async def notify_app_installed(
+    github_account: str,
+    account_type: str,
+    tenant_id: int | None = None,
+    installation_id: int | None = None,
+) -> bool:
+    """
+    Send notification when someone installs the GitHub App via webhook.
+
+    Args:
+        github_account: GitHub username or organization name
+        account_type: "User" or "Organization"
+        tenant_id: Database tenant ID (if created)
+        installation_id: GitHub App installation ID
+
+    Returns:
+        True if notification was sent successfully
+    """
+    emoji = "👤" if account_type == "User" else "🏢"
+    account_link = f'<a href="https://github.com/{_escape_html(github_account)}">{_escape_html(github_account)}</a>'
+
+    message_parts = [
+        "🔥 <b>New GitHub App Install!</b>",
+        "",
+        f"{emoji} <b>Account:</b> {account_link}",
+        f"📋 <b>Type:</b> {account_type}",
+    ]
+
+    if tenant_id:
+        message_parts.append(f"🆔 <b>Tenant ID:</b> {tenant_id}")
+
+    if installation_id:
+        message_parts.append(f"🔧 <b>Installation ID:</b> {installation_id}")
+
+    message = "\n".join(message_parts)
+    return await send_telegram_message(message)
+
+
 async def notify_payment_event(
     event_type: str,
     tenant_name: str | None = None,

@@ -81,6 +81,7 @@ def get_current_tenant_id(request: Request) -> int:
 class CheckoutRequest(BaseModel):
     plan: str  # starter, professional, enterprise
     period: str  # monthly, annual
+    return_path: str | None = None  # optional path to redirect after checkout
 
 
 class CheckoutResponse(BaseModel):
@@ -146,12 +147,23 @@ async def create_checkout_session(
         tenant.stripe_customer_id = customer.id
         db.commit()
 
+    # Build return URLs — default to billing page, allow override via return_path
+    return_base = "/settings/billing"
+    if body.return_path:
+        rp = body.return_path
+        if not rp.startswith("/") or "://" in rp or "//" in rp or "\n" in rp or "\r" in rp:
+            raise HTTPException(400, "Invalid return_path")
+        return_base = rp
+
+    success_url = f"{FRONTEND_URL}{return_base}{'&' if '?' in return_base else '?'}success=true"
+    cancel_url = f"{FRONTEND_URL}{return_base}{'&' if '?' in return_base else '?'}canceled=true"
+
     session = stripe.checkout.Session.create(
         customer=tenant.stripe_customer_id,
         mode="subscription",
         line_items=[{"price": price_id, "quantity": 1}],
-        success_url=f"{FRONTEND_URL}/settings/billing?success=true",
-        cancel_url=f"{FRONTEND_URL}/settings/billing?canceled=true",
+        success_url=success_url,
+        cancel_url=cancel_url,
         allow_promotion_codes=True,
         metadata={"tenant_id": str(tenant.id), "plan": body.plan, "period": body.period},
     )

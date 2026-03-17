@@ -2968,7 +2968,8 @@ async def start_audit(
         db.add(tenant)
         db.commit()
 
-    has_saas_sub = tenant.stripe_subscription_id and tenant.plan not in (None, "free")
+    from server.tier_enforcement import has_paid_subscription
+    has_saas_sub = has_paid_subscription(tenant)
 
     gate = PaymentGate(enabled=False, status="disabled")
 
@@ -4887,6 +4888,7 @@ class SubscriptionResponse(BaseModel):
     plan_limits: dict = {}  # { repos, audits_per_month, scans_per_month }
     usage_this_month: dict = {}  # { scans_used, audits_used, repos_count }
     can_scan: bool = False
+    can_view_details: bool = False
     scan_credits: int = 0
     stripe_customer_id: str | None = None
 
@@ -5155,6 +5157,10 @@ async def get_current_subscription(
     scans_limit = plan_limits.get("scans_per_month", 0)
     can_scan = scans_used < scans_limit or (tenant.scan_credits or 0) > 0
 
+    # Paid subscribers can see full finding details
+    from server.tier_enforcement import has_paid_subscription
+    can_view_details = has_paid_subscription(tenant)
+
     return SubscriptionResponse(
         tenant_id=tenant.id,
         org_name=tenant.name,
@@ -5164,9 +5170,51 @@ async def get_current_subscription(
         plan_limits=plan_limits,
         usage_this_month=usage,
         can_scan=can_scan,
+        can_view_details=can_view_details,
         scan_credits=tenant.scan_credits or 0,
         stripe_customer_id=tenant.stripe_customer_id,
     )
+
+
+ALLOWED_ANALYTICS_EVENTS = {
+    "scan_completed",
+    "paywall_viewed",
+    "upgrade_clicked",
+    "checkout_started",
+    "checkout_completed",
+    "checkout_canceled",
+}
+
+
+class AnalyticsEventRequest(BaseModel):
+    event: str
+    properties: dict = {}
+
+
+@app.post("/events", status_code=204)
+async def track_event(
+    body: AnalyticsEventRequest,
+    request: Request,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+):
+    """Track a funnel analytics event. Whitelisted event names only."""
+    if body.event not in ALLOWED_ANALYTICS_EVENTS:
+        raise HTTPException(400, f"Unknown event: {body.event}")
+
+    # Cap payload size
+    import json as _json
+    if len(body.properties) > 10 or len(_json.dumps(body.properties)) > 4096:
+        raise HTTPException(400, "Properties too large (max 10 keys, 4KB)")
+
+    from database.models import AnalyticsEvent
+    event = AnalyticsEvent(
+        tenant_id=tenant_id,
+        event=body.event,
+        properties=body.properties,
+    )
+    db.add(event)
+    db.commit()
 
 
 @app.get("/usage/current-month", response_model=UsageStatsResponse)

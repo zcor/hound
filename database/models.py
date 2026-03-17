@@ -619,6 +619,20 @@ class TenantDiscount(Base):
         return f"<TenantDiscount(tenant_id={self.tenant_id}, discount_id={self.discount_id})>"
 
 
+class AnalyticsEvent(Base):
+    """Funnel analytics events tracked from the dashboard."""
+    __tablename__ = "analytics_events"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
+    event = Column(String(100), nullable=False, index=True)
+    properties = Column(JSONType, nullable=False, default=dict)
+    created_at = Column(DateTime, nullable=False, default=func.now())
+
+    def __repr__(self):
+        return f"<AnalyticsEvent(tenant_id={self.tenant_id}, event={self.event})>"
+
+
 # Model pricing table (per 1M tokens) - Updated January 2026
 MODEL_PRICING = {
     # OpenAI

@@ -3,7 +3,7 @@ Tests for the FastAPI server endpoints.
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -25,6 +25,35 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
 from server.api import app, get_db
 from server.auth_utils import create_access_token
+
+
+class FakeGitHubResponse:
+    """Small helper for mocking GitHub API responses."""
+
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+
+class FakeAsyncClient:
+    """Deterministic async client for GitHub API endpoint tests."""
+
+    def __init__(self, responses=None):
+        self._responses = list(responses or [])
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, *args, **kwargs):
+        if not self._responses:
+            raise AssertionError("Unexpected GET request")
+        return self._responses.pop(0)
 
 
 # Test database setup
@@ -613,6 +642,42 @@ def test_get_current_subscription(client, sample_tenant):
     assert "status" in data
 
 
+def test_get_current_subscription_active_trial_uses_effective_plan(client, sample_tenant, test_db):
+    """Active trials should report starter limits and can_view_details."""
+    sample_tenant.status = "active"
+    sample_tenant.trial_plan = "starter"
+    sample_tenant.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=14)
+    test_db.commit()
+
+    response = client.get("/subscriptions/current", headers=auth_headers(sample_tenant))
+    assert response.status_code == 200
+    data = response.json()
+    assert data["plan"] == "starter"
+    assert data["is_trial"] is True
+    assert data["can_view_details"] is True
+    assert data["plan_limits"]["scans_per_month"] == 40
+    assert data["trial_plan"] == "starter"
+    assert data["trial_ends_at"] is not None
+
+
+def test_get_current_subscription_paid_beats_trial(client, sample_tenant, test_db):
+    """Paid subscriptions should override active trial metadata."""
+    sample_tenant.status = "active"
+    sample_tenant.plan = "professional"
+    sample_tenant.stripe_subscription_id = "sub_123"
+    sample_tenant.trial_plan = "starter"
+    sample_tenant.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=14)
+    test_db.commit()
+
+    response = client.get("/subscriptions/current", headers=auth_headers(sample_tenant))
+    assert response.status_code == 200
+    data = response.json()
+    assert data["plan"] == "professional"
+    assert data["is_trial"] is False
+    assert data["can_view_details"] is True
+    assert data["plan_limits"]["scans_per_month"] == 180
+
+
 def test_get_current_subscription_not_found(client, test_db):
     """Test getting subscription for non-existent tenant."""
     # Create a tenant so JWT is valid, but it has no subscription data matching tenant 999
@@ -942,6 +1007,8 @@ def test_trigger_scan_dispatches_celery_task(client, sample_project, github_user
     from unittest.mock import MagicMock, patch
 
     mock_task = MagicMock()
+    sample_project.installation_id = 88888
+    test_db.commit()
 
     # Bypass tier enforcement — patched at the source module
     def fake_require(action):
@@ -965,6 +1032,7 @@ def test_trigger_scan_dispatches_celery_task(client, sample_project, github_user
     call_kwargs = mock_task.delay.call_args
     assert call_kwargs.kwargs["repo_url"] == sample_project.git_url
     assert call_kwargs.kwargs["tenant_id"] == sample_project.tenant_id
+    assert call_kwargs.kwargs["installation_id"] == 88888
 
 
 def test_trigger_scan_dispatch_failure_returns_500(client, sample_project, github_user, test_db):
@@ -1404,6 +1472,61 @@ def test_github_webhook_installation_deleted(client, test_db):
     assert preserved.status == "active"
 
 
+def test_list_installation_repos_returns_tenant_installation_repos(client, test_db, sample_tenant):
+    """Installation repo endpoint should use the tenant installation token."""
+    from unittest.mock import patch
+
+    sample_tenant.installation_id = 12345
+    project = Project(
+        tenant_id=sample_tenant.id,
+        name="existing",
+        git_url="https://github.com/acme-corp/existing.git",
+        github_repo_id=111,
+        status="active",
+        created_at=datetime.now(timezone.utc),
+        last_accessed=datetime.now(timezone.utc),
+    )
+    test_db.add(project)
+    test_db.commit()
+
+    fake_client = FakeAsyncClient(responses=[
+        FakeGitHubResponse({
+            "total_count": 2,
+            "repositories": [
+                {
+                    "id": 111,
+                    "name": "existing",
+                    "full_name": "acme-corp/existing",
+                    "private": True,
+                    "default_branch": "main",
+                    "html_url": "https://github.com/acme-corp/existing",
+                    "updated_at": "2026-03-17T00:00:00Z",
+                },
+                {
+                    "id": 222,
+                    "name": "new-repo",
+                    "full_name": "acme-corp/new-repo",
+                    "private": True,
+                    "default_branch": "main",
+                    "html_url": "https://github.com/acme-corp/new-repo",
+                    "updated_at": "2026-03-17T00:00:00Z",
+                },
+            ],
+        })
+    ])
+
+    with patch("integrations.github_auth.get_installation_token", return_value="inst_token"):
+        with patch("server.api.httpx.AsyncClient", return_value=fake_client):
+            response = client.get("/github/installation-repos", headers=auth_headers(sample_tenant))
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total_count"] == 2
+    assert len(data["repos"]) == 2
+    assert data["repos"][0]["already_added"] is True
+    assert data["repos"][1]["already_added"] is False
+
+
 def test_create_repository_sends_notification(client, test_db, sample_tenant):
     """Test that POST /repositories sends notify_repo_added with correct kwargs."""
     from unittest.mock import AsyncMock, patch
@@ -1432,6 +1555,39 @@ def test_create_repository_sends_notification(client, test_db, sample_tenant):
     assert call_kwargs["github_account"] == "testacct"
     assert call_kwargs["tenant_id"] == sample_tenant.id
     assert call_kwargs["full_name"] == "testacct/my-contract"
+
+
+def test_create_repository_uses_tenant_installation_id_for_project_and_autoscan(client, test_db, sample_tenant):
+    """Repository creation should persist tenant installation_id and pass it to the worker."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    sample_tenant.installation_id = 77777
+    test_db.commit()
+
+    with patch("server.api.notify_repo_added", new_callable=AsyncMock):
+        with patch.dict("sys.modules", {"worker.tasks": MagicMock()}):
+            import sys
+            mock_module = sys.modules["worker.tasks"]
+            mock_module.execute_scan_task = MagicMock()
+
+            response = client.post(
+                "/repositories",
+                json={
+                    "name": "org-repo",
+                    "full_name": "acme-corp/org-repo",
+                    "git_url": "https://github.com/acme-corp/org-repo.git",
+                    "default_branch": "main",
+                    "is_private": True,
+                },
+                headers=auth_headers(sample_tenant),
+            )
+
+    assert response.status_code == 201
+    project = test_db.query(Project).filter(Project.name == "org-repo").first()
+    assert project is not None
+    assert project.installation_id == 77777
+    call_kwargs = mock_module.execute_scan_task.delay.call_args.kwargs
+    assert call_kwargs["installation_id"] == 77777
 
 
 def test_github_webhook_installation_signed(client, test_db):

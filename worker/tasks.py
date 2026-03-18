@@ -801,12 +801,23 @@ def execute_scan_task(
         from utils.config_loader import load_config
         
         config = load_config()
+        scan_github_token = None
+        if installation_id:
+            try:
+                from integrations.github_auth import get_installation_token
+                scan_github_token = get_installation_token(installation_id)
+            except Exception as e:
+                publisher.publish_thought(
+                    f"Warning: could not get installation token: {e}",
+                    iteration=1,
+                )
         
         scanner = SurfaceScanner(
             config=config,
             llm_budget=llm_budget,
             model=model or "gpt-4o-mini",
             quiet=True,
+            github_token=scan_github_token,
         )
         
         # Run scan

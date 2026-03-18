@@ -11,7 +11,7 @@ import os
 import secrets
 import time
 from collections.abc import Generator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import stripe
@@ -22,13 +22,54 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database.models import OAuthAuditLog, Tenant, User
+from database.models import OAuthAuditLog, Project, ScanExecution, Tenant, User
 from server.auth_utils import create_access_token, get_current_user_from_token, reject_preview_writes
 from server.token_crypto import encrypt_token
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
+
+
+def _tenant_has_meaningful_data(db: Session, tenant: Tenant | None) -> bool:
+    """Return True if a tenant has data that makes silent relinking risky."""
+    if tenant is None:
+        return False
+
+    return (
+        db.query(Project).filter(Project.tenant_id == tenant.id).count() > 0
+        or db.query(ScanExecution).filter(ScanExecution.tenant_id == tenant.id).count() > 0
+        or tenant.stripe_subscription_id is not None
+        or (tenant.scan_credits or 0) > 0
+        or tenant.plan not in (None, "free")
+    )
+
+
+def _find_matching_org_tenant(
+    db: Session,
+    user_orgs: list[dict],
+) -> Tenant | None:
+    """Return the first org tenant matching one of the user's GitHub orgs."""
+    for org in user_orgs:
+        org_login = org.get("login")
+        if not org_login:
+            continue
+        org_tenant = db.query(Tenant).filter(
+            func.lower(Tenant.github_account_login) == org_login.lower(),
+            Tenant.github_account_type == "Organization",
+        ).first()
+        if org_tenant:
+            return org_tenant
+    return None
+
+
+def _activate_trial_if_pending(tenant: Tenant | None) -> None:
+    """Activate a pending tenant and start the starter trial once."""
+    if tenant and tenant.status == "pending":
+        tenant.status = "active"
+        if not tenant.trial_ends_at:
+            tenant.trial_ends_at = datetime.now(timezone.utc) + timedelta(days=14)
+            tenant.trial_plan = "starter"
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +248,7 @@ async def github_login():
         f"https://github.com/login/oauth/authorize"
         f"?client_id={config['client_id']}"
         f"&redirect_uri={config['frontend_url']}/auth/callback"
-        f"&scope=repo read:user user:email"
+        f"&scope=repo read:org read:user user:email"
         f"&state={state}"
     )
     return {"url": github_auth_url}
@@ -234,6 +275,7 @@ async def github_callback(
             raise HTTPException(400, str(e))
 
     # 1. Exchange code for GitHub access token
+    user_orgs: list[dict] = []
     async with httpx.AsyncClient() as client:
         token_response = await client.post(
             "https://github.com/login/oauth/access_token",
@@ -275,6 +317,28 @@ async def github_callback(
                         github_user["email"] = entry["email"]
                         break
 
+        # 2c. Fetch org memberships for tenant matching. Existing tokens may
+        # lack read:org; in that case we fail open and keep current behavior.
+        orgs_page = 1
+        while True:
+            orgs_response = await client.get(
+                "https://api.github.com/user/orgs",
+                params={"per_page": 100, "page": orgs_page},
+                headers={
+                    "Authorization": f"Bearer {github_token}",
+                    "Accept": "application/json",
+                },
+            )
+            if orgs_response.status_code != 200:
+                break
+            page_orgs = orgs_response.json()
+            if not page_orgs:
+                break
+            user_orgs.extend(page_orgs)
+            if len(page_orgs) < 100:
+                break
+            orgs_page += 1
+
     # 3. Create or update user in database
     user = db.query(User).filter(User.github_id == github_user["id"]).first()
     is_new_user = False
@@ -288,10 +352,16 @@ async def github_callback(
         user.github_token_encrypted = encrypt_token(github_token)
         user.github_access_token = github_token
         user.github_connected_at = datetime.now(timezone.utc)
-        # Ensure tenant is active on login
-        tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
-        if tenant and tenant.status == "pending":
-            tenant.status = "active"
+        current_tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+        target_tenant = current_tenant
+
+        if current_tenant and current_tenant.github_account_type != "Organization":
+            org_tenant = _find_matching_org_tenant(db, user_orgs)
+            if org_tenant and not _tenant_has_meaningful_data(db, current_tenant):
+                target_tenant = org_tenant
+                user.tenant_id = org_tenant.id
+
+        _activate_trial_if_pending(target_tenant)
         _log_oauth_event(db, user.id, "login", "github", str(github_user["id"]), request)
         db.commit()
         db.refresh(user)
@@ -312,17 +382,24 @@ async def github_callback(
 
         # New user — find or create tenant
         normalized_login = github_user["login"].lower()
-        tenant = db.query(Tenant).filter(
+        personal_tenant = db.query(Tenant).filter(
             func.lower(Tenant.github_account_login) == normalized_login
         ).first()
-        if not tenant:
-            tenant = db.query(Tenant).filter(
+        if not personal_tenant:
+            personal_tenant = db.query(Tenant).filter(
                 func.lower(Tenant.name) == f"github_{normalized_login}"
             ).first()
+        org_tenant = _find_matching_org_tenant(db, user_orgs)
+
+        if org_tenant and personal_tenant:
+            tenant = personal_tenant if _tenant_has_meaningful_data(db, personal_tenant) else org_tenant
+        elif org_tenant:
+            tenant = org_tenant
+        else:
+            tenant = personal_tenant
 
         if tenant:
-            if tenant.status == "pending":
-                tenant.status = "active"
+            _activate_trial_if_pending(tenant)
         else:
             is_new_user = True
             try:
@@ -331,6 +408,8 @@ async def github_callback(
                     github_account_login=github_user["login"],
                     github_account_type="User",
                     status="active",
+                    trial_ends_at=datetime.now(timezone.utc) + timedelta(days=14),
+                    trial_plan="starter",
                 )
                 db.add(tenant)
                 db.flush()

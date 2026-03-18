@@ -3,6 +3,7 @@ Tests for GitHub OAuth authentication and JWT token management.
 """
 
 import os
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -10,13 +11,48 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from database.models import Base, OAuthAuditLog, Tenant, User
+from database.models import Base, OAuthAuditLog, Project, ScanExecution, Tenant, User
 from server.auth_utils import create_access_token, decode_access_token, get_current_user_from_token
 
 # Set test database URL before importing app
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
 from server.api import app, get_db
+
+
+class FakeGitHubResponse:
+    """Small helper for mocking GitHub HTTP responses."""
+
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+
+class FakeAsyncClient:
+    """Deterministic async client for OAuth callback tests."""
+
+    def __init__(self, post_responses=None, get_responses=None):
+        self._post_responses = list(post_responses or [])
+        self._get_responses = list(get_responses or [])
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, *args, **kwargs):
+        if not self._post_responses:
+            raise AssertionError("Unexpected POST request")
+        return self._post_responses.pop(0)
+
+    async def get(self, *args, **kwargs):
+        if not self._get_responses:
+            raise AssertionError("Unexpected GET request")
+        return self._get_responses.pop(0)
 
 
 # Test database setup
@@ -163,7 +199,8 @@ class TestAuthRoutes:
         """Test getting GitHub OAuth login URL."""
         # Mock environment variable
         with patch.dict(os.environ, {"GITHUB_CLIENT_ID": "test_client_id"}):
-            response = client.get("/auth/github/login")
+            with patch("server.auth_routes.create_oauth_state", new=AsyncMock(return_value="state123")):
+                response = client.get("/auth/github/login")
             
             if response.status_code != 200:
                 print(f"Response: {response.status_code} - {response.json()}")
@@ -173,6 +210,7 @@ class TestAuthRoutes:
             assert "url" in data
             assert "github.com/login/oauth/authorize" in data["url"]
             assert "test_client_id" in data["url"]
+            assert "read%3Aorg" in data["url"] or "read:org" in data["url"]
 
     def test_github_login_url_missing_config(self, client):
         """Test GitHub login without configuration."""
@@ -181,6 +219,208 @@ class TestAuthRoutes:
             
             assert response.status_code == 500
             assert "not configured" in response.json()["detail"]
+
+    def test_github_callback_existing_user_relinks_empty_personal_tenant_to_org(self, client, test_db, sample_user, sample_tenant):
+        """Existing users on empty personal shells should be re-linked to org tenants."""
+        from server import auth_routes
+
+        sample_tenant.github_account_login = "testuser"
+        sample_tenant.github_account_type = "User"
+        sample_tenant.status = "active"
+
+        org_tenant = Tenant(
+            name="github_acme-corp",
+            github_account_login="acme-corp",
+            github_account_type="Organization",
+            status="pending",
+        )
+        test_db.add(org_tenant)
+        test_db.commit()
+
+        fake_client = FakeAsyncClient(
+            post_responses=[FakeGitHubResponse({"access_token": "github_token_123"})],
+            get_responses=[
+                FakeGitHubResponse({
+                    "id": sample_user.github_id,
+                    "login": sample_user.github_login,
+                    "email": "updated@example.com",
+                    "name": "Updated Name",
+                    "avatar_url": sample_user.avatar_url,
+                }),
+                FakeGitHubResponse([{"login": "acme-corp"}]),
+            ],
+        )
+
+        with patch.object(auth_routes.httpx, "AsyncClient", return_value=fake_client):
+            with patch.dict(os.environ, {
+                "GITHUB_CLIENT_ID": "test_id",
+                "GITHUB_CLIENT_SECRET": "test_secret",
+            }):
+                response = client.post("/auth/github/callback", json={"code": "github_code_123"})
+
+        assert response.status_code == 200
+        test_db.refresh(sample_user)
+        test_db.refresh(org_tenant)
+        assert sample_user.tenant_id == org_tenant.id
+        assert org_tenant.status == "active"
+        assert org_tenant.trial_plan == "starter"
+        assert org_tenant.trial_ends_at is not None
+
+    def test_github_callback_existing_user_keeps_nonempty_personal_tenant(self, client, test_db, sample_user, sample_tenant):
+        """Existing users with data on a personal tenant should not be re-linked."""
+        from server import auth_routes
+
+        sample_tenant.github_account_login = "testuser"
+        sample_tenant.github_account_type = "User"
+        sample_tenant.status = "active"
+        test_db.add(Project(
+            tenant_id=sample_tenant.id,
+            name="existing-project",
+            git_url="https://github.com/testuser/existing-project.git",
+            status="active",
+            created_at=datetime.now(timezone.utc),
+            last_accessed=datetime.now(timezone.utc),
+        ))
+        org_tenant = Tenant(
+            name="github_acme-corp",
+            github_account_login="acme-corp",
+            github_account_type="Organization",
+            status="pending",
+        )
+        test_db.add(org_tenant)
+        test_db.commit()
+
+        fake_client = FakeAsyncClient(
+            post_responses=[FakeGitHubResponse({"access_token": "github_token_123"})],
+            get_responses=[
+                FakeGitHubResponse({
+                    "id": sample_user.github_id,
+                    "login": sample_user.github_login,
+                    "email": "updated@example.com",
+                    "name": "Updated Name",
+                    "avatar_url": sample_user.avatar_url,
+                }),
+                FakeGitHubResponse([{"login": "acme-corp"}]),
+            ],
+        )
+
+        with patch.object(auth_routes.httpx, "AsyncClient", return_value=fake_client):
+            with patch.dict(os.environ, {
+                "GITHUB_CLIENT_ID": "test_id",
+                "GITHUB_CLIENT_SECRET": "test_secret",
+            }):
+                response = client.post("/auth/github/callback", json={"code": "github_code_123"})
+
+        assert response.status_code == 200
+        test_db.refresh(sample_user)
+        test_db.refresh(org_tenant)
+        assert sample_user.tenant_id == sample_tenant.id
+        assert org_tenant.status == "pending"
+        assert org_tenant.trial_ends_at is None
+
+    def test_github_callback_new_user_prefers_org_over_empty_personal_shell(self, client, test_db):
+        """New users should prefer a matching org tenant over an empty personal shell."""
+        from server import auth_routes
+
+        personal_tenant = Tenant(
+            name="github_newuser",
+            github_account_login="newuser",
+            github_account_type="User",
+            status="active",
+        )
+        org_tenant = Tenant(
+            name="github_acme-corp",
+            github_account_login="acme-corp",
+            github_account_type="Organization",
+            status="pending",
+        )
+        test_db.add_all([personal_tenant, org_tenant])
+        test_db.commit()
+
+        fake_client = FakeAsyncClient(
+            post_responses=[FakeGitHubResponse({"access_token": "github_token_123"})],
+            get_responses=[
+                FakeGitHubResponse({
+                    "id": 98765432,
+                    "login": "newuser",
+                    "email": "newuser@example.com",
+                    "name": "New User",
+                    "avatar_url": "https://avatars.githubusercontent.com/u/98765432",
+                }),
+                FakeGitHubResponse([{"login": "acme-corp"}]),
+            ],
+        )
+
+        with patch.object(auth_routes.httpx, "AsyncClient", return_value=fake_client):
+            with patch.dict(os.environ, {
+                "GITHUB_CLIENT_ID": "test_id",
+                "GITHUB_CLIENT_SECRET": "test_secret",
+            }):
+                response = client.post("/auth/github/callback", json={"code": "github_code_123"})
+
+        assert response.status_code == 200
+        user = test_db.query(User).filter(User.github_id == 98765432).first()
+        test_db.refresh(org_tenant)
+        assert user is not None
+        assert user.tenant_id == org_tenant.id
+        assert org_tenant.status == "active"
+        assert org_tenant.trial_plan == "starter"
+
+    def test_github_callback_new_user_keeps_nonempty_personal_tenant(self, client, test_db):
+        """New users should stay on an existing non-empty personal tenant."""
+        from server import auth_routes
+
+        personal_tenant = Tenant(
+            name="github_newuser",
+            github_account_login="newuser",
+            github_account_type="User",
+            status="active",
+        )
+        test_db.add(personal_tenant)
+        test_db.commit()
+        test_db.add(ScanExecution(
+            execution_id="scan_personal_1",
+            tenant_id=personal_tenant.id,
+            repo_name="newuser/repo",
+            status="completed",
+            created_at=datetime.now(timezone.utc),
+        ))
+        org_tenant = Tenant(
+            name="github_acme-corp",
+            github_account_login="acme-corp",
+            github_account_type="Organization",
+            status="pending",
+        )
+        test_db.add(org_tenant)
+        test_db.commit()
+
+        fake_client = FakeAsyncClient(
+            post_responses=[FakeGitHubResponse({"access_token": "github_token_123"})],
+            get_responses=[
+                FakeGitHubResponse({
+                    "id": 98765433,
+                    "login": "newuser",
+                    "email": "newuser@example.com",
+                    "name": "New User",
+                    "avatar_url": "https://avatars.githubusercontent.com/u/98765433",
+                }),
+                FakeGitHubResponse([{"login": "acme-corp"}]),
+            ],
+        )
+
+        with patch.object(auth_routes.httpx, "AsyncClient", return_value=fake_client):
+            with patch.dict(os.environ, {
+                "GITHUB_CLIENT_ID": "test_id",
+                "GITHUB_CLIENT_SECRET": "test_secret",
+            }):
+                response = client.post("/auth/github/callback", json={"code": "github_code_123"})
+
+        assert response.status_code == 200
+        user = test_db.query(User).filter(User.github_id == 98765433).first()
+        test_db.refresh(org_tenant)
+        assert user is not None
+        assert user.tenant_id == personal_tenant.id
+        assert org_tenant.status == "pending"
 
     @pytest.mark.skip(reason="Requires complex httpx.AsyncClient mocking")
     @patch("httpx.AsyncClient")

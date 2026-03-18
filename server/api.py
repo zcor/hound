@@ -4891,6 +4891,9 @@ class SubscriptionResponse(BaseModel):
     can_view_details: bool = False
     scan_credits: int = 0
     stripe_customer_id: str | None = None
+    trial_ends_at: datetime | None = None
+    trial_plan: str | None = None
+    is_trial: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -4939,6 +4942,7 @@ class RepositoryListResponse(BaseModel):
 class RepositoryCreateRequest(BaseModel):
     """Request model for adding a new repository."""
     github_repo_id: int | None = None
+    installation_id: int | None = None
     name: str
     full_name: str
     git_url: str
@@ -5119,7 +5123,11 @@ async def get_current_subscription(
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     subscription_status = "active" if tenant.status == "active" else "pending"
-    plan = tenant.plan or "free"
+    from server.tier_enforcement import get_effective_plan, has_paid_subscription, is_trial_active
+
+    plan = get_effective_plan(tenant)
+    has_stripe_paid_plan = bool(tenant.stripe_subscription_id) and tenant.plan not in (None, "free")
+    is_trial = is_trial_active(tenant) and not has_stripe_paid_plan
 
     # Load plan limits
     import json
@@ -5157,10 +5165,7 @@ async def get_current_subscription(
     scans_limit = plan_limits.get("scans_per_month", 0)
     can_scan = scans_used < scans_limit or (tenant.scan_credits or 0) > 0
 
-    # Paid subscribers can see full finding details
-    from server.tier_enforcement import has_paid_subscription
     can_view_details = has_paid_subscription(tenant)
-
     return SubscriptionResponse(
         tenant_id=tenant.id,
         org_name=tenant.name,
@@ -5173,6 +5178,9 @@ async def get_current_subscription(
         can_view_details=can_view_details,
         scan_credits=tenant.scan_credits or 0,
         stripe_customer_id=tenant.stripe_customer_id,
+        trial_ends_at=tenant.trial_ends_at,
+        trial_plan=tenant.trial_plan,
+        is_trial=is_trial,
     )
 
 
@@ -5589,6 +5597,103 @@ async def list_github_repos(
     )
 
 
+@app.get("/github/installation-repos", response_model=GitHubRepoListResponse, tags=["github"])
+async def list_installation_repos(
+    tenant_id: int = Depends(get_current_tenant_id),
+    page: int = Query(1, ge=1, description="Page number"),
+    per_page: int = Query(30, ge=1, le=100, description="Results per page"),
+    search: str | None = Query(None, description="Filter repos by name"),
+    db: Session = Depends(get_db),
+):
+    """List repositories available to the tenant's GitHub App installation."""
+    from integrations.github_auth import get_installation_token
+
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant or not tenant.installation_id:
+        raise HTTPException(404, "No GitHub App installation for this tenant")
+
+    try:
+        installation_token = get_installation_token(tenant.installation_id)
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to get installation token: {exc}") from exc
+
+    headers = {
+        "Authorization": f"Bearer {installation_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    added_ids = {
+        repo_id
+        for (repo_id,) in db.query(Project.github_repo_id).filter(
+            Project.tenant_id == tenant_id,
+            Project.github_repo_id.isnot(None),
+            Project.status != "removed",
+        ).all()
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        if search:
+            fetch_page = 1
+            all_repos: list[dict] = []
+            search_lower = search.lower()
+            while True:
+                resp = await client.get(
+                    "https://api.github.com/installation/repositories",
+                    params={"per_page": 100, "page": fetch_page},
+                    headers=headers,
+                )
+                if resp.status_code != 200:
+                    raise HTTPException(502, "Failed to list installation repos")
+                data = resp.json()
+                batch = data.get("repositories", [])
+                if not batch:
+                    break
+                all_repos.extend(
+                    repo for repo in batch if search_lower in repo.get("name", "").lower()
+                )
+                if len(batch) < 100:
+                    break
+                fetch_page += 1
+            total_count = len(all_repos)
+            start = (page - 1) * per_page
+            repos_page = all_repos[start : start + per_page]
+        else:
+            resp = await client.get(
+                "https://api.github.com/installation/repositories",
+                params={"per_page": per_page, "page": page},
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                raise HTTPException(502, "Failed to list installation repos")
+            data = resp.json()
+            repos_page = data.get("repositories", [])
+            total_count = data.get("total_count", len(repos_page))
+
+    items = [
+        GitHubRepoItem(
+            id=repo["id"],
+            name=repo.get("name", ""),
+            full_name=repo.get("full_name", ""),
+            description=repo.get("description"),
+            private=repo.get("private", False),
+            default_branch=repo.get("default_branch", "main"),
+            html_url=repo.get("html_url", ""),
+            language=repo.get("language"),
+            updated_at=repo.get("updated_at"),
+            already_added=repo["id"] in added_ids,
+        )
+        for repo in repos_page
+    ]
+
+    return GitHubRepoListResponse(
+        repos=items,
+        total_count=total_count,
+        page=page,
+        per_page=per_page,
+    )
+
+
 @app.post("/repositories", status_code=201, response_model=RepositoryResponse, tags=["repositories"])
 async def create_repository(
     body: RepositoryCreateRequest,
@@ -5628,6 +5733,7 @@ async def create_repository(
     if existing_url:
         raise HTTPException(status_code=409, detail="Repository already added")
 
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
     now = datetime.now(timezone.utc)
     project = Project(
         tenant_id=tenant_id,
@@ -5635,6 +5741,7 @@ async def create_repository(
         full_name=body.full_name,
         git_url=body.git_url,
         github_repo_id=body.github_repo_id,
+        installation_id=body.installation_id or (tenant.installation_id if tenant else None),
         default_branch=body.default_branch,
         description=body.description,
         is_private=body.is_private,
@@ -5648,7 +5755,6 @@ async def create_repository(
 
     # Send Telegram notification for new repo (fire-and-forget)
     try:
-        tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
         await notify_repo_added(
             repo_name=project.name,
             repo_url=project.git_url or "",
@@ -5691,6 +5797,7 @@ async def create_repository(
                 repo_url=project.git_url,
                 scan_id=initial_execution_id,
                 tenant_id=tenant_id,
+                installation_id=project.installation_id,
             )
             logger.info(f"Auto-triggered initial scan {initial_execution_id} for new repo {project.name}")
         except Exception as e:
@@ -6103,6 +6210,7 @@ async def trigger_repository_scan(
             repo_url=project.git_url,
             scan_id=execution_id,
             tenant_id=project.tenant_id,
+            installation_id=project.installation_id,
         )
     except Exception as e:
         # Mark scan as failed — don't leave it stuck "pending"

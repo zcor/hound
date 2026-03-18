@@ -26,6 +26,8 @@ def run_migration():
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS github_account_type VARCHAR(50)",
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS created_at TIMESTAMP NOT NULL DEFAULT NOW()",
         "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW()",
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMP",
+        "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS trial_plan VARCHAR(50)",
         
         # Projects table migrations
         "ALTER TABLE projects ADD COLUMN IF NOT EXISTS status VARCHAR(50) NOT NULL DEFAULT 'active'",

@@ -55,6 +55,6 @@
   },
   "free": {
     "name": "Free",
-    "limits": { "repos": 999, "audits_per_month": 0, "scans_per_month": 1 }
+    "limits": { "repos": 999, "audits_per_month": 0, "scans_per_month": 3 }
   }
 }

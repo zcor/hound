@@ -85,6 +85,7 @@ class SurfaceScanner:
         llm_budget: int = 5,
         model: str | None = None,
         quiet: bool = False,
+        github_token: str | None = None,
     ):
         """Initialize the surface scanner.
 
@@ -93,6 +94,7 @@ class SurfaceScanner:
             llm_budget: Maximum LLM calls per scan (default: 5)
             model: Override model for LLM calls
             quiet: Suppress progress output
+            github_token: Optional GitHub token for tarball downloads
         """
         self.config = config or {}
         self.llm_budget = llm_budget
@@ -103,8 +105,8 @@ class SurfaceScanner:
         self._log_lines: list[str] = []
         self._start_time: float = 0.0
 
-        # GitHub API settings
-        self.github_token = os.environ.get("GITHUB_TOKEN")
+        # Prefer an explicit installation token, otherwise fall back to env.
+        self.github_token = github_token or os.environ.get("GITHUB_TOKEN")
 
     def _log(self, msg: str) -> None:
         """Append a timestamped log line."""

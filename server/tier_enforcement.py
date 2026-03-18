@@ -27,11 +27,34 @@ from database.models import ScanExecution, Tenant
 logger = logging.getLogger(__name__)
 
 
+def _as_utc(dt: datetime) -> datetime:
+    """Normalize naive DB timestamps to UTC for safe comparisons."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def is_trial_active(tenant: Tenant) -> bool:
+    """Return True when a tenant has an unexpired active trial."""
+    if tenant.trial_ends_at and tenant.trial_plan:
+        return datetime.now(timezone.utc) < _as_utc(tenant.trial_ends_at)
+    return False
+
+
+def get_effective_plan(tenant: Tenant) -> str:
+    """Return the effective plan. Precedence: paid > active trial > free."""
+    if tenant.stripe_subscription_id and tenant.plan not in (None, "free"):
+        return tenant.plan
+    if is_trial_active(tenant):
+        return tenant.trial_plan or "free"
+    return tenant.plan or "free"
+
+
 def has_paid_subscription(tenant: Tenant) -> bool:
-    """Canonical check: does this tenant have an active paid SaaS subscription?"""
-    return bool(tenant.stripe_subscription_id) and tenant.plan not in (None, "free")
-
-
+    """Canonical check: does this tenant have an active paid subscription or trial?"""
+    if tenant.stripe_subscription_id and tenant.plan not in (None, "free"):
+        return True
+    return is_trial_active(tenant)
 def _load_plans() -> dict:
     """Load plan config from stripe_plans.json."""
     config_path = Path(__file__).parent.parent / "config" / "stripe_plans.json"
@@ -96,7 +119,8 @@ def _check_sync(tenant_id: int, operation: str, db: Session) -> dict:
         raise HTTPException(404, "Tenant not found")
 
     plans = _load_plans()
-    plan_config = plans.get(tenant.plan, plans["free"])
+    effective_plan = get_effective_plan(tenant)
+    plan_config = plans.get(effective_plan, plans["free"])
     limits = plan_config.get("limits", {})
 
     if operation == "scan":

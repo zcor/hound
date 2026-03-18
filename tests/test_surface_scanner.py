@@ -20,3 +20,13 @@ def test_fetch_github_repo_type_hints():
     from analysis.surface.scanner import SurfaceScanner
     hints = typing.get_type_hints(SurfaceScanner._fetch_github_repo)
     assert "return" in hints
+
+
+def test_surface_scanner_prefers_explicit_github_token(monkeypatch):
+    """Explicit constructor token should override the process-wide fallback."""
+    from analysis.surface.scanner import SurfaceScanner
+
+    monkeypatch.setenv("GITHUB_TOKEN", "env-token")
+    scanner = SurfaceScanner(github_token="explicit-token")
+
+    assert scanner.github_token == "explicit-token"

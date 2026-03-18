@@ -95,6 +95,8 @@ class Tenant(Base):
     plan_period = Column(String(20), nullable=True)  # monthly, annual
     plan_updated_at = Column(DateTime, nullable=True)
     scan_credits = Column(Integer, nullable=False, default=0)  # Credit tranche top-ups
+    trial_ends_at = Column(DateTime, nullable=True)
+    trial_plan = Column(String(50), nullable=True)
 
     # Relationships
     projects = relationship("Project", back_populates="tenant", cascade="all, delete-orphan")

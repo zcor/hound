@@ -5967,6 +5967,14 @@ async def create_repository(
     # Auto-trigger initial surface scan (fire-and-forget)
     if project.git_url:
         try:
+            github_user_id = None
+            if not project.installation_id:
+                try:
+                    current_user = await _get_current_user_with_token(request, db)
+                    github_user_id = current_user.id
+                except HTTPException:
+                    github_user_id = None
+
             # Tier enforcement: check plan limits before auto-scanning
             from server.tier_enforcement import _check_sync
             auto_scan_uses_credit = False
@@ -5997,6 +6005,7 @@ async def create_repository(
                 scan_id=initial_execution_id,
                 tenant_id=tenant_id,
                 installation_id=project.installation_id,
+                github_user_id=github_user_id,
             )
             logger.info(f"Auto-triggered initial scan {initial_execution_id} for new repo {project.name}")
         except Exception as e:
@@ -6375,7 +6384,7 @@ async def trigger_repository_scan(
     tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
     _: None = Depends(reject_preview_writes),
-    __: User = Depends(require_github_linked),
+    current_user: User = Depends(require_github_linked),
     ___: None = Depends(require_verified_email),
 ):
     """
@@ -6424,6 +6433,7 @@ async def trigger_repository_scan(
             scan_id=execution_id,
             tenant_id=project.tenant_id,
             installation_id=project.installation_id,
+            github_user_id=current_user.id,
         )
     except Exception as e:
         # Mark scan as failed — don't leave it stuck "pending"

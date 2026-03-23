@@ -25,6 +25,7 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 
 from server.api import app, get_db
 from server.auth_utils import create_access_token
+from server.token_crypto import encrypt_token
 
 
 class FakeGitHubResponse:
@@ -1073,6 +1074,35 @@ def test_trigger_scan_dispatches_celery_task(client, sample_project, github_user
     assert call_kwargs.kwargs["repo_url"] == sample_project.git_url
     assert call_kwargs.kwargs["tenant_id"] == sample_project.tenant_id
     assert call_kwargs.kwargs["installation_id"] == 88888
+    assert call_kwargs.kwargs["github_user_id"] == github_user.id
+
+
+def test_trigger_scan_dispatches_github_user_id_for_oauth_repo(client, sample_project, github_user):
+    """OAuth-triggered scans should pass the acting user id to the worker."""
+    from unittest.mock import MagicMock, patch
+
+    mock_task = MagicMock()
+
+    def fake_require(action):
+        async def _check(request):
+            return {"uses_credit": False}
+        return _check
+
+    with patch("server.tier_enforcement.require_plan_allowance", fake_require):
+        with patch.dict("sys.modules", {"worker.tasks": MagicMock()}):
+            import sys
+            mock_module = sys.modules["worker.tasks"]
+            mock_module.execute_scan_task = mock_task
+
+            response = client.post(
+                f"/repositories/{sample_project.id}/scan",
+                headers=github_auth_headers(github_user),
+            )
+
+    assert response.status_code == 200
+    call_kwargs = mock_task.delay.call_args.kwargs
+    assert call_kwargs["installation_id"] is None
+    assert call_kwargs["github_user_id"] == github_user.id
 
 
 def test_trigger_scan_dispatch_failure_returns_500(client, sample_project, github_user, test_db):
@@ -1628,6 +1658,36 @@ def test_create_repository_uses_tenant_installation_id_for_project_and_autoscan(
     assert project.installation_id == 77777
     call_kwargs = mock_module.execute_scan_task.delay.call_args.kwargs
     assert call_kwargs["installation_id"] == 77777
+
+
+def test_create_repository_autoscan_uses_github_user_id_without_installation(
+    client, test_db, github_user
+):
+    """Autoscan should pass the acting GitHub user id when no installation exists."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    with patch("server.api.notify_repo_added", new_callable=AsyncMock):
+        with patch.dict("sys.modules", {"worker.tasks": MagicMock()}):
+            import sys
+            mock_module = sys.modules["worker.tasks"]
+            mock_module.execute_scan_task = MagicMock()
+
+            response = client.post(
+                "/repositories",
+                json={
+                    "name": "oauth-private-repo",
+                    "full_name": "testuser/oauth-private-repo",
+                    "git_url": "https://github.com/testuser/oauth-private-repo",
+                    "default_branch": "main",
+                    "is_private": True,
+                },
+                headers=github_auth_headers(github_user),
+            )
+
+    assert response.status_code == 201
+    call_kwargs = mock_module.execute_scan_task.delay.call_args.kwargs
+    assert call_kwargs["installation_id"] is None
+    assert call_kwargs["github_user_id"] == github_user.id
 
 
 def test_github_webhook_installation_signed(client, test_db):

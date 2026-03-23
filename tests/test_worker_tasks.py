@@ -215,6 +215,39 @@ class TestWorkerTasks(unittest.TestCase):
         # Verify task has correct name
         self.assertEqual(execute_audit_task.name, "worker.tasks.execute_audit_task")
 
+    @patch("server.token_crypto.decrypt_token", return_value="ghp_decrypted")
+    def test_resolve_scan_github_token_uses_user_token_fallback(self, mock_decrypt):
+        """OAuth-triggered scans should fall back to the user's stored GitHub token."""
+        from worker.tasks import resolve_scan_github_token
+
+        user = MagicMock(tenant_id=7, github_token_encrypted="encrypted-token")
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = user
+
+        token = resolve_scan_github_token(lambda: db, tenant_id=7, github_user_id=42)
+
+        self.assertEqual(token, "ghp_decrypted")
+        mock_decrypt.assert_called_once_with("encrypted-token")
+        db.close.assert_called_once()
+
+    @patch("integrations.github_auth.get_installation_token", return_value="ghs_installation")
+    def test_resolve_scan_github_token_prefers_installation_token(self, mock_installation_token):
+        """Installation auth should win over OAuth fallback when both are present."""
+        from worker.tasks import resolve_scan_github_token
+
+        db_factory = MagicMock()
+
+        token = resolve_scan_github_token(
+            db_factory,
+            tenant_id=7,
+            installation_id=99,
+            github_user_id=42,
+        )
+
+        self.assertEqual(token, "ghs_installation")
+        mock_installation_token.assert_called_once_with(99)
+        db_factory.assert_not_called()
+
 
 class TestAgentCoreRedisIntegration(unittest.TestCase):
     """Test Redis integration in AutonomousAgent."""

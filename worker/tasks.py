@@ -29,6 +29,42 @@ from llm.token_tracker import set_token_context, clear_token_context  # noqa: E4
 from integrations.telegram import notify_deep_audit_completed  # noqa: E402
 
 
+def resolve_scan_github_token(
+    db_session_factory,
+    tenant_id: int,
+    installation_id: int | None = None,
+    github_user_id: int | None = None,
+) -> str | None:
+    """Resolve the best GitHub token for a surface scan.
+
+    Prefer a GitHub App installation token for private org repos. If no
+    installation is available, fall back to the acting user's stored GitHub OAuth
+    token, but only within the same tenant.
+    """
+    if installation_id:
+        from integrations.github_auth import get_installation_token
+
+        return get_installation_token(installation_id)
+
+    if not github_user_id:
+        return None
+
+    from database.models import User
+    from server.token_crypto import decrypt_token
+
+    db = db_session_factory()
+    try:
+        user = db.query(User).filter(
+            User.id == github_user_id,
+            User.tenant_id == tenant_id,
+        ).first()
+        if not user or not user.github_token_encrypted:
+            return None
+        return decrypt_token(user.github_token_encrypted)
+    finally:
+        db.close()
+
+
 class AuditTask(Task):
     """
     Base class for audit tasks with shared setup and error handling.
@@ -975,6 +1011,7 @@ def execute_scan_task(
     pr_number: int | None = None,
     repo_full_name: str | None = None,
     installation_id: int | None = None,
+    github_user_id: int | None = None,
 ) -> dict:
     """
     Execute a lightweight surface scan.
@@ -1010,13 +1047,18 @@ def execute_scan_task(
         
         config = load_config()
         scan_github_token = None
-        if installation_id:
+        if installation_id or github_user_id:
             try:
-                from integrations.github_auth import get_installation_token
-                scan_github_token = get_installation_token(installation_id)
+                scan_github_token = resolve_scan_github_token(
+                    self.get_db_session,
+                    tenant_id=tenant_id,
+                    installation_id=installation_id,
+                    github_user_id=github_user_id,
+                )
             except Exception as e:
+                token_source = "installation token" if installation_id else "user GitHub token"
                 publisher.publish_thought(
-                    f"Warning: could not get installation token: {e}",
+                    f"Warning: could not get {token_source}: {e}",
                     iteration=1,
                 )
         

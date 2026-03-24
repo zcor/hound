@@ -1,0 +1,38 @@
+.git
+.gitignore
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Backend build does not need the embedded frontend tree
+frontend/
+
+# Non-runtime content
+tests/
+docs/
+examples/
+media/
+
+# Local tooling / editor state
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Local data / secrets / scratch space
+tmp/
+*.log
+.env
+.env.*
+backups/

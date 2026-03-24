@@ -5342,9 +5342,16 @@ async def get_current_subscription(
         Project.status == "active",
     ).count()
 
+    tenant_project_ids = db.query(Project.id).filter(Project.tenant_id == tenant_id).subquery()
+    audits_used = db.query(AuditSession).filter(
+        AuditSession.project_id.in_(tenant_project_ids),
+        AuditSession.start_time >= month_start,
+    ).count()
+
     usage = {
         "scans_used": scans_used,
         "repos_count": repos_count,
+        "audits_used": audits_used,
     }
 
     # Can scan: within plan limit OR has credits

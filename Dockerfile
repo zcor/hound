@@ -1,41 +1,50 @@
 # Hound SaaS Stack Dockerfile
-# Base image with Python 3.11
-FROM python:3.11-slim
+FROM python:3.11-slim AS builder
 
-# Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV PORT=8000
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
     git \
     libpq-dev \
-    gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
 WORKDIR /app
 
-# Copy requirements first for better layer caching
+# Install Python dependencies into a copyable prefix for the runtime image.
 COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
+# Copy application code after dependencies for better caching.
 COPY . .
 
-# Create non-root user for security
+
+FROM python:3.11-slim AS runner
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PORT=8000
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+COPY --from=builder /app /app
+
 RUN useradd --create-home --shell /bin/bash hound \
-    && chown -R hound:hound /app
+    && mkdir -p /home/hound/.hound \
+    && chown -R hound:hound /app /home/hound
+
 USER hound
 
-# Create .hound directory for local storage
-RUN mkdir -p /home/hound/.hound
-
-# Expose default port (Railway sets $PORT)
 EXPOSE ${PORT}
 
-# Default command for Railway (uses $PORT env var)
 CMD uvicorn server.api:app --host 0.0.0.0 --port ${PORT} --proxy-headers --forwarded-allow-ips='*'

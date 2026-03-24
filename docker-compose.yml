@@ -44,6 +44,7 @@ services:
 
   # FastAPI Server
   api:
+    image: ${HOUND_APP_IMAGE:-hound-app:local}
     build:
       context: .
       dockerfile: Dockerfile
@@ -100,9 +101,7 @@ services:
 
   # Celery Worker
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${HOUND_APP_IMAGE:-hound-app:local}
     container_name: hound-worker
     command: celery -A worker.tasks worker --loglevel=info -Q default,audits,scans
     environment:
@@ -149,6 +148,7 @@ services:
 
   # Next.js Frontend
   frontend:
+    image: ${HOUND_FRONTEND_IMAGE:-hound-frontend:local}
     build:
       context: ./frontend
       dockerfile: Dockerfile

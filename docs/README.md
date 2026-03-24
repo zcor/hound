@@ -3,7 +3,7 @@
 ## Quick Start
 - [Main README](../README.md) - Installation and basic usage
 - [Quick Start Guide](QUICK_START.md) - Get up and running in minutes
-- [Deployment Guide](DEPLOYMENT.md) - **Deploy docs to your website**
+- [Deployment Guide](DEPLOYMENT.md) - **Deploy Hound with Docker Compose + GHCR**
 
 ## Technical Documentation
 - [API Reference](API_REFERENCE.md) - Complete REST and WebSocket API documentation

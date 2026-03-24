@@ -2,7 +2,7 @@ name: Publish Docker Images
 
 on:
   push:
-    branches: [ main ]
+    branches: [ feature/surface-scan, main ]
   workflow_dispatch:
 
 permissions:
@@ -44,7 +44,8 @@ jobs:
         with:
           images: ${{ matrix.image }}
           tags: |
-            type=raw,value=main,enable={{is_default_branch}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
             type=sha,format=short
 
       - name: Build and push ${{ matrix.name }}

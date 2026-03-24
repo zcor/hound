@@ -8,7 +8,7 @@ Hound runs on the DigitalOcean droplet at `/opt/hound/` with Docker Compose:
 
 - `api` and `worker` share the same backend image
 - `frontend` uses its own image
-- GitHub Actions publishes images to GHCR on push to `main`
+- GitHub Actions publishes images to GHCR on push to the active production branch (`feature/surface-scan` today, `main` if the repo later flips)
 - Production rollout stays manual: pull the desired image tags on the droplet, then recreate the containers
 
 ## Images
@@ -32,12 +32,14 @@ Defaults in `docker-compose.yml` point at local image names for development:
 
 The `publish-images.yml` workflow runs on:
 
+- push to `feature/surface-scan`
 - push to `main`
 - `workflow_dispatch`
 
 For each run it publishes:
 
-- `:main` for the default branch
+- `:latest` for the default branch
+- `:<branch-name>` for the pushed branch
 - `:<short-sha>` for the exact commit
 
 Use the short SHA tags for explicit production rollouts and rollback safety.
@@ -62,11 +64,11 @@ cd /opt/hound
 sudo git pull
 ```
 
-Deploy the latest `main` images:
+Deploy the latest default-branch images:
 
 ```bash
-export HOUND_APP_IMAGE=ghcr.io/firepan-labs/hound-app:main
-export HOUND_FRONTEND_IMAGE=ghcr.io/firepan-labs/hound-frontend:main
+export HOUND_APP_IMAGE=ghcr.io/firepan-labs/hound-app:latest
+export HOUND_FRONTEND_IMAGE=ghcr.io/firepan-labs/hound-frontend:latest
 
 sudo -E docker compose pull api worker frontend
 sudo -E docker compose up -d --no-deps api worker frontend

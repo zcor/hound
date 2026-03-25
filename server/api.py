@@ -3047,6 +3047,11 @@ async def start_audit(
             logger.error(f"Failed to link payment to audit job: {e}")
             mark_job_failed(db, gate.payment_log_id)
 
+    # Resolve installation_id: prefer request, fall back to project
+    resolved_installation_id = request_body.installation_id
+    if not resolved_installation_id and project and getattr(project, "installation_id", None):
+        resolved_installation_id = project.installation_id
+
     # Dispatch to Celery worker queue (async - returns immediately!)
     task = execute_audit_task.delay(
         repo_url=request_body.repo_url,
@@ -3055,7 +3060,7 @@ async def start_audit(
         project_id=request_body.project_id,
         max_iterations=request_body.max_iterations,
         investigation_prompt=request_body.investigation_prompt,
-        installation_id=request_body.installation_id,
+        installation_id=resolved_installation_id,
         pr_number=request_body.pr_number,
         repo_full_name=request_body.repo_full_name,
         time_limit_minutes=request_body.time_limit_minutes,

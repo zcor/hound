@@ -8,6 +8,7 @@ These tasks are executed by the Celery worker fleet, separate from the web serve
 import json
 import os
 import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -224,11 +225,13 @@ def execute_audit_task(
             publisher.publish_thought(f"Cloning repository: {repo_url}", iteration=0)
             
             import subprocess
+            clone_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
             clone_result = subprocess.run(
                 ["git", "clone", "--depth", "1", clone_url, str(repo_path)],
                 capture_output=True,
                 text=True,
                 timeout=300,  # 5 minute timeout for clone
+                env=clone_env,
             )
             
             if clone_result.returncode != 0:
@@ -563,7 +566,6 @@ def execute_audit_task(
                     
             except Exception as e:
                 publisher.publish_thought(f"Strategist planning failed: {e}, falling back to default", iteration=total_iterations)
-                import traceback
                 traceback.print_exc()
                 # Fallback: create a default investigation
                 items = [{'goal': investigation_prompt, 'priority': 1}]
@@ -945,7 +947,6 @@ def _store_hypotheses_in_db(
             db.close()
     except Exception as e:
         print(f"Failed to store hypotheses: {e}")
-        import traceback
         traceback.print_exc()
 
 
@@ -1270,7 +1271,6 @@ def build_graphs_task(
         publisher.publish_error(error_msg, "build_graphs_error")
         
         # Log full traceback
-        import traceback
         tb = traceback.format_exc()
         print(f"Graph build task failed: {tb}")
         

@@ -3,7 +3,7 @@ Tests for GitHub OAuth authentication and JWT token management.
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -12,7 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from database.models import Base, OAuthAuditLog, Project, ScanExecution, Tenant, User
-from server.auth_utils import create_access_token, decode_access_token, get_current_user_from_token
+from server.auth_utils import ACCESS_TOKEN_EXPIRE_MINUTES, create_access_token, decode_access_token, get_current_user_from_token
 
 # Set test database URL before importing app
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
@@ -177,6 +177,29 @@ class TestJWTUtilities:
         """Test decoding an invalid token."""
         with pytest.raises(ValueError, match="Invalid token"):
             decode_access_token("invalid.token.here")
+
+    def test_default_token_expiry_is_30_days(self):
+        """Default user token should expire in 30 days."""
+        assert ACCESS_TOKEN_EXPIRE_MINUTES == 60 * 24 * 30
+
+        data = {"user_id": 1, "tenant_id": 1}
+        token = create_access_token(data)
+        payload = decode_access_token(token)
+
+        expected_exp = datetime.now(timezone.utc) + timedelta(days=30)
+        actual_exp = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
+        # Allow 5 seconds of drift for test execution time
+        assert abs((expected_exp - actual_exp).total_seconds()) < 5
+
+    def test_preview_token_expiry_remains_1_hour(self):
+        """Admin preview tokens use an explicit 1-hour expires_delta."""
+        data = {"user_id": 1, "tenant_id": 1, "admin_preview": True}
+        token = create_access_token(data, expires_delta=timedelta(hours=1))
+        payload = decode_access_token(token)
+
+        expected_exp = datetime.now(timezone.utc) + timedelta(hours=1)
+        actual_exp = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
+        assert abs((expected_exp - actual_exp).total_seconds()) < 5
 
     def test_get_current_user_from_token(self):
         """Test extracting user info from token (slim — no github_login)."""

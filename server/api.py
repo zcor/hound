@@ -2872,6 +2872,7 @@ class FindingResponse(BaseModel):
     location: str | None = None  # Code location from surface scan
     code_snippet: str | None = None  # Code snippet from surface scan
     source: str | None = None  # "surface" | "deep"
+    user_notes: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -4654,7 +4655,7 @@ async def get_project_hypotheses(
         query = query.filter(Hypothesis.status == status)
     
     hypotheses = query.order_by(Hypothesis.created_at.desc()).all()
-    
+
     response = []
     for hypothesis in hypotheses:
         response.append(
@@ -4672,11 +4673,12 @@ async def get_project_hypotheses(
                 reported_by_model=hypothesis.reported_by_model,
                 junior_model=hypothesis.junior_model,
                 senior_model=hypothesis.senior_model,
+                user_notes=hypothesis.user_notes,
                 created_at=hypothesis.created_at,
                 updated_at=hypothesis.updated_at,
             )
         )
-    
+
     return response
 
 
@@ -4732,6 +4734,7 @@ async def get_session_findings(
                 reported_by_model=hypothesis.reported_by_model,
                 junior_model=hypothesis.junior_model,
                 senior_model=hypothesis.senior_model,
+                user_notes=hypothesis.user_notes,
                 created_at=hypothesis.created_at,
                 updated_at=hypothesis.updated_at,
             )
@@ -4740,10 +4743,115 @@ async def get_session_findings(
     return response
 
 
+class FindingTriageUpdate(BaseModel):
+    """Request model for triaging a finding (status change and/or notes)."""
+
+    status: str | None = Field(None, description="New status (proposed, investigating, confirmed, rejected, resolved)")
+    user_notes: str | None = Field(None, description="User triage notes / reasoning")
+
+
 class FindingStatusUpdate(BaseModel):
     """Request model for updating finding status."""
 
     status: str = Field(..., description="New status (proposed, investigating, confirmed, rejected, resolved)")
+
+
+@app.patch("/findings/{finding_id}/triage")
+async def triage_finding(
+    finding_id: str,
+    triage: FindingTriageUpdate,
+    db: Session = Depends(get_db),
+    tenant_id: int = Depends(get_current_tenant_id),
+    _: None = Depends(reject_preview_writes),
+):
+    """
+    Triage a finding: update status and/or add user notes.
+
+    JWT-authenticated, tenant-scoped. Supports both hypothesis_id strings
+    and integer DB IDs.
+    """
+    if triage.status is None and triage.user_notes is None:
+        raise HTTPException(status_code=400, detail="Must provide status or user_notes")
+
+    valid_statuses = ["proposed", "investigating", "confirmed", "rejected", "resolved"]
+    if triage.status is not None and triage.status not in valid_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status. Must be one of: {', '.join(valid_statuses)}",
+        )
+
+    # Look up by hypothesis_id string first, then integer ID
+    finding = (
+        db.query(Hypothesis)
+        .join(Project, Hypothesis.project_id == Project.id)
+        .filter(Hypothesis.hypothesis_id == finding_id, Project.tenant_id == tenant_id)
+        .first()
+    )
+    if not finding:
+        try:
+            int_id = int(finding_id)
+            finding = (
+                db.query(Hypothesis)
+                .join(Project, Hypothesis.project_id == Project.id)
+                .filter(Hypothesis.id == int_id, Project.tenant_id == tenant_id)
+                .first()
+            )
+        except ValueError:
+            pass
+
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding not found")
+
+    if triage.status is not None:
+        finding.status = triage.status
+        if triage.status == "confirmed":
+            finding.confidence = 1.0
+        elif triage.status == "rejected":
+            finding.confidence = 0.0
+
+    if triage.user_notes is not None:
+        finding.user_notes = triage.user_notes
+
+    finding.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(finding)
+
+    # Determine source for response
+    _deep_scan = db.query(ScanExecution).filter(
+        ScanExecution.project_id == finding.project_id,
+        ScanExecution.findings.isnot(None),
+    ).all()
+    _is_deep = False
+    for _ds in _deep_scan:
+        _cfg = _ds.scan_config or {}
+        if isinstance(_cfg, dict) and _cfg.get("scan_type") == "deep":
+            for _f in (_ds.findings or []):
+                if isinstance(_f, dict) and _f.get("pattern_id") == finding.hypothesis_id:
+                    _is_deep = True
+                    break
+        if _is_deep:
+            break
+
+    return FindingResponse(
+        id=finding.id,
+        hypothesis_id=finding.hypothesis_id,
+        title=finding.title,
+        description=finding.description,
+        vulnerability_type=finding.vulnerability_type,
+        status=finding.status,
+        confidence=finding.confidence,
+        severity=finding.severity,
+        node_refs=finding.node_refs,
+        evidence=finding.evidence,
+        reported_by_model=finding.reported_by_model,
+        junior_model=finding.junior_model,
+        senior_model=finding.senior_model,
+        project_id=finding.project_id,
+        user_notes=finding.user_notes,
+        source="deep" if _is_deep else "surface",
+        created_at=finding.created_at,
+        updated_at=finding.updated_at,
+    )
 
 
 @app.post("/findings/{finding_id}/status")
@@ -6374,6 +6482,7 @@ async def list_all_findings(
             junior_model=h.junior_model,
             senior_model=h.senior_model,
             project_id=h.project_id,
+            user_notes=h.user_notes,
             source=h_source,
             created_at=h.created_at,
             updated_at=h.updated_at,

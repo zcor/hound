@@ -409,6 +409,7 @@ class Hypothesis(Base):
     reported_by_model = Column(String(255), nullable=True)
     junior_model = Column(String(255), nullable=True)
     senior_model = Column(String(255), nullable=True)
+    user_notes = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -763,6 +764,8 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE scan_executions ADD COLUMN IF NOT EXISTS scan_log TEXT"))
             # PR comments toggle
             conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS pr_comments_enabled BOOLEAN NOT NULL DEFAULT TRUE"))
+            # User triage notes on findings
+            conn.execute(text("ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS user_notes TEXT"))
 
 
 def init_database(engine):

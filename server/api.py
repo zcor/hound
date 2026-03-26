@@ -2871,6 +2871,7 @@ class FindingResponse(BaseModel):
     pattern_id: str | None = None  # Surface scan pattern identifier
     location: str | None = None  # Code location from surface scan
     code_snippet: str | None = None  # Code snippet from surface scan
+    source: str | None = None  # "surface" | "deep"
     created_at: datetime
     updated_at: datetime
 
@@ -6353,6 +6354,7 @@ async def list_all_findings(
             junior_model=h.junior_model,
             senior_model=h.senior_model,
             project_id=h.project_id,
+            source="deep",
             created_at=h.created_at,
             updated_at=h.updated_at,
         ))
@@ -6373,12 +6375,11 @@ async def list_all_findings(
         if repository_id and proj_id != repository_id:
             continue
 
-        # Get latest surface scan AND latest deep scan separately
+        # Deep findings come from Hypothesis table (above). Only surface from JSONB.
         scans_to_include = []
-        for stype in ("surface", "deep"):
-            scan = _latest_scan_by_type(db, proj_id, stype)
-            if scan and scan.findings:
-                scans_to_include.append(scan)
+        scan = _latest_scan_by_type(db, proj_id, "surface")
+        if scan and scan.findings:
+            scans_to_include.append(scan)
 
         for latest_scan in scans_to_include:
             scan_ts = latest_scan.completed_at or latest_scan.created_at
@@ -6407,6 +6408,7 @@ async def list_all_findings(
                     location=sf.get("location"),
                     code_snippet=sf.get("code_snippet"),
                     project_id=proj_id,
+                    source="surface",
                     created_at=scan_ts,
                     updated_at=scan_ts,
                 ))
@@ -6489,18 +6491,18 @@ async def get_findings_statistics(
     ).all()
 
     for proj_id, proj_name in tenant_projects:
-        for stype in ("surface", "deep"):
-            latest_scan = _latest_scan_by_type(db, proj_id, stype)
-            if not latest_scan or not latest_scan.findings:
-                continue
+        # Deep findings come from Hypothesis table (above). Only surface from JSONB.
+        latest_scan = _latest_scan_by_type(db, proj_id, "surface")
+        if not latest_scan or not latest_scan.findings:
+            continue
 
-            for finding in latest_scan.findings:
-                total += 1
-                sev = finding.get("severity", "low") if isinstance(finding, dict) else "low"
-                if sev in by_severity:
-                    by_severity[sev] += 1
-                by_status["scanner_detected"] += 1
-                by_repository[proj_name] = by_repository.get(proj_name, 0) + 1
+        for finding in latest_scan.findings:
+            total += 1
+            sev = finding.get("severity", "low") if isinstance(finding, dict) else "low"
+            if sev in by_severity:
+                by_severity[sev] += 1
+            by_status["scanner_detected"] += 1
+            by_repository[proj_name] = by_repository.get(proj_name, 0) + 1
 
     return FindingStatsResponse(
         total=total,

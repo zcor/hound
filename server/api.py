@@ -6335,10 +6335,30 @@ async def list_all_findings(
         query = query.filter(Hypothesis.project_id == repository_id)
 
     findings = query.order_by(Hypothesis.created_at.desc()).all()
-    
+
+    # Build a set of hypothesis IDs that appear in deep audit JSONB findings.
+    # If a Hypothesis.hypothesis_id matches a deep ScanExecution finding's
+    # pattern_id, it originated from a deep audit.  Otherwise it was stored
+    # by the surface scan normalization pipeline → tag as "surface".
+    _project_ids = {h.project_id for h in findings}
+    _deep_hyp_ids: set[str] = set()
+    if _project_ids:
+        _deep_scans = db.query(ScanExecution).filter(
+            ScanExecution.project_id.in_(_project_ids),
+            ScanExecution.findings.isnot(None),
+        ).all()
+        for _ds in _deep_scans:
+            _cfg = _ds.scan_config or {}
+            if isinstance(_cfg, dict) and _cfg.get("scan_type") == "deep":
+                for _f in (_ds.findings or []):
+                    _pid = _f.get("pattern_id", "") if isinstance(_f, dict) else ""
+                    if _pid:
+                        _deep_hyp_ids.add(_pid)
+
     # Build hypothesis findings
     hypothesis_findings = []
     for h in findings:
+        h_source = "deep" if h.hypothesis_id in _deep_hyp_ids else "surface"
         hypothesis_findings.append(FindingResponse(
             id=h.id,
             hypothesis_id=h.hypothesis_id,
@@ -6354,7 +6374,7 @@ async def list_all_findings(
             junior_model=h.junior_model,
             senior_model=h.senior_model,
             project_id=h.project_id,
-            source="deep",
+            source=h_source,
             created_at=h.created_at,
             updated_at=h.updated_at,
         ))

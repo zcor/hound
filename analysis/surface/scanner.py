@@ -206,13 +206,16 @@ class SurfaceScanner:
             findings = self._matches_to_findings(all_matches, repo_path)
             self._log(f"Pattern detection: {len(all_matches)} raw matches, {len(findings)} unique findings")
 
+            # Extract traits for summary (always, even without LLM)
+            traits = self._extract_repo_traits(contracts, quality_metrics)
+
             # LLM verification (if budget allows)
             if self.llm_budget > 0 and findings:
                 self._log(f"Starting LLM verification (budget: {self.llm_budget})")
                 findings, summary = self._llm_verify(findings, contracts, quality_metrics, repo_path)
                 self._log(f"LLM verification complete: {self.llm_calls_made} call(s) used")
             else:
-                summary = self._generate_basic_summary(findings, quality_metrics)
+                summary = self._generate_traits_summary(traits, findings, quality_metrics)
 
             # Calculate risk score
             risk_score = self._calculate_risk_score(findings, quality_metrics)
@@ -488,6 +491,156 @@ class SurfaceScanner:
 
         return list(set(test_files))
 
+    def _extract_repo_traits(self, contracts: list[Path], quality: QualityMetrics) -> dict:
+        """Extract deterministic repo traits from contract source code.
+
+        Returns a dict of boolean/string traits used to constrain LLM summary
+        generation and build the deterministic fallback summary.
+        """
+        traits: dict = {
+            "language": "unknown",
+            "contract_style": "unknown",
+            "has_stateful_accounting": False,
+            "has_custody": False,
+            "has_privileged_flows": False,
+            "has_upgradeability": False,
+            "has_oracle_dependency": False,
+            "has_external_integrations": False,
+            "has_signature_logic": False,
+            "scope_complexity": "narrow",
+        }
+
+        all_source = ""
+        sol_count = 0
+        vy_count = 0
+        for c in contracts:
+            try:
+                content = c.read_text(errors="ignore")
+                all_source += content + "\n"
+                if c.suffix == ".sol":
+                    sol_count += 1
+                elif c.suffix == ".vy":
+                    vy_count += 1
+            except Exception:
+                continue
+
+        # Language
+        if sol_count > 0 and vy_count > 0:
+            traits["language"] = "mixed"
+        elif vy_count > 0:
+            traits["language"] = "vyper"
+        elif sol_count > 0:
+            traits["language"] = "solidity"
+
+        src = all_source.lower()
+
+        # Contract style detection (best guess from keywords)
+        style_signals = {
+            "token": ["totalsupply", "balanceof", "transfer(", "erc20", "erc721", "erc1155", "mint("],
+            "vault": ["deposit(", "withdraw(", "totalassets", "shares", "vault"],
+            "amm": ["swap(", "addliquidity", "removeliquidity", "getreserves", "pair"],
+            "oracle-consumer": ["latestround", "latestrounddata", "aggregatorv3", "pricefeed", "getprice"],
+            "governance": ["propose(", "castVote", "execute(", "quorum", "governor", "timelock"],
+            "payment-splitter": ["commission", "split", "transferfrom", "treasury", "pay("],
+            "upgradeable-proxy": ["delegatecall", "implementation(", "upgradeto", "initialize(", "proxy"],
+            "access-controlled-admin": ["onlyowner", "onlyadmin", "hasrole", "grantRole", "revokeRole"],
+        }
+        best_style = "utility/helper"
+        best_score = 0
+        for style, keywords in style_signals.items():
+            score = sum(1 for kw in keywords if kw.lower() in src)
+            if score > best_score:
+                best_score = score
+                best_style = style
+        if best_score >= 2:
+            traits["contract_style"] = best_style
+        else:
+            traits["contract_style"] = "utility/helper"
+
+        # Boolean trait detection
+        accounting_signals = ["balances[", "balanceof[", "totalsupply", "_balances", "mapping(address => uint"]
+        traits["has_stateful_accounting"] = any(s in src for s in accounting_signals)
+
+        custody_signals = ["withdraw(", "deposit(", "msg.value", "transfer(msg.sender", "payable("]
+        traits["has_custody"] = any(s in src for s in custody_signals)
+
+        privilege_signals = ["onlyowner", "onlyadmin", "hasrole(", "ownable", "accesscontrol", "msg.sender == owner"]
+        traits["has_privileged_flows"] = any(s in src for s in privilege_signals)
+
+        upgrade_signals = ["delegatecall", "upgradeto(", "initializer", "uupsupgradeable", "transparentproxy", "implementation()"]
+        traits["has_upgradeability"] = any(s in src for s in upgrade_signals)
+
+        oracle_signals = ["aggregatorv3", "latestrounddata", "chainlink", "pricefeed", "twap", "oracle"]
+        traits["has_oracle_dependency"] = any(s in src for s in oracle_signals)
+
+        # External integrations beyond standard ERC-20 transferFrom
+        ext_signals = ["call(", "staticcall(", "delegatecall(", "interface ", "extcall ", "raw_call("]
+        ext_count = sum(1 for s in ext_signals if s in src)
+        # transferFrom/approve are standard ERC-20, don't count those alone
+        traits["has_external_integrations"] = ext_count >= 2
+
+        sig_signals = ["ecrecover", "eip712", "permit(", "signedmessage", "digest", "v, r, s"]
+        traits["has_signature_logic"] = any(s in src for s in sig_signals)
+
+        # Scope complexity
+        loc = quality.total_loc or 0
+        n_contracts = quality.contract_count or len(contracts)
+        if loc > 2000 or n_contracts > 10:
+            traits["scope_complexity"] = "broad"
+        elif loc > 500 or n_contracts > 3:
+            traits["scope_complexity"] = "moderate"
+        else:
+            traits["scope_complexity"] = "narrow"
+
+        return traits
+
+    def _prepare_source_context(self, contracts: list[Path], max_chars: int = 16000) -> str:
+        """Prepare a bounded source code excerpt for LLM consumption.
+
+        Sorts contracts smallest-first so simple contracts are shown in full.
+        Hard budget of max_chars guarantees bounded prompt size.
+        """
+        # Sort by file size ascending, cap at 10 files
+        sized = []
+        for c in contracts:
+            try:
+                content = c.read_text(errors="ignore")
+                sized.append((c, content))
+            except Exception:
+                continue
+        sized.sort(key=lambda x: len(x[1]))
+        sized = sized[:10]
+
+        parts: list[str] = []
+        remaining = max_chars
+        for path, content in sized:
+            header = f"// --- {path.name} ---\n"
+            if remaining <= len(header) + 20:
+                break
+            remaining -= len(header)
+            parts.append(header)
+            if len(content) <= remaining:
+                parts.append(content)
+                remaining -= len(content)
+            else:
+                # Include as many lines as fit
+                lines = content.split("\n")
+                truncated: list[str] = []
+                for line in lines:
+                    if remaining < len(line) + 1:
+                        break
+                    truncated.append(line)
+                    remaining -= len(line) + 1
+                parts.append("\n".join(truncated))
+                parts.append("\n[... truncated]")
+                remaining = 0
+            parts.append("\n\n")
+            remaining -= 2
+            if remaining <= 0:
+                break
+
+        return "".join(parts)
+
     def _matches_to_findings(self, matches: list[PatternMatch], repo_path: Path) -> list[Finding]:
         """Convert pattern matches to findings."""
         findings = []
@@ -542,11 +695,14 @@ class SurfaceScanner:
         Returns:
             (verified_findings, summary)
         """
+        # Extract traits for summary generation (cheap, deterministic)
+        traits = self._extract_repo_traits(contracts, quality)
+
         try:
             from llm.unified_client import UnifiedLLMClient
         except ImportError:
             # Fallback if LLM not available
-            return findings, self._generate_basic_summary(findings, quality)
+            return findings, self._generate_traits_summary(traits, findings, quality)
 
         # Prepare config for LLM
         llm_config = self.config.copy() if self.config else {}
@@ -565,7 +721,7 @@ class SurfaceScanner:
             model = "claude-3-haiku-20240307"
         else:
             # No API key available, skip LLM
-            return findings, self._generate_basic_summary(findings, quality)
+            return findings, self._generate_traits_summary(traits, findings, quality)
 
         llm_config["models"]["scan"] = {
             "provider": provider,
@@ -582,7 +738,7 @@ class SurfaceScanner:
         try:
             client = UnifiedLLMClient(llm_config, profile="scan")
         except Exception:
-            return findings, self._generate_basic_summary(findings, quality)
+            return findings, self._generate_traits_summary(traits, findings, quality)
 
         # Call 1: Verify critical/high findings
         critical_high = [f for f in findings if f.severity in ("critical", "high")]
@@ -598,11 +754,11 @@ class SurfaceScanner:
             findings = self._verify_findings_batch(client, medium, findings)
             self.llm_calls_made += 1
 
-        # Call 3: Generate summary
-        summary = self._generate_basic_summary(findings, quality)
+        # Call 3: Generate context-aware summary
+        summary = self._generate_traits_summary(traits, findings, quality)
         if self.llm_calls_made < self.llm_budget:
-            self._log("LLM generating summary")
-            summary = self._generate_llm_summary(client, findings, quality, repo_path)
+            self._log("LLM generating context-aware summary")
+            summary = self._generate_llm_summary(client, findings, quality, repo_path, contracts, traits)
             self.llm_calls_made += 1
 
         return findings, summary
@@ -647,7 +803,10 @@ Respond in JSON format:
 }}"""
 
         try:
-            response = client.generate(prompt, max_tokens=1000)
+            response = client.generate(
+                system="You are a smart contract security auditor. Analyze findings for false positives. Respond with JSON only.",
+                user=prompt,
+            )
             # Parse response and update findings
             # This is simplified - in production, use proper JSON parsing
             result_text = response if isinstance(response, str) else str(response)
@@ -676,54 +835,153 @@ Respond in JSON format:
         findings: list[Finding],
         quality: QualityMetrics,
         repo_path: Path,
+        contracts: list[Path],
+        traits: dict,
     ) -> str:
-        """Generate LLM summary of scan results."""
+        """Generate a context-aware pre-audit posture paragraph using LLM."""
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
         for f in findings:
             counts[f.severity] += 1
 
-        prompt = f"""Generate a brief (2-3 sentence) security summary for this smart contract repository:
+        # Top findings for context (up to 5 most severe)
+        sorted_findings = sorted(findings, key=lambda f: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(f.severity, 4))
+        top_findings_text = "\n".join(
+            f"- [{f.severity}] {f.title}: {f.description[:120]}"
+            for f in sorted_findings[:5]
+        )
 
-Repository: {repo_path.name}
-Contracts: {quality.contract_count}
-Lines of Code: {quality.total_loc}
+        source_excerpt = self._prepare_source_context(contracts)
+        lang = traits.get("language", "unknown")
+        version = quality.vyper_version or quality.solidity_version or "unknown"
 
-Findings:
-- Critical: {counts['critical']}
-- High: {counts['high']}
-- Medium: {counts['medium']}
-- Low: {counts['low']}
+        system_prompt = (
+            "You are a senior smart contract security auditor writing a pre-audit posture assessment. "
+            "Write a single paragraph (3-5 sentences) that:\n"
+            "1. States what the repository appears to do\n"
+            "2. Identifies what materially reduces or increases risk in this specific codebase\n"
+            "3. Notes what a full audit would focus on next\n\n"
+            "Rules:\n"
+            "- Be specific to THIS code — no generic audit boilerplate\n"
+            "- NEVER mention risk categories absent from the provided traits "
+            "(no oracle talk if has_oracle_dependency is false, no admin risk if has_privileged_flows is false, etc.)\n"
+            "- For simple repos, explicitly say the attack surface appears narrow when supported by traits\n"
+            "- Auditor tone, not marketing language\n"
+            "- Write prose only — no bullet points, no headers, no lists"
+        )
 
-Code Quality:
-- Has Tests: {quality.has_tests}
-- Solidity Version: {quality.solidity_version or 'Unknown'}
-- Has Access Control: {quality.has_access_control}
-- Has Events: {quality.has_events}
+        user_prompt = (
+            f"Repository: {repo_path.name}\n"
+            f"Language: {lang} ({version})\n"
+            f"Contracts: {quality.contract_count} files, {quality.total_loc} LOC\n"
+            f"Scope complexity: {traits.get('scope_complexity', 'unknown')}\n\n"
+            f"Inferred traits:\n"
+            f"  contract_style: {traits.get('contract_style', 'unknown')}\n"
+            f"  has_stateful_accounting: {traits.get('has_stateful_accounting', False)}\n"
+            f"  has_custody: {traits.get('has_custody', False)}\n"
+            f"  has_privileged_flows: {traits.get('has_privileged_flows', False)}\n"
+            f"  has_upgradeability: {traits.get('has_upgradeability', False)}\n"
+            f"  has_oracle_dependency: {traits.get('has_oracle_dependency', False)}\n"
+            f"  has_external_integrations: {traits.get('has_external_integrations', False)}\n"
+            f"  has_signature_logic: {traits.get('has_signature_logic', False)}\n\n"
+            f"Pattern scan results: {counts['critical']} critical, {counts['high']} high, "
+            f"{counts['medium']} medium, {counts['low']} low\n"
+        )
+        if top_findings_text:
+            user_prompt += f"\nTop findings:\n{top_findings_text}\n"
 
-Write a professional, concise summary suitable for a security report. Focus on the key risks."""
+        user_prompt += (
+            f"\nCode quality: tests={'yes' if quality.has_tests else 'no'}, "
+            f"access_control={'yes' if quality.has_access_control else 'no'}, "
+            f"events={'yes' if quality.has_events else 'no'}\n\n"
+            f"Contract source code:\n{source_excerpt}"
+        )
 
         try:
-            response = client.generate(prompt, max_tokens=200)
-            return response if isinstance(response, str) else str(response)
+            response = client.generate(system=system_prompt, user=user_prompt)
+            result = response if isinstance(response, str) else str(response)
+            # Strip any markdown formatting the LLM might add
+            result = result.strip().strip('"').strip("'")
+            if result and len(result) > 50:
+                return result
+            return self._generate_traits_summary(traits, findings, quality)
         except Exception:
-            return self._generate_basic_summary(findings, quality)
+            return self._generate_traits_summary(traits, findings, quality)
 
-    def _generate_basic_summary(self, findings: list[Finding], quality: QualityMetrics) -> str:
-        """Generate a basic summary without LLM."""
+    def _generate_traits_summary(self, traits: dict, findings: list[Finding], quality: QualityMetrics) -> str:
+        """Generate a context-aware summary from traits without LLM."""
+        lang = traits.get("language", "unknown").capitalize()
+        style = traits.get("contract_style", "unknown").replace("-", " ")
+        loc = quality.total_loc or 0
+        n_contracts = quality.contract_count or 0
+        complexity = traits.get("scope_complexity", "unknown")
+
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
         for f in findings:
             counts[f.severity] += 1
 
+        # Build the "what it is" part
+        parts = [f"This {lang} {style} ({n_contracts} contract{'s' if n_contracts != 1 else ''}, {loc} LOC)"]
+
+        # Build the "what's notable" part
+        if complexity == "narrow":
+            parts.append("has a narrow attack surface")
+        elif complexity == "broad":
+            parts.append("has a broad attack surface spanning multiple contracts")
+
+        # Mention absent risk categories (only for narrow/moderate scope)
+        absent = []
+        if not traits.get("has_privileged_flows"):
+            absent.append("admin roles")
+        if not traits.get("has_oracle_dependency"):
+            absent.append("oracle dependencies")
+        if not traits.get("has_upgradeability"):
+            absent.append("upgradeability")
+        if not traits.get("has_custody"):
+            absent.append("user fund custody")
+        if absent and complexity != "broad":
+            parts.append(f"with no {', '.join(absent)}")
+
+        sentence1 = " ".join(parts) + "."
+
+        # Build findings summary
         if counts["critical"] > 0:
-            return f"Critical security issues detected. Found {counts['critical']} critical and {counts['high']} high severity issues requiring immediate attention."
+            sentence2 = f"{counts['critical']} critical and {counts['high']} high-severity pattern matches require immediate attention."
         elif counts["high"] > 0:
-            return f"Significant security concerns identified. Found {counts['high']} high and {counts['medium']} medium severity issues that should be addressed."
+            sentence2 = f"{counts['high']} high-severity pattern matches warrant review."
         elif counts["medium"] > 0:
-            return f"Moderate security issues found. {counts['medium']} medium severity findings warrant review."
+            # Be specific about what the findings relate to using pattern IDs
+            top_patterns = set()
+            for f in findings[:5]:
+                if f.pattern_id:
+                    # Convert REENTRANCY-001 → "reentrancy" style
+                    name = f.pattern_id.split("-")[0].lower() if "-" in f.pattern_id else f.title.lower()
+                    top_patterns.add(name)
+            pat_text = ", ".join(sorted(top_patterns)[:3]) if top_patterns else "security patterns"
+            sentence2 = f"{counts['medium']} medium-severity pattern matches relate to {pat_text}."
         elif counts["low"] > 0:
-            return f"Minor issues detected. {counts['low']} low severity findings related to code quality."
+            sentence2 = f"{counts['low']} low-severity informational findings were noted."
         else:
-            return "No significant security issues detected in static analysis. A deeper audit is recommended for production contracts."
+            sentence2 = "No security patterns were flagged during static analysis."
+
+        # Build "what to audit next" part
+        present = []
+        if traits.get("has_external_integrations"):
+            present.append("external contract interactions")
+        if traits.get("has_stateful_accounting"):
+            present.append("accounting state transitions")
+        if traits.get("has_custody"):
+            present.append("fund custody and withdrawal logic")
+        if traits.get("has_signature_logic"):
+            present.append("signature verification")
+        if not present:
+            # Infer from findings
+            if any("transfer" in (f.title or "").lower() for f in findings):
+                present.append("token transfer interaction patterns")
+            else:
+                present.append("edge cases in the core logic")
+        sentence3 = f"A deeper review should validate {' and '.join(present[:2])}."
+
+        return f"{sentence1} {sentence2} {sentence3}"
 
     def _calculate_risk_score(self, findings: list[Finding], quality: QualityMetrics) -> int:
         """Calculate composite risk score 0-100."""

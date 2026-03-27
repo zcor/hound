@@ -7,6 +7,7 @@ These tasks are executed by the Celery worker fleet, separate from the web serve
 
 import json
 import os
+import re
 import sys
 import traceback
 from datetime import datetime, timezone
@@ -704,16 +705,55 @@ def execute_audit_task(
         # Normalize hypotheses into SurfaceFinding-compatible shape for ScanExecution
         normalized_findings, risk_score, risk_level = _normalize_hypotheses_for_scan(hypotheses)
 
+        # Build curated assessment on a COPY (does not touch stored data)
+        audit_config = config or {}
+        overview = None
+        try:
+            curated = list(hypotheses)  # shallow copy
+
+            if audit_config.get("deep_audit_semantic_dedup", True):
+                publisher.publish_thought(
+                    f"Running semantic dedup on {len(curated)} findings...",
+                    iteration=result.get("iterations", 0)
+                )
+                curated = _semantic_dedup_hypotheses(curated, audit_config)
+
+            if audit_config.get("deep_audit_severity_rerank", True):
+                publisher.publish_thought(
+                    f"Re-ranking severity for {len(curated)} findings...",
+                    iteration=result.get("iterations", 0)
+                )
+                curated = _rerank_severities(curated, audit_config)
+
+            overview = _compute_deep_audit_overview(
+                raw_count=len(hypotheses),
+                curated_hypotheses=curated,
+                config=audit_config,
+            )
+            print(f"[DEBUG] Deep audit overview: assessment={overview.get('assessment_level')}, "
+                  f"credible={overview.get('credible_findings_count')}/{len(hypotheses)} raw")
+        except Exception as e:
+            print(f"[DEBUG] Failed to compute deep audit overview: {e}")
+            traceback.print_exc()
+
+        # Build summary from overview if available
+        if overview:
+            summary_text = overview.get("headline", f"Deep audit found {len(hypotheses)} potential issues")
+        else:
+            summary_text = f"Deep audit found {len(hypotheses)} potential issues"
+
         # Update final status (writes to ScanExecution if present, else AuditSession)
-        self._update_scan_status(
-            scan_id,
-            "completed",
+        update_fields = dict(
             findings=normalized_findings,
-            summary=f"Deep audit found {len(hypotheses)} potential issues",
+            summary=summary_text,
             risk_score=risk_score,
             risk_level=risk_level,
         )
-        
+        if overview:
+            update_fields["deep_audit_overview"] = overview
+
+        self._update_scan_status(scan_id, "completed", **update_fields)
+
         publisher.publish_status(
             "completed",
             f"Audit complete. Found {len(hypotheses)} potential vulnerabilities."
@@ -948,6 +988,262 @@ def _store_hypotheses_in_db(
     except Exception as e:
         print(f"Failed to store hypotheses: {e}")
         traceback.print_exc()
+
+
+def _semantic_dedup_hypotheses(hypotheses: list, config: dict | None = None) -> list:
+    """Semantically deduplicate hypotheses using LLM.
+
+    Clusters near-duplicate hypotheses by title/description/location and keeps
+    the best representative from each cluster. Operates on a copy — does not
+    mutate the input list. Returns a new deduplicated list.
+    """
+    if len(hypotheses) <= 5:
+        return list(hypotheses)
+
+    try:
+        from analysis.hypothesis_dedup import _get_lightweight_client
+    except ImportError:
+        print("[deep_audit_dedup] hypothesis_dedup not available, skipping semantic dedup")
+        return list(hypotheses)
+
+    client = _get_lightweight_client(config or {})
+    if not client:
+        print("[deep_audit_dedup] No LLM client available, skipping semantic dedup")
+        return list(hypotheses)
+
+    # Process in chunks of ~30
+    chunk_size = 30
+    all_keep_indices: set[int] = set()
+    chunks = [hypotheses[i:i + chunk_size] for i in range(0, len(hypotheses), chunk_size)]
+
+    for chunk_idx, chunk in enumerate(chunks):
+        # Build a compact summary of each finding for the LLM
+        items_text = []
+        for i, h in enumerate(chunk):
+            idx = chunk_idx * chunk_size + i
+            title = h.get("title") or h.get("description", "")[:80]
+            desc = h.get("description", "")[:150]
+            sev = h.get("severity", "medium")
+            conf = h.get("confidence", 0.5)
+            nodes = ", ".join(str(n) for n in (h.get("node_ids") or [])[:3])
+            items_text.append(f"[{idx}] sev={sev} conf={conf} nodes={nodes}\n  title: {title}\n  desc: {desc}")
+
+        system = (
+            "You are a security finding deduplication assistant.\n"
+            "Given numbered security findings, identify clusters of semantically identical findings "
+            "(same root cause and same affected code area, just different wording).\n"
+            "For each cluster, output ONLY the index of the best representative (most specific, highest confidence).\n"
+            "For findings that are unique (no duplicates), include their index too.\n"
+            "Return JSON: {\"keep\": [0, 3, 7, ...]} — the indices to keep."
+        )
+        user = "FINDINGS:\n" + "\n\n".join(items_text)
+
+        try:
+            response = client.raw(system=system, user=user)
+            text = response if isinstance(response, str) else str(response)
+            # Parse the keep indices from JSON
+            import json as _json
+            match = re.search(r'\{[\s\S]*"keep"[\s\S]*\}', text)
+            if match:
+                result = _json.loads(match.group())
+                for idx in result.get("keep", []):
+                    if isinstance(idx, int) and 0 <= idx < len(hypotheses):
+                        all_keep_indices.add(idx)
+            else:
+                # Couldn't parse — keep all from this chunk
+                for i in range(chunk_idx * chunk_size, min((chunk_idx + 1) * chunk_size, len(hypotheses))):
+                    all_keep_indices.add(i)
+        except Exception as e:
+            print(f"[deep_audit_dedup] LLM dedup failed for chunk {chunk_idx}: {e}")
+            # Keep all from this chunk on failure
+            for i in range(chunk_idx * chunk_size, min((chunk_idx + 1) * chunk_size, len(hypotheses))):
+                all_keep_indices.add(i)
+
+    if not all_keep_indices:
+        return list(hypotheses)
+
+    deduped = [hypotheses[i] for i in sorted(all_keep_indices)]
+    print(f"[deep_audit_dedup] Semantic dedup: {len(hypotheses)} → {len(deduped)}")
+    return deduped
+
+
+def _rerank_severities(hypotheses: list, config: dict | None = None) -> list:
+    """Re-rank severity of hypotheses using LLM.
+
+    Sends the finding list to an LLM to reassess severity based on actual
+    impact rather than default "medium" for everything. Returns a new list
+    with updated severity fields.
+    """
+    if not hypotheses:
+        return list(hypotheses)
+
+    try:
+        from analysis.hypothesis_dedup import _get_lightweight_client
+    except ImportError:
+        return list(hypotheses)
+
+    client = _get_lightweight_client(config or {})
+    if not client:
+        return list(hypotheses)
+
+    # Build compact finding summaries
+    items_text = []
+    for i, h in enumerate(hypotheses):
+        title = h.get("title") or h.get("description", "")[:80]
+        desc = h.get("description", "")[:200]
+        nodes = ", ".join(str(n) for n in (h.get("node_ids") or [])[:3])
+        items_text.append(f"[{i}] {title}\n  {desc}\n  nodes: {nodes}")
+
+    system = (
+        "You are a senior security auditor. Reassess the severity of each finding.\n"
+        "Apply these criteria strictly:\n"
+        "- critical: Direct loss of funds, protocol-breaking, exploitable by anyone\n"
+        "- high: Significant value at risk, requires specific but realistic conditions\n"
+        "- medium: Moderate impact, complex exploitation path, or limited scope\n"
+        "- low: Informational, best practice violations, theoretical issues, design opinions\n\n"
+        "Most automated findings are incorrectly rated as medium. Be honest — "
+        "missing input validation on a simple payment splitter is low, not medium.\n"
+        "Return JSON: {\"severities\": [{\"index\": 0, \"severity\": \"low\"}, ...]}"
+    )
+    user = "FINDINGS TO REASSESS:\n" + "\n\n".join(items_text)
+
+    try:
+        response = client.raw(system=system, user=user)
+        text = response if isinstance(response, str) else str(response)
+        import json as _json
+        match = re.search(r'\{[\s\S]*"severities"[\s\S]*\}', text)
+        if match:
+            result = _json.loads(match.group())
+            reranked = [dict(h) for h in hypotheses]  # shallow copy each dict
+            valid_severities = {"critical", "high", "medium", "low"}
+            for item in result.get("severities", []):
+                idx = item.get("index")
+                sev = item.get("severity", "").lower()
+                if isinstance(idx, int) and 0 <= idx < len(reranked) and sev in valid_severities:
+                    reranked[idx]["severity"] = sev
+            print(f"[deep_audit_rerank] Severity reranking complete for {len(reranked)} findings")
+            return reranked
+    except Exception as e:
+        print(f"[deep_audit_rerank] Severity reranking failed: {e}")
+
+    return list(hypotheses)
+
+
+def _compute_deep_audit_overview(raw_count: int, curated_hypotheses: list, config: dict | None = None) -> dict:
+    """Compute a curated deep audit overview from hypotheses.
+
+    Returns a dict suitable for storage in ScanExecution.deep_audit_overview.
+    """
+    # Triage counts
+    triage_counts = {
+        "confirmed": 0,
+        "investigating": 0,
+        "proposed": 0,
+        "rejected": 0,
+        "uncertain": 0,
+    }
+    for h in curated_hypotheses:
+        status = h.get("status", "proposed")
+        if status in triage_counts:
+            triage_counts[status] += 1
+        else:
+            triage_counts["proposed"] += 1
+
+    # Credible findings: confirmed + investigating + high-confidence unconfirmed
+    credible = []
+    for h in curated_hypotheses:
+        status = h.get("status", "proposed")
+        confidence = float(h.get("confidence", 0.5))
+        if status in ("confirmed", "high_confidence", "investigating"):
+            credible.append(h)
+        elif confidence > 0.7:
+            credible.append(h)
+
+    # Top concerns: up to 3 most severe credible findings
+    severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    sorted_credible = sorted(
+        credible,
+        key=lambda h: (severity_rank.get(h.get("severity", "medium"), 2), float(h.get("confidence", 0.5))),
+        reverse=True,
+    )
+    top_concerns = []
+    for h in sorted_credible[:3]:
+        top_concerns.append({
+            "title": h.get("title") or h.get("description", "")[:80],
+            "description": h.get("description", ""),
+            "severity": h.get("severity", "medium"),
+            "confidence": float(h.get("confidence", 0.5)),
+            "hypothesis_id": h.get("id", ""),
+        })
+
+    # Assessment level from credible findings only
+    credible_severity_weights = {"critical": 25, "high": 15, "medium": 5, "low": 1}
+    credible_score = min(100, sum(
+        credible_severity_weights.get(h.get("severity", "medium"), 5)
+        for h in credible
+    ))
+    assessment_level = (
+        "critical" if credible_score >= 75
+        else "high" if credible_score >= 50
+        else "medium" if credible_score >= 25
+        else "low"
+    )
+
+    # Review note
+    preliminary_count = raw_count - len(credible)
+    review_note = None
+    if preliminary_count > 0 and raw_count > 5:
+        review_note = (
+            f"{preliminary_count} of {raw_count} findings are preliminary "
+            f"and may not represent real vulnerabilities."
+        )
+
+    # Headline (deterministic — LLM-generated headline can be added later)
+    if len(credible) == 0:
+        headline = (
+            f"Deep audit reviewed {raw_count} potential issues. "
+            f"No findings met the credibility threshold for confirmed vulnerabilities."
+        )
+    elif len(credible) <= 3:
+        sev_summary = ", ".join(f"{h.get('severity', 'medium')}-severity" for h in credible)
+        headline = (
+            f"Deep audit identified {len(credible)} credible finding{'s' if len(credible) != 1 else ''} "
+            f"({sev_summary}) out of {raw_count} candidates reviewed."
+        )
+    else:
+        sev_counts: dict[str, int] = {}
+        for h in credible:
+            s = h.get("severity", "medium")
+            sev_counts[s] = sev_counts.get(s, 0) + 1
+        sev_parts = []
+        for s in ["critical", "high", "medium", "low"]:
+            if sev_counts.get(s):
+                sev_parts.append(f"{sev_counts[s]} {s}")
+        headline = (
+            f"Deep audit identified {len(credible)} credible findings "
+            f"({', '.join(sev_parts)}) out of {raw_count} candidates reviewed."
+        )
+
+    # Credible findings list with hypothesis_id for frontend filtering
+    credible_findings = []
+    for h in sorted_credible:
+        credible_findings.append({
+            "hypothesis_id": h.get("id", ""),
+            "title": h.get("title") or h.get("description", "")[:80],
+            "severity": h.get("severity", "medium"),
+            "confidence": float(h.get("confidence", 0.5)),
+        })
+
+    return {
+        "headline": headline,
+        "top_concerns": top_concerns,
+        "triage_counts": triage_counts,
+        "credible_findings_count": len(credible),
+        "credible_findings": credible_findings,
+        "raw_findings_count": raw_count,
+        "assessment_level": assessment_level,
+        "review_note": review_note,
+    }
 
 
 def _normalize_hypotheses_for_scan(hypotheses: list) -> tuple[list, int, str]:

@@ -468,6 +468,9 @@ class ScanExecution(Base):
 
     # Error handling
     error_message = Column(Text, nullable=True)
+
+    # Deep audit curated assessment (JSONB, NULL for surface scans)
+    deep_audit_overview = Column(JSONType, nullable=True)
     
     # Timing
     started_at = Column(DateTime, nullable=True)
@@ -766,6 +769,8 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS pr_comments_enabled BOOLEAN NOT NULL DEFAULT TRUE"))
             # User triage notes on findings
             conn.execute(text("ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS user_notes TEXT"))
+            # Deep audit curated assessment
+            conn.execute(text("ALTER TABLE scan_executions ADD COLUMN IF NOT EXISTS deep_audit_overview JSONB"))
 
 
 def init_database(engine):

@@ -280,6 +280,120 @@ async def notify_payment_event(
     return await send_telegram_message(message)
 
 
+async def notify_deep_audit_started(
+    repo_url: str,
+    session_id: str,
+    tenant_id: int | None = None,
+    project_name: str | None = None,
+    mode: str | None = None,
+) -> bool:
+    """
+    Send notification when a deep audit is started/queued.
+
+    Args:
+        repo_url: Repository URL being audited
+        session_id: Audit session ID
+        tenant_id: Tenant ID that initiated the audit
+        project_name: Human-readable project name (optional)
+        mode: Audit mode (e.g., "sweep", "targeted")
+
+    Returns:
+        True if notification was sent successfully
+    """
+    repo_display = f'<a href="{_escape_html(repo_url)}">{_escape_html(repo_url)}</a>' if repo_url.startswith("http") else _escape_html(repo_url)
+    display_name = _escape_html(project_name) if project_name else repo_display
+
+    message_parts = [
+        "🔬 <b>Deep Audit Started</b>",
+        "",
+        f"📁 <b>Repo:</b> {repo_display}",
+    ]
+
+    if project_name:
+        message_parts.append(f"📋 <b>Project:</b> {_escape_html(project_name)}")
+
+    message_parts.append(f"🔑 <b>Session:</b> <code>{_escape_html(session_id)}</code>")
+
+    if mode:
+        message_parts.append(f"⚙️ <b>Mode:</b> {_escape_html(mode)}")
+
+    if tenant_id is not None:
+        message_parts.append(f"🆔 <b>Tenant ID:</b> {tenant_id}")
+
+    message = "\n".join(message_parts)
+    return await send_telegram_message(message)
+
+
+async def notify_deep_audit_completed(
+    repo_url: str,
+    session_id: str,
+    tenant_id: int | None = None,
+    status: str = "completed",
+    findings_count: int | None = None,
+    risk_level: str | None = None,
+    risk_score: float | None = None,
+    assessment_level: str | None = None,
+    error_message: str | None = None,
+    project_name: str | None = None,
+) -> bool:
+    """
+    Send notification when a deep audit completes (success or failure).
+
+    Args:
+        repo_url: Repository URL that was audited
+        session_id: Audit session ID
+        tenant_id: Tenant ID
+        status: "completed" or "failed"
+        findings_count: Number of findings (success only)
+        risk_level: Raw risk level (e.g., "high", "medium")
+        risk_score: Numeric risk score
+        assessment_level: Curated assessment from deep audit overview (preferred over risk_level)
+        error_message: Error details (failure only)
+        project_name: Human-readable project name (optional)
+
+    Returns:
+        True if notification was sent successfully
+    """
+    repo_display = f'<a href="{_escape_html(repo_url)}">{_escape_html(repo_url)}</a>' if repo_url.startswith("http") else _escape_html(repo_url)
+
+    if status == "completed":
+        header = "✅ <b>Deep Audit Complete</b>"
+    else:
+        header = "❌ <b>Deep Audit Failed</b>"
+
+    message_parts = [
+        header,
+        "",
+        f"📁 <b>Repo:</b> {repo_display}",
+    ]
+
+    if project_name:
+        message_parts.append(f"📋 <b>Project:</b> {_escape_html(project_name)}")
+
+    if status == "completed":
+        if findings_count is not None:
+            message_parts.append(f"🔍 <b>Findings:</b> {findings_count}")
+
+        # Prefer curated assessment_level over raw risk_level
+        display_level = assessment_level or risk_level
+        if display_level:
+            message_parts.append(f"⚠️ <b>Assessment:</b> {_escape_html(str(display_level))}")
+
+        if risk_score is not None:
+            message_parts.append(f"📊 <b>Risk Score:</b> {risk_score}")
+    else:
+        if error_message:
+            message_parts.append(f"💥 <b>Error:</b> {_escape_html(str(error_message))}")
+
+    message_parts.append(f"🔑 <b>Session:</b> <code>{_escape_html(session_id)}</code>")
+
+    if tenant_id is not None:
+        message_parts.append(f"🆔 <b>Tenant ID:</b> {tenant_id}")
+
+    message = "\n".join(message_parts)
+    return await send_telegram_message(message)
+
+
 def _escape_html(text: str) -> str:
     """Escape HTML special characters for Telegram HTML parse mode."""
     return (

@@ -85,7 +85,7 @@ from database.models import (  # noqa: E402
     create_db_engine,
     create_db_session,
 )
-from integrations.telegram import notify_new_repo_synced, notify_repo_added, notify_app_installed  # noqa: E402
+from integrations.telegram import notify_new_repo_synced, notify_repo_added, notify_app_installed, notify_deep_audit_started  # noqa: E402
 from server.auth_utils import reject_preview_writes  # noqa: E402
 from server.token_crypto import decrypt_token  # noqa: E402
 
@@ -3071,6 +3071,18 @@ async def start_audit(
     )
 
     logger.info(f"Dispatched audit task {task.id} for session {session_id}")
+
+    # Send Telegram notification for deep audit start (fire-and-forget)
+    try:
+        await notify_deep_audit_started(
+            repo_url=request_body.repo_url,
+            session_id=session_id,
+            tenant_id=tenant.id,
+            project_name=project.name if project else None,
+            mode=request_body.mode,
+        )
+    except Exception:
+        pass  # non-critical
 
     return AuditStartResponse(
         session_id=session_id,

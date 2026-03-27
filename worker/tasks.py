@@ -5,6 +5,7 @@ Contains the main background tasks for running audits and surface scans.
 These tasks are executed by the Celery worker fleet, separate from the web server.
 """
 
+import asyncio
 import json
 import os
 import re
@@ -25,6 +26,7 @@ from .celery_app import celery_app  # noqa: E402
 from .redis_publisher import RedisPublisher  # noqa: E402
 
 from llm.token_tracker import set_token_context, clear_token_context  # noqa: E402
+from integrations.telegram import notify_deep_audit_completed  # noqa: E402
 
 
 class AuditTask(Task):
@@ -185,7 +187,24 @@ def execute_audit_task(
     
     publisher = RedisPublisher(scan_id)
     temp_dir = None
-    
+
+    # Resolve project_name for Telegram notifications
+    project_name = None
+    if project_id:
+        try:
+            from database.models import Project, create_db_engine, create_db_session as _create_session
+            _engine = create_db_engine(os.environ.get("DATABASE_URL", "sqlite:///hound.db"))
+            _db = _create_session(_engine)
+            _project = _db.query(Project).filter(Project.id == project_id).first()
+            if _project:
+                project_name = _project.name
+            _db.close()
+        except Exception:
+            pass
+    if not project_name:
+        # Fallback: extract repo name from URL
+        project_name = repo_url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") if repo_url else None
+
     try:
         # Set token tracking context for cost attribution
         set_token_context(
@@ -754,11 +773,24 @@ def execute_audit_task(
 
         self._update_scan_status(scan_id, "completed", **update_fields)
 
+        # Send Telegram notification for deep audit completion (fire-and-forget)
+        try:
+            assessment = overview.get("assessment_level") if overview else None
+            asyncio.run(notify_deep_audit_completed(
+                repo_url=repo_url, session_id=scan_id, tenant_id=tenant_id,
+                status="completed", findings_count=len(hypotheses),
+                risk_level=risk_level, risk_score=risk_score,
+                assessment_level=assessment,
+                project_name=project_name,
+            ))
+        except Exception:
+            pass  # non-critical
+
         publisher.publish_status(
             "completed",
             f"Audit complete. Found {len(hypotheses)} potential vulnerabilities."
         )
-        
+
         return {
             "status": "completed",
             "scan_id": scan_id,
@@ -772,6 +804,14 @@ def execute_audit_task(
         publisher.publish_error("Audit timed out", "timeout")
         publisher.publish_status("failed", "Audit exceeded time limit")
         self._update_scan_status(scan_id, "failed", error_message="Time limit exceeded")
+        try:
+            asyncio.run(notify_deep_audit_completed(
+                repo_url=repo_url, session_id=scan_id, tenant_id=tenant_id,
+                status="failed", error_message="Time limit exceeded",
+                project_name=project_name,
+            ))
+        except Exception:
+            pass  # non-critical
         raise
         
     except Exception as e:
@@ -779,11 +819,19 @@ def execute_audit_task(
         publisher.publish_error(error_msg, "execution_error")
         publisher.publish_status("failed", error_msg)
         self._update_scan_status(scan_id, "failed", error_message=error_msg)
-        
+        try:
+            asyncio.run(notify_deep_audit_completed(
+                repo_url=repo_url, session_id=scan_id, tenant_id=tenant_id,
+                status="failed", error_message=error_msg,
+                project_name=project_name,
+            ))
+        except Exception:
+            pass  # non-critical
+
         # Log full traceback for debugging
         print(f"Audit task failed: {error_msg}")
         traceback.print_exc()
-        
+
         raise
         
     finally:

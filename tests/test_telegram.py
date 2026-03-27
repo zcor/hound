@@ -8,6 +8,8 @@ from integrations.telegram import (
     notify_payment_event,
     notify_repo_added,
     notify_app_installed,
+    notify_deep_audit_started,
+    notify_deep_audit_completed,
     _escape_html,
 )
 
@@ -221,3 +223,127 @@ def test_notify_app_installed_minimal():
     # No tenant_id or installation_id lines
     assert "Tenant ID:" not in msg
     assert "Installation ID:" not in msg
+
+
+def test_notify_deep_audit_started():
+    with patch("integrations.telegram.send_telegram_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = True
+        result = _run(notify_deep_audit_started(
+            repo_url="https://github.com/acme/contracts",
+            session_id="sess-abc123",
+            tenant_id=42,
+            project_name="Acme Contracts",
+            mode="sweep",
+        ))
+    assert result is True
+    mock_send.assert_called_once()
+    msg = mock_send.call_args[0][0]
+    assert "Deep Audit Started" in msg
+    assert "acme/contracts" in msg
+    assert "sess-abc123" in msg
+    assert "42" in msg
+    assert "Acme Contracts" in msg
+    assert "sweep" in msg
+
+
+def test_notify_deep_audit_started_minimal():
+    with patch("integrations.telegram.send_telegram_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = True
+        result = _run(notify_deep_audit_started(
+            repo_url="https://github.com/user/repo",
+            session_id="sess-xyz",
+        ))
+    assert result is True
+    msg = mock_send.call_args[0][0]
+    assert "Deep Audit Started" in msg
+    assert "sess-xyz" in msg
+    # No optional fields
+    assert "Project:" not in msg
+    assert "Mode:" not in msg
+    assert "Tenant ID:" not in msg
+
+
+def test_notify_deep_audit_completed_success():
+    with patch("integrations.telegram.send_telegram_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = True
+        result = _run(notify_deep_audit_completed(
+            repo_url="https://github.com/acme/contracts",
+            session_id="sess-abc123",
+            tenant_id=42,
+            status="completed",
+            findings_count=15,
+            risk_level="high",
+            risk_score=78.5,
+            assessment_level="Needs Attention",
+            project_name="Acme Contracts",
+        ))
+    assert result is True
+    mock_send.assert_called_once()
+    msg = mock_send.call_args[0][0]
+    assert "Deep Audit Complete" in msg
+    assert "acme/contracts" in msg
+    assert "15" in msg
+    # assessment_level preferred over risk_level
+    assert "Needs Attention" in msg
+    assert "78.5" in msg
+    assert "42" in msg
+    assert "Acme Contracts" in msg
+    # Should NOT contain failure language
+    assert "Failed" not in msg
+    assert "Error:" not in msg
+
+
+def test_notify_deep_audit_completed_success_fallback_risk():
+    """When assessment_level is None, falls back to risk_level."""
+    with patch("integrations.telegram.send_telegram_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = True
+        result = _run(notify_deep_audit_completed(
+            repo_url="https://github.com/acme/repo",
+            session_id="sess-999",
+            status="completed",
+            findings_count=3,
+            risk_level="medium",
+            risk_score=45.0,
+        ))
+    assert result is True
+    msg = mock_send.call_args[0][0]
+    assert "medium" in msg
+    assert "45.0" in msg
+
+
+def test_notify_deep_audit_completed_failure():
+    with patch("integrations.telegram.send_telegram_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = True
+        result = _run(notify_deep_audit_completed(
+            repo_url="https://github.com/acme/contracts",
+            session_id="sess-abc123",
+            tenant_id=42,
+            status="failed",
+            error_message="Time limit exceeded",
+            project_name="Acme Contracts",
+        ))
+    assert result is True
+    mock_send.assert_called_once()
+    msg = mock_send.call_args[0][0]
+    assert "Deep Audit Failed" in msg
+    assert "Time limit exceeded" in msg
+    assert "acme/contracts" in msg
+    assert "42" in msg
+    # Should NOT contain success language
+    assert "Findings:" not in msg
+    assert "Risk Score:" not in msg
+
+
+def test_notify_deep_audit_completed_html_escaping():
+    with patch("integrations.telegram.send_telegram_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = True
+        result = _run(notify_deep_audit_completed(
+            repo_url="https://github.com/test/repo",
+            session_id="sess-test",
+            status="failed",
+            error_message="<script>alert('xss')</script>",
+        ))
+    assert result is True
+    msg = mock_send.call_args[0][0]
+    assert "<script>" not in msg
+    assert "&lt;script&gt;" in msg

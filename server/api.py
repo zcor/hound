@@ -5106,6 +5106,9 @@ class ScanHistoryItem(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     scan_type: str = "surface"
+    # Deep audit curated fields (None for surface scans)
+    assessment_level: str | None = None
+    credible_findings_count: int | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -5436,9 +5439,14 @@ def _count_findings_for_project(db: Session, project_id: int) -> int:
         count += len(latest_surface.findings)
 
     # Latest completed deep audit findings (from ScanExecution, not Hypothesis table)
+    # Prefer curated credible count from deep_audit_overview when available
     latest_deep = _latest_scan_by_type(db, project_id, "deep")
     if latest_deep and latest_deep.findings:
-        count += len(latest_deep.findings)
+        overview = latest_deep.deep_audit_overview if hasattr(latest_deep, 'deep_audit_overview') else None
+        if isinstance(overview, dict) and "credible_findings_count" in overview:
+            count += overview["credible_findings_count"]
+        else:
+            count += len(latest_deep.findings)
 
     # Deep audit hypotheses not backed by a ScanExecution (CLI/agent path)
     if not latest_deep:
@@ -6390,6 +6398,13 @@ async def list_repository_scans(
     scan_items = []
     for scan in scans:
         findings_count = len(scan.findings) if scan.findings else 0
+        # Extract curated fields from deep_audit_overview if present
+        overview = scan.deep_audit_overview if hasattr(scan, 'deep_audit_overview') else None
+        assessment_level = None
+        credible_findings_count = None
+        if isinstance(overview, dict):
+            assessment_level = overview.get("assessment_level")
+            credible_findings_count = overview.get("credible_findings_count")
         scan_items.append(ScanHistoryItem(
             execution_id=scan.execution_id,
             status=scan.status,
@@ -6399,6 +6414,8 @@ async def list_repository_scans(
             started_at=scan.started_at,
             completed_at=scan.completed_at,
             scan_type=scan.scan_config.get("scan_type", "surface") if scan.scan_config else "surface",
+            assessment_level=assessment_level,
+            credible_findings_count=credible_findings_count,
         ))
     
     return ScanHistoryResponse(
@@ -7620,6 +7637,8 @@ class SurfaceScanResponse(BaseModel):
     error: str | None = None
     scan_log: str | None = None
     scan_type: str = "surface"
+    # Deep audit curated assessment (None for surface scans)
+    deep_audit_overview: dict | None = None
 
 
 class SurfaceScanListItem(BaseModel):
@@ -8047,6 +8066,9 @@ async def get_surface_scan(
     if scan.started_at and scan.completed_at:
         duration = (scan.completed_at - scan.started_at).total_seconds()
     
+    # Include deep_audit_overview if present
+    overview = scan.deep_audit_overview if hasattr(scan, 'deep_audit_overview') else None
+
     return SurfaceScanResponse(
         execution_id=scan.execution_id,
         repo_url=scan.repo_url,
@@ -8062,6 +8084,7 @@ async def get_surface_scan(
         error=scan.error_message,
         scan_log=scan.scan_log,
         scan_type=scan.scan_config.get("scan_type", "surface") if scan.scan_config else "surface",
+        deep_audit_overview=overview if isinstance(overview, dict) else None,
     )
 
 

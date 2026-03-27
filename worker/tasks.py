@@ -1041,9 +1041,9 @@ def _store_hypotheses_in_db(
 def _semantic_dedup_hypotheses(hypotheses: list, config: dict | None = None) -> list:
     """Semantically deduplicate hypotheses using LLM.
 
-    Clusters near-duplicate hypotheses by title/description/location and keeps
-    the best representative from each cluster. Operates on a copy — does not
-    mutate the input list. Returns a new deduplicated list.
+    Sends all findings in a single pass for comprehensive cross-finding
+    comparison. Falls back to chunked processing only for very large sets (500+).
+    Operates on a copy — does not mutate the input list.
     """
     if len(hypotheses) <= 5:
         return list(hypotheses)
@@ -1059,58 +1059,78 @@ def _semantic_dedup_hypotheses(hypotheses: list, config: dict | None = None) -> 
         print("[deep_audit_dedup] No LLM client available, skipping semantic dedup")
         return list(hypotheses)
 
-    # Process in chunks of ~30
-    chunk_size = 30
-    all_keep_indices: set[int] = set()
-    chunks = [hypotheses[i:i + chunk_size] for i in range(0, len(hypotheses), chunk_size)]
-
-    for chunk_idx, chunk in enumerate(chunks):
-        # Build a compact summary of each finding for the LLM
+    def _dedup_batch(batch: list, offset: int = 0) -> set[int]:
+        """Send a batch to LLM for dedup, return global indices to keep."""
         items_text = []
-        for i, h in enumerate(chunk):
-            idx = chunk_idx * chunk_size + i
+        for i, h in enumerate(batch):
+            idx = offset + i
             title = h.get("title") or h.get("description", "")[:80]
-            desc = h.get("description", "")[:150]
             sev = h.get("severity", "medium")
             conf = h.get("confidence", 0.5)
-            nodes = ", ".join(str(n) for n in (h.get("node_ids") or [])[:3])
-            items_text.append(f"[{idx}] sev={sev} conf={conf} nodes={nodes}\n  title: {title}\n  desc: {desc}")
+            items_text.append(f"[{idx}] sev={sev} conf={conf} | {title}")
 
         system = (
             "You are a security finding deduplication assistant.\n"
-            "Given numbered security findings, identify clusters of semantically identical findings "
-            "(same root cause and same affected code area, just different wording).\n"
-            "For each cluster, output ONLY the index of the best representative (most specific, highest confidence).\n"
-            "For findings that are unique (no duplicates), include their index too.\n"
-            "Return JSON: {\"keep\": [0, 3, 7, ...]} — the indices to keep."
+            "Given numbered security findings, identify ALL clusters of semantically identical "
+            "or near-identical findings (same root cause, just different wording).\n"
+            "Examples of duplicates:\n"
+            "- 'No emergency pause mechanism' ≈ 'No emergency pause or circuit breaker mechanism'\n"
+            "- 'Treasury immutability prevents recovery' ≈ 'Treasury address immutable after deployment'\n"
+            "- 'Integer overflow in commission' ≈ 'Potential integer overflow in commission calculation'\n"
+            "- 'Missing reentrancy guard' ≈ 'No reentrancy protection on external calls'\n\n"
+            "For each cluster, keep ONLY the best representative (most specific, highest confidence).\n"
+            "For unique findings (no duplicates), include their index too.\n"
+            "Be aggressive — if two findings describe the same underlying issue, they are duplicates.\n"
+            "Return JSON: {\"keep\": [0, 3, 7, ...]}"
         )
-        user = "FINDINGS:\n" + "\n\n".join(items_text)
+        user = "FINDINGS:\n" + "\n".join(items_text)
 
         try:
             response = client.raw(system=system, user=user)
             text = response if isinstance(response, str) else str(response)
-            # Parse the keep indices from JSON
-            import json as _json
             match = re.search(r'\{[\s\S]*"keep"[\s\S]*\}', text)
             if match:
-                result = _json.loads(match.group())
-                for idx in result.get("keep", []):
-                    if isinstance(idx, int) and 0 <= idx < len(hypotheses):
-                        all_keep_indices.add(idx)
-            else:
-                # Couldn't parse — keep all from this chunk
-                for i in range(chunk_idx * chunk_size, min((chunk_idx + 1) * chunk_size, len(hypotheses))):
-                    all_keep_indices.add(i)
+                result = json.loads(match.group())
+                return {idx for idx in result.get("keep", [])
+                        if isinstance(idx, int) and 0 <= idx < len(hypotheses)}
         except Exception as e:
-            print(f"[deep_audit_dedup] LLM dedup failed for chunk {chunk_idx}: {e}")
-            # Keep all from this chunk on failure
-            for i in range(chunk_idx * chunk_size, min((chunk_idx + 1) * chunk_size, len(hypotheses))):
-                all_keep_indices.add(i)
+            print(f"[deep_audit_dedup] LLM dedup failed: {e}")
 
-    if not all_keep_indices:
+        # Fallback: keep all
+        return {offset + i for i in range(len(batch))}
+
+    # Single-pass for up to 500 findings (compact one-liners fit in context)
+    if len(hypotheses) <= 500:
+        keep_indices = _dedup_batch(hypotheses, offset=0)
+    else:
+        # Chunked with cross-chunk merge for very large sets
+        chunk_size = 200
+        keep_indices: set[int] = set()
+        chunks = [hypotheses[i:i + chunk_size] for i in range(0, len(hypotheses), chunk_size)]
+
+        # Pass 1: dedup within each chunk
+        chunk_representatives: list[tuple[int, dict]] = []
+        for chunk_idx, chunk in enumerate(chunks):
+            offset = chunk_idx * chunk_size
+            chunk_keep = _dedup_batch(chunk, offset=offset)
+            for idx in sorted(chunk_keep):
+                chunk_representatives.append((idx, hypotheses[idx]))
+
+        # Pass 2: dedup across chunk representatives
+        if len(chunk_representatives) > 5:
+            rep_batch = [h for _, h in chunk_representatives]
+            cross_keep = _dedup_batch(rep_batch, offset=0)
+            # Map back to original indices
+            for i in cross_keep:
+                if i < len(chunk_representatives):
+                    keep_indices.add(chunk_representatives[i][0])
+        else:
+            keep_indices = {idx for idx, _ in chunk_representatives}
+
+    if not keep_indices:
         return list(hypotheses)
 
-    deduped = [hypotheses[i] for i in sorted(all_keep_indices)]
+    deduped = [hypotheses[i] for i in sorted(keep_indices)]
     print(f"[deep_audit_dedup] Semantic dedup: {len(hypotheses)} → {len(deduped)}")
     return deduped
 

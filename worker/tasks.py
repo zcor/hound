@@ -1129,6 +1129,73 @@ def _rerank_severities(hypotheses: list, config: dict | None = None) -> list:
     return list(hypotheses)
 
 
+def _generate_deep_audit_headline(
+    raw_count: int,
+    credible: list,
+    top_concerns: list,
+    assessment_level: str,
+    config: dict | None = None,
+) -> str:
+    """Generate an auditor-quality headline paragraph for the deep audit overview.
+
+    Tries LLM first, falls back to deterministic summary.
+    """
+    # Build deterministic fallback first
+    if len(credible) == 0:
+        fallback = (
+            f"Deep audit reviewed {raw_count} potential issues. "
+            f"No findings met the credibility threshold for confirmed vulnerabilities."
+        )
+    else:
+        sev_counts: dict[str, int] = {}
+        for h in credible:
+            s = h.get("severity", "medium")
+            sev_counts[s] = sev_counts.get(s, 0) + 1
+        sev_parts = []
+        for s in ["critical", "high", "medium", "low"]:
+            if sev_counts.get(s):
+                sev_parts.append(f"{sev_counts[s]} {s}")
+        fallback = (
+            f"Deep audit identified {len(credible)} credible findings "
+            f"({', '.join(sev_parts)}) out of {raw_count} candidates reviewed."
+        )
+
+    # Try LLM headline
+    try:
+        from analysis.hypothesis_dedup import _get_lightweight_client
+        client = _get_lightweight_client(config or {})
+        if not client:
+            return fallback
+
+        concerns_text = "\n".join(
+            f"- [{tc.get('severity', 'medium')}] {tc.get('title', '')}"
+            for tc in top_concerns
+        )
+
+        system = (
+            "You are a senior smart contract security auditor writing a post-audit assessment. "
+            "Write a single paragraph (3-5 sentences) summarizing the security posture after a deep audit. "
+            "Be specific. Auditor tone. Mention what the contract does, key risks, and overall assessment. "
+            "Do not list individual findings. Prose only — no bullet points, no headers."
+        )
+
+        user = (
+            f"Deep audit reviewed {raw_count} candidates, {len(credible)} credible findings remain.\n"
+            f"Assessment level: {assessment_level}.\n"
+            f"Top concerns:\n{concerns_text}\n\n"
+            f"Write the assessment paragraph."
+        )
+
+        result = client.raw(system=system, user=user)
+        result = result.strip().strip('"').strip("'") if isinstance(result, str) else str(result).strip()
+        if result and len(result) > 50:
+            return result
+    except Exception as e:
+        print(f"[deep_audit_overview] LLM headline failed: {e}")
+
+    return fallback
+
+
 def _compute_deep_audit_overview(raw_count: int, curated_hypotheses: list, config: dict | None = None) -> dict:
     """Compute a curated deep audit overview from hypotheses.
 
@@ -1198,31 +1265,10 @@ def _compute_deep_audit_overview(raw_count: int, curated_hypotheses: list, confi
             f"and may not represent real vulnerabilities."
         )
 
-    # Headline (deterministic — LLM-generated headline can be added later)
-    if len(credible) == 0:
-        headline = (
-            f"Deep audit reviewed {raw_count} potential issues. "
-            f"No findings met the credibility threshold for confirmed vulnerabilities."
-        )
-    elif len(credible) <= 3:
-        sev_summary = ", ".join(f"{h.get('severity', 'medium')}-severity" for h in credible)
-        headline = (
-            f"Deep audit identified {len(credible)} credible finding{'s' if len(credible) != 1 else ''} "
-            f"({sev_summary}) out of {raw_count} candidates reviewed."
-        )
-    else:
-        sev_counts: dict[str, int] = {}
-        for h in credible:
-            s = h.get("severity", "medium")
-            sev_counts[s] = sev_counts.get(s, 0) + 1
-        sev_parts = []
-        for s in ["critical", "high", "medium", "low"]:
-            if sev_counts.get(s):
-                sev_parts.append(f"{sev_counts[s]} {s}")
-        headline = (
-            f"Deep audit identified {len(credible)} credible findings "
-            f"({', '.join(sev_parts)}) out of {raw_count} candidates reviewed."
-        )
+    # Headline: LLM-generated auditor paragraph, with deterministic fallback
+    headline = _generate_deep_audit_headline(
+        raw_count, credible, top_concerns, assessment_level, config
+    )
 
     # Credible findings list with hypothesis_id for frontend filtering
     credible_findings = []

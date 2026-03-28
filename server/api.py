@@ -75,6 +75,7 @@ from database.models import (  # noqa: E402
     Base,
     Graph,
     Hypothesis,
+    PageView,
     PaymentLog,
     Project,
     ScanExecution,
@@ -236,7 +237,8 @@ app.state.limiter = limiter
 
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    return HTTPException(status_code=429, detail="Rate limit exceeded")
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
 
 
 # Middleware to fix URL generation for proxied requests (Codespaces, ngrok, etc.)
@@ -9280,6 +9282,48 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
         tenant_id=tenant.id,
         message="You're on the waitlist! We'll review your application and be in touch.",
     )
+
+
+# --------------------------------------------------------------------------
+# Page view beacon (funnel analytics)
+# --------------------------------------------------------------------------
+@app.post("/t", status_code=204)
+@limiter.limit("20/minute")
+async def track_page_view(request: Request, db: Session = Depends(get_db)):
+    """Lightweight page view beacon. No auth required."""
+    # Origin check: strict hostname match
+    origin = request.headers.get("origin", "")
+    if origin:
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(origin).hostname or ""
+            if host != "firepan.com" and not host.endswith(".firepan.com"):
+                return Response(status_code=204)
+        except Exception:
+            return Response(status_code=204)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return Response(status_code=204)
+
+    path = str(body.get("p", ""))[:500]
+    if not path.startswith("/"):
+        return Response(status_code=204)
+
+    vid = str(body.get("v", ""))[:64]
+    if vid and (len(vid) < 20 or not all(c.isalnum() or c == '-' for c in vid)):
+        vid = None
+
+    page_view = PageView(
+        path=path,
+        referrer=str(body.get("r", ""))[:1000] or None,
+        user_agent=str(request.headers.get("user-agent", ""))[:500] or None,
+        visitor_id=vid or None,
+    )
+    db.add(page_view)
+    db.commit()
+    return Response(status_code=204)
 
 
 # Health check endpoint

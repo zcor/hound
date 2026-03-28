@@ -394,6 +394,52 @@ async def notify_deep_audit_completed(
     return await send_telegram_message(message)
 
 
+async def notify_funnel_digest(
+    period_label: str,
+    visitors_7d: int,
+    visitors_unique_7d: int,
+    signups_7d: int,
+    scans_7d: int,
+    new_paid_7d: int,
+    visitors_30d: int,
+    visitors_unique_30d: int,
+    signups_30d: int,
+    scans_30d: int,
+    new_paid_30d: int,
+    active_paid: int,
+    ever_paid: int,
+    total_users: int,
+    total_scans: int,
+) -> bool:
+    """Send weekly funnel digest to internal Telegram channel."""
+
+    def _pct(num: int, denom: int) -> str:
+        if denom == 0:
+            return "N/A"
+        return f"{num / denom * 100:.1f}%"
+
+    message = (
+        f"\U0001f4ca <b>Weekly Funnel Digest</b>\n"
+        f"{_escape_html(period_label)}\n"
+        f"\n"
+        f"<b>Funnel (7d / 30d):</b>\n"
+        f"\U0001f310 Page views:      {visitors_7d} / {visitors_30d}\n"
+        f"\U0001f464 Unique visitors:  {visitors_unique_7d} / {visitors_unique_30d}\n"
+        f"\U0001f4dd Signups:          {signups_7d} / {signups_30d}\n"
+        f"\U0001f52c Scans started:    {scans_7d} / {scans_30d}\n"
+        f"\U0001f4b0 New paid:         {new_paid_7d} / {new_paid_30d}\n"
+        f"\n"
+        f"<b>Conversion (7d):</b>\n"
+        f"  Visit \u2192 Signup:  {_pct(signups_7d, visitors_unique_7d)}\n"
+        f"  Signup \u2192 Scan:   {_pct(scans_7d, signups_7d)}\n"
+        f"  Scan \u2192 Paid:    {_pct(new_paid_7d, scans_7d)}\n"
+        f"\n"
+        f"<b>Totals:</b>\n"
+        f"  Active paid: {active_paid} | Ever paid: {ever_paid} | Users: {total_users} | Scans: {total_scans}"
+    )
+    return await send_telegram_message(message)
+
+
 def _escape_html(text: str) -> str:
     """Escape HTML special characters for Telegram HTML parse mode."""
     return (

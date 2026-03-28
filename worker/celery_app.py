@@ -15,6 +15,7 @@ if str(app_root) not in sys.path:
     sys.path.insert(0, str(app_root))
 
 from celery import Celery  # noqa: E402
+from celery.schedules import crontab  # noqa: E402
 
 # Redis configuration from environment variables
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -74,5 +75,13 @@ celery_app.conf.task_annotations = {
     },
     "worker.tasks.build_graphs_task": {
         "rate_limit": "5/m",  # Graph builds are moderately heavy
+    },
+}
+
+# Celery Beat periodic schedule
+celery_app.conf.beat_schedule = {
+    "weekly-funnel-digest": {
+        "task": "worker.tasks.send_funnel_digest_task",
+        "schedule": crontab(hour=9, minute=0, day_of_week=1),  # Monday 9am UTC
     },
 }

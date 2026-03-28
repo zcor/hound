@@ -147,6 +147,26 @@ services:
       - hound-net
     restart: unless-stopped
 
+  # Celery Beat Scheduler
+  beat:
+    image: ${HOUND_APP_IMAGE:-hound-app:local}
+    container_name: hound-beat
+    command: celery -A worker.celery_app beat --loglevel=info
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql://${POSTGRES_USER:-hound}:${POSTGRES_PASSWORD:-hound_secret}@db:5432/${POSTGRES_DB:-hound}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-hound_redis_secret}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-hound_redis_secret}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-hound_redis_secret}@redis:6379/0
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - hound-net
+    restart: unless-stopped
+
   # Next.js Frontend
   frontend:
     image: ${HOUND_FRONTEND_IMAGE:-hound-frontend:local}

@@ -11,7 +11,7 @@ import os
 import re
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Ensure the app root is in Python path for imports (needed for Celery fork workers)
@@ -1696,3 +1696,104 @@ def build_graphs_task(
         
         # Note: We don't clean up temp_dir here as the graphs may be needed
         # Cleanup should happen after audit completes or via scheduled task
+
+
+@celery_app.task(name="worker.tasks.send_funnel_digest_task")
+def send_funnel_digest_task():
+    """Weekly funnel stats digest to internal Telegram channel."""
+    from database.models import PageView, ScanExecution, Tenant, User, create_db_engine, create_db_session
+    from integrations.telegram import notify_funnel_digest
+    from sqlalchemy import func as sqlfunc
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    db_url = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
+    engine = create_db_engine(db_url)
+    db = create_db_session(engine)
+
+    BOT_SUBSTRINGS = [
+        "bot", "crawler", "spider", "slurp", "curl", "wget",
+        "python", "uptimerobot", "facebookexternalhit",
+    ]
+
+    def _is_human(pv):
+        if not pv.visitor_id:
+            return False
+        ua = (pv.user_agent or "").lower()
+        return not any(b in ua for b in BOT_SUBSTRINGS)
+
+    try:
+        now = datetime.now(timezone.utc)
+        seven_days_ago = now - timedelta(days=7)
+        thirty_days_ago = now - timedelta(days=30)
+
+        # Stage 1: Page views (bot-filtered)
+        raw_7d = db.query(PageView).filter(PageView.created_at >= seven_days_ago).all()
+        human_7d = [pv for pv in raw_7d if _is_human(pv)]
+        visitors_7d = len(human_7d)
+        visitors_unique_7d = len(set(pv.visitor_id for pv in human_7d))
+
+        raw_30d = db.query(PageView).filter(PageView.created_at >= thirty_days_ago).all()
+        human_30d = [pv for pv in raw_30d if _is_human(pv)]
+        visitors_30d = len(human_30d)
+        visitors_unique_30d = len(set(pv.visitor_id for pv in human_30d))
+
+        # Stage 2: Signups
+        signups_7d = db.query(sqlfunc.count(User.id)).filter(User.created_at >= seven_days_ago).scalar() or 0
+        signups_30d = db.query(sqlfunc.count(User.id)).filter(User.created_at >= thirty_days_ago).scalar() or 0
+
+        # Stage 3: Scans started
+        scans_7d = db.query(sqlfunc.count(ScanExecution.id)).filter(
+            ScanExecution.created_at >= seven_days_ago,
+        ).scalar() or 0
+        scans_30d = db.query(sqlfunc.count(ScanExecution.id)).filter(
+            ScanExecution.created_at >= thirty_days_ago,
+        ).scalar() or 0
+
+        # Stage 4: Paid conversions
+        PAID_PLANS = ['starter', 'professional', 'enterprise']
+        new_paid_7d = db.query(sqlfunc.count(Tenant.id)).filter(
+            Tenant.first_paid_at >= seven_days_ago,
+        ).scalar() or 0
+        new_paid_30d = db.query(sqlfunc.count(Tenant.id)).filter(
+            Tenant.first_paid_at >= thirty_days_ago,
+        ).scalar() or 0
+
+        # All-time footer
+        active_paid = db.query(sqlfunc.count(Tenant.id)).filter(
+            Tenant.plan.in_(PAID_PLANS),
+        ).scalar() or 0
+        ever_paid = db.query(sqlfunc.count(Tenant.id)).filter(
+            Tenant.first_paid_at.isnot(None),
+        ).scalar() or 0
+        total_users = db.query(sqlfunc.count(User.id)).scalar() or 0
+        total_scans = db.query(sqlfunc.count(ScanExecution.id)).scalar() or 0
+
+        # Build period label
+        period_end = now.strftime("%b %d")
+        period_start = seven_days_ago.strftime("%b %d")
+        period_label = f"Week of {period_start}\u2013{period_end}"
+
+        asyncio.run(notify_funnel_digest(
+            period_label=period_label,
+            visitors_7d=visitors_7d,
+            visitors_unique_7d=visitors_unique_7d,
+            signups_7d=signups_7d,
+            scans_7d=scans_7d,
+            new_paid_7d=new_paid_7d,
+            visitors_30d=visitors_30d,
+            visitors_unique_30d=visitors_unique_30d,
+            signups_30d=signups_30d,
+            scans_30d=scans_30d,
+            new_paid_30d=new_paid_30d,
+            active_paid=active_paid,
+            ever_paid=ever_paid,
+            total_users=total_users,
+            total_scans=total_scans,
+        ))
+        logger.info("Funnel digest sent successfully")
+    except Exception:
+        logger.exception("Failed to send funnel digest")
+    finally:
+        db.close()

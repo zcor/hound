@@ -94,6 +94,7 @@ class Tenant(Base):
     plan = Column(String(50), nullable=False, default="free")  # free, starter, professional, enterprise
     plan_period = Column(String(20), nullable=True)  # monthly, annual
     plan_updated_at = Column(DateTime, nullable=True)
+    first_paid_at = Column(DateTime, nullable=True)  # Set once on first Stripe subscription_created
     scan_credits = Column(Integer, nullable=False, default=0)  # Credit tranche top-ups
     trial_ends_at = Column(DateTime, nullable=True)
     trial_plan = Column(String(50), nullable=True)
@@ -639,6 +640,21 @@ class AnalyticsEvent(Base):
         return f"<AnalyticsEvent(tenant_id={self.tenant_id}, event={self.event})>"
 
 
+class PageView(Base):
+    """Lightweight page view tracking for funnel analytics (anonymous, no tenant)."""
+    __tablename__ = "page_views"
+
+    id = Column(Integer, primary_key=True)
+    path = Column(String(500), nullable=False, index=True)        # e.g., "/", "/welcome", "/pricing"
+    referrer = Column(String(1000), nullable=True)                # document.referrer
+    user_agent = Column(String(500), nullable=True)               # for bot filtering
+    visitor_id = Column(String(64), nullable=True, index=True)    # localStorage-backed anonymous UUID
+    created_at = Column(DateTime, nullable=False, default=func.now(), index=True)
+
+    def __repr__(self):
+        return f"<PageView(path='{self.path}', visitor_id='{self.visitor_id}')>"
+
+
 # Model pricing table (per 1M tokens) - Updated January 2026
 MODEL_PRICING = {
     # OpenAI
@@ -771,6 +787,8 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS user_notes TEXT"))
             # Deep audit curated assessment
             conn.execute(text("ALTER TABLE scan_executions ADD COLUMN IF NOT EXISTS deep_audit_overview JSONB"))
+            # Funnel analytics: first paid conversion timestamp
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS first_paid_at TIMESTAMP"))
 
 
 def init_database(engine):

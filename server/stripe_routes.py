@@ -396,6 +396,8 @@ def _handle_checkout_completed(session, db: Session) -> dict | None:
         tenant.plan = plan
         tenant.plan_period = period
         tenant.plan_updated_at = datetime.now(timezone.utc)
+        if not tenant.first_paid_at:
+            tenant.first_paid_at = datetime.now(timezone.utc)
         if subscription_id:
             tenant.stripe_subscription_id = subscription_id
         if customer_id and not tenant.stripe_customer_id:

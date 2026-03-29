@@ -443,20 +443,29 @@ async def notify_funnel_digest(
 async def notify_stripe_webhook_stale(
     last_event_days_ago: int,
     monthly_paid_count: int,
+    extra_issues: list[str] | None = None,
 ) -> bool:
-    """Alert when Stripe webhooks appear stale with active monthly subscriptions."""
-    message = (
-        "\u26a0\ufe0f <b>Stripe Webhook Stale</b>\n"
-        "\n"
-        f"\U0001f4c5 <b>Last processed event:</b> {last_event_days_ago} days ago\n"
-        f"\U0001f4b3 <b>Monthly paid tenants:</b> {monthly_paid_count}\n"
-        "\n"
-        "Stripe sends periodic events (invoice.upcoming) for active subscriptions. "
-        "No webhook processed in 30+ days with monthly subs is abnormal.\n"
-        "\n"
-        "<b>Check:</b> <code>curl https://api.firepan.com/health/stripe</code>\n"
-        "<b>Dashboard:</b> Stripe \u2192 Developers \u2192 Webhooks \u2192 Deliveries"
-    )
+    """Alert when Stripe webhook health check finds issues."""
+    parts = [
+        "\u26a0\ufe0f <b>Stripe Webhook Health Alert</b>",
+        "",
+        f"\U0001f4c5 <b>Last processed event:</b> {last_event_days_ago} days ago" if last_event_days_ago >= 0 else "\U0001f4c5 <b>Last processed event:</b> unknown",
+        f"\U0001f4b3 <b>Monthly paid tenants:</b> {monthly_paid_count}" if monthly_paid_count >= 0 else "",
+    ]
+
+    if extra_issues:
+        parts.append("")
+        parts.append("<b>Issues:</b>")
+        for issue in extra_issues:
+            parts.append(f"  \u2022 {_escape_html(issue)}")
+
+    parts.extend([
+        "",
+        "<b>Check:</b> <code>curl https://api.firepan.com/health/stripe</code>",
+        "<b>Dashboard:</b> Stripe \u2192 Developers \u2192 Webhooks \u2192 Deliveries",
+    ])
+
+    message = "\n".join(p for p in parts if p is not None)
     return await send_telegram_message(message)
 
 

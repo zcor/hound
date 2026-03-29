@@ -84,8 +84,8 @@ celery_app.conf.beat_schedule = {
         "task": "worker.tasks.send_funnel_digest_task",
         "schedule": crontab(hour=9, minute=0, day_of_week=1),  # Monday 9am UTC
     },
-    "weekly-stripe-health": {
+    "daily-stripe-health": {
         "task": "worker.tasks.check_stripe_webhook_health_task",
-        "schedule": crontab(hour=10, minute=0, day_of_week=1),  # Monday 10am UTC
+        "schedule": crontab(hour=10, minute=0),  # Daily 10am UTC
     },
 }

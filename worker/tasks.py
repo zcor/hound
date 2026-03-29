@@ -1801,59 +1801,71 @@ def send_funnel_digest_task():
 
 @celery_app.task(name="worker.tasks.check_stripe_webhook_health_task")
 def check_stripe_webhook_health_task():
-    """Weekly check: alert if Stripe webhooks appear stale with monthly subs."""
-    from database.models import Tenant, create_db_engine, create_db_session
+    """Weekly check: ping /health/stripe and alert on any issue."""
     from integrations.telegram import notify_stripe_webhook_stale
-    from sqlalchemy import func as sqlfunc, text
+    import httpx
     import logging
 
     logger = logging.getLogger(__name__)
 
+    # Hit the health endpoint — it checks config, probes the webhook, and reports staleness
+    api_base = os.environ.get("API_BASE_URL", "http://api:8000")
+    try:
+        resp = httpx.get(f"{api_base}/health/stripe", timeout=15.0)
+        data = resp.json()
+    except Exception as e:
+        logger.error("Failed to reach /health/stripe: %s", e)
+        asyncio.run(notify_stripe_webhook_stale(
+            last_event_days_ago=-1,
+            monthly_paid_count=-1,
+            extra_issues=["Could not reach /health/stripe endpoint"],
+        ))
+        return
+
+    issues = data.get("issues", [])
+    probe = data.get("webhook_probe", {})
+    config_ok = data.get("config_ok", False)
+    age_days = data.get("last_event_days_ago")
+
+    # Alert if: config bad, probe failed, or stale with monthly subs
+    should_alert = False
+
+    if not config_ok:
+        should_alert = True
+        logger.error("Stripe health: config issues: %s", issues)
+
+    if probe.get("status") != "ok":
+        should_alert = True
+        issues.append(f"Webhook probe: {probe.get('status')} — {probe.get('detail', 'unknown')}")
+        logger.error("Stripe health: webhook probe failed: %s", probe)
+
+    # Staleness check: only if we have monthly paid tenants
+    # Query the DB for monthly paid count (the health endpoint doesn't include this)
+    from database.models import Tenant, create_db_engine, create_db_session
+    from sqlalchemy import func as sqlfunc
     db_url = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
     engine = create_db_engine(db_url)
     db = create_db_session(engine)
-
-    PAID_PLANS = ['starter', 'professional', 'enterprise']
-
     try:
-        # Count monthly paid tenants only — annual subs can go months without events
+        PAID_PLANS = ['starter', 'professional', 'enterprise']
         monthly_paid = db.query(sqlfunc.count(Tenant.id)).filter(
             Tenant.plan.in_(PAID_PLANS),
             Tenant.plan_period == 'monthly',
         ).scalar() or 0
-
-        if monthly_paid == 0:
-            logger.info("No monthly paid tenants — skipping stripe webhook health check")
-            return
-
-        # Get last processed webhook event
-        latest = db.execute(text(
-            "SELECT MAX(processed_at) FROM stripe_processed_events"
-        )).scalar()
-
-        if latest is None:
-            logger.warning("No Stripe webhook events ever processed")
-            asyncio.run(notify_stripe_webhook_stale(
-                last_event_days_ago=-1,
-                monthly_paid_count=monthly_paid,
-            ))
-            return
-
-        now = datetime.now(timezone.utc)
-        age_days = (now - latest).days
-
-        if age_days > 30:
-            logger.warning(
-                "Stripe webhook stale: last event %d days ago, %d monthly paid tenants",
-                age_days, monthly_paid,
-            )
-            asyncio.run(notify_stripe_webhook_stale(
-                last_event_days_ago=age_days,
-                monthly_paid_count=monthly_paid,
-            ))
-        else:
-            logger.info("Stripe webhook health OK: last event %d days ago", age_days)
-    except Exception:
-        logger.exception("Failed to check Stripe webhook health")
     finally:
         db.close()
+
+    if age_days is not None and age_days > 30 and monthly_paid > 0:
+        should_alert = True
+        issues.append(f"Last webhook {age_days} days ago with {monthly_paid} monthly subs")
+        logger.warning("Stripe webhook stale: %d days, %d monthly subs", age_days, monthly_paid)
+
+    if should_alert:
+        asyncio.run(notify_stripe_webhook_stale(
+            last_event_days_ago=age_days if age_days is not None else -1,
+            monthly_paid_count=monthly_paid,
+            extra_issues=issues if issues else None,
+        ))
+    else:
+        logger.info("Stripe webhook health OK: config=%s, probe=%s, age=%s days",
+                     config_ok, probe.get("status"), age_days)

@@ -91,11 +91,38 @@ class AuditTask(Task):
             print(f"Failed to refund scan credit: {e}")
     
     def on_success(self, retval, task_id, args, kwargs):
-        """Handle task success."""
+        """Handle task success — read actual status from DB before publishing."""
         scan_id = kwargs.get('scan_id') or (args[1] if len(args) > 1 else None)
         if scan_id:
+            # Read actual status — task may have set in_review or failed early
+            actual_status = "completed"
+            try:
+                from database.models import AuditSession, ScanExecution
+                db = self.get_db_session()
+                try:
+                    scan = db.query(ScanExecution).filter_by(execution_id=scan_id).first()
+                    if scan:
+                        actual_status = scan.status
+                    else:
+                        session = db.query(AuditSession).filter_by(session_id=scan_id).first()
+                        if session:
+                            actual_status = session.status
+                finally:
+                    db.close()
+            except Exception:
+                pass
+
+            # Don't publish success for scans that already set a terminal status
+            if actual_status == "failed":
+                return
+
+            msg = {
+                "in_review": "Audit complete — results under review",
+                "completed": "Audit completed successfully",
+            }.get(actual_status, f"Audit finished with status: {actual_status}")
+
             publisher = RedisPublisher(scan_id)
-            publisher.publish_status("completed", "Audit completed successfully")
+            publisher.publish_status(actual_status, msg)
             publisher.close()
     
     def _update_scan_status(
@@ -105,33 +132,34 @@ class AuditTask(Task):
         error_message: str | None = None,
         **extra_fields
     ):
-        """Update scan execution status in database."""
+        """Update scan execution status in database.
+
+        Updates BOTH ScanExecution and AuditSession in one transaction.
+        Deep audits have both records; surface scans only have ScanExecution.
+        """
         try:
             from database.models import AuditSession, ScanExecution
-            
+
             db = self.get_db_session()
             try:
-                # Try ScanExecution first (for surface scans)
                 scan = db.query(ScanExecution).filter_by(execution_id=scan_id).first()
                 if scan:
                     scan.status = status
                     if error_message:
                         scan.error_message = error_message
-                    if status == "completed":
+                    if status in ("completed", "in_review"):
                         scan.completed_at = datetime.now(timezone.utc)
                     for key, value in extra_fields.items():
                         if hasattr(scan, key):
                             setattr(scan, key, value)
-                    db.commit()
-                    return
-                
-                # Try AuditSession (for full audits)
+
                 session = db.query(AuditSession).filter_by(session_id=scan_id).first()
                 if session:
                     session.status = status
-                    if status == "completed":
+                    if status in ("completed", "in_review"):
                         session.end_time = datetime.now(timezone.utc)
-                    db.commit()
+
+                db.commit()
             finally:
                 db.close()
         except Exception as e:
@@ -204,6 +232,32 @@ def execute_audit_task(
     if not project_name:
         # Fallback: extract repo name from URL
         project_name = repo_url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") if repo_url else None
+
+    # --- Idempotency guard: skip if already done or partially persisted ---
+    db = self.get_db_session()
+    try:
+        from database.models import ScanExecution
+        scan = db.query(ScanExecution).filter_by(execution_id=scan_id).first()
+        if scan and scan.status in ("completed", "in_review"):
+            print(f"[IDEMPOTENCY] Scan {scan_id} already {scan.status}, skipping redelivered task")
+            return {"status": "already_done", "scan_id": scan_id}
+
+        # Detect partial persistence from a crashed prior run.
+        # Crash window: hypotheses written to DB, but ScanExecution.findings/status
+        # not yet updated. A redelivered task would re-run the full audit.
+        if scan and scan.status == "running" and project_id and scan.started_at:
+            from database.models import Hypothesis
+            orphan_count = db.query(Hypothesis).filter(
+                Hypothesis.project_id == project_id,
+                Hypothesis.created_at >= scan.started_at,
+            ).count()
+            if orphan_count > 0:
+                print(f"[IDEMPOTENCY] Scan {scan_id} has {orphan_count} orphan hypotheses from crashed prior run")
+                self._update_scan_status(scan_id, "failed",
+                    error_message=f"Aborted: {orphan_count} findings from crashed prior run. Manual review needed.")
+                return {"status": "partial_crash", "scan_id": scan_id}
+    finally:
+        db.close()
 
     try:
         # Set token tracking context for cost attribution
@@ -665,21 +719,56 @@ def execute_audit_task(
         print(f"[DEBUG] Full audit completed after {total_iterations} total iterations, {planned_round} rounds")
         print(f"[DEBUG] Investigations completed: {len(completed_investigations)}")
         print(f"[DEBUG] Total hypotheses: {len(all_hypotheses)}")
-        
-        # Deduplicate hypotheses by description (detailed_hypotheses uses 'description' not 'title')
+
+        # --- Curation pipeline: filter → dedup → rerank BEFORE persistence ---
+        raw_count = len(all_hypotheses)
+        audit_config = config or {}
+
+        # Step A: Exact-string dedup (cheap, always run)
         seen_descriptions = set()
         hypotheses = []
         for h in all_hypotheses:
-            # Use description for dedup (title field may not exist in detailed_hypotheses format)
             desc = h.get('description', '') if isinstance(h, dict) else ''
             if desc and desc not in seen_descriptions:
                 seen_descriptions.add(desc)
                 hypotheses.append(h)
-        
-        print(f"[DEBUG] After dedup: {len(hypotheses)} unique hypotheses")
-        
-        # Store hypotheses in database
-        print(f"[DEBUG] Storing {len(hypotheses)} hypotheses to DB for project_id={project_id}")
+        print(f"[DEBUG] After exact dedup: {len(hypotheses)} unique hypotheses")
+
+        # Step B: Filter test contract noise
+        hypotheses = _filter_test_contract_findings(hypotheses)
+        print(f"[DEBUG] After test contract filter: {len(hypotheses)}")
+
+        # Step C: Semantic dedup (LLM)
+        if audit_config.get("deep_audit_semantic_dedup", True) and len(hypotheses) > 5:
+            publisher.publish_thought(
+                f"Running semantic dedup on {len(hypotheses)} findings...",
+                iteration=total_iterations,
+            )
+            hypotheses = _semantic_dedup_hypotheses(hypotheses, audit_config)
+
+        # Step D: Severity re-ranking (LLM)
+        if audit_config.get("deep_audit_severity_rerank", True) and hypotheses:
+            publisher.publish_thought(
+                f"Re-ranking severity for {len(hypotheses)} findings...",
+                iteration=total_iterations,
+            )
+            hypotheses = _rerank_severities(hypotheses, audit_config)
+
+        # Step E: Severity fallback — if >80% uniform with >10 findings, demote low-confidence
+        if len(hypotheses) > 10:
+            from collections import Counter
+            severity_counts = Counter(h.get("severity") for h in hypotheses)
+            dominant_sev, dominant_count = severity_counts.most_common(1)[0]
+            if dominant_count / len(hypotheses) > 0.8:
+                print(f"[DEBUG] Severity fallback: {dominant_count}/{len(hypotheses)} are '{dominant_sev}', demoting low-confidence")
+                for h in hypotheses:
+                    if h.get("confidence", 0.5) < 0.5:
+                        h["severity"] = "low"
+
+        print(f"[DEBUG] Final curated: {len(hypotheses)} findings (from {raw_count} raw)")
+
+        # --- Persist curated hypotheses ---
+        print(f"[DEBUG] Storing {len(hypotheses)} curated hypotheses to DB for project_id={project_id}")
         _store_hypotheses_in_db(
             self.get_db_session,
             project_id,
@@ -687,21 +776,20 @@ def execute_audit_task(
             scan_id,
         )
         print("[DEBUG] Hypothesis storage complete")
-        
+
         # Step 6: Post findings to PR if requested
         pr_result = None
         if installation_id and pr_number and repo_full_name and hypotheses:
             try:
                 from integrations.pr_bot import post_findings_to_pr
-                
-                # Convert hypotheses to findings format
+
                 findings = _convert_hypotheses_to_findings(hypotheses)
-                
+
                 publisher.publish_thought(
                     f"Posting {len(findings)} findings to PR #{pr_number}",
-                    iteration=result.get("iterations", 0)
+                    iteration=total_iterations,
                 )
-                
+
                 pr_result = post_findings_to_pr(
                     installation_id=installation_id,
                     repo_full_name=repo_full_name,
@@ -709,76 +797,75 @@ def execute_audit_task(
                     findings=findings,
                     scan_id=scan_id,
                 )
-                
+
                 publisher.publish_thought(
                     f"PR comments posted: {pr_result.get('inline_comments_posted', 0)} inline, "
                     f"summary: {pr_result.get('summary_posted', False)}",
-                    iteration=result.get("iterations", 0)
+                    iteration=total_iterations,
                 )
             except Exception as pr_err:
                 publisher.publish_thought(
                     f"Failed to post PR comments: {pr_err}",
-                    iteration=result.get("iterations", 0)
+                    iteration=total_iterations,
                 )
-        
-        # Normalize hypotheses into SurfaceFinding-compatible shape for ScanExecution
+
+        # Normalize for ScanExecution storage
         normalized_findings, risk_score, risk_level = _normalize_hypotheses_for_scan(hypotheses)
 
-        # Build curated assessment on a COPY (does not touch stored data)
-        audit_config = config or {}
+        # Build overview from ALREADY-CURATED hypotheses (same data as persisted)
         overview = None
         try:
-            curated = list(hypotheses)  # shallow copy
-
-            if audit_config.get("deep_audit_semantic_dedup", True):
-                publisher.publish_thought(
-                    f"Running semantic dedup on {len(curated)} findings...",
-                    iteration=result.get("iterations", 0)
-                )
-                curated = _semantic_dedup_hypotheses(curated, audit_config)
-
-            if audit_config.get("deep_audit_severity_rerank", True):
-                publisher.publish_thought(
-                    f"Re-ranking severity for {len(curated)} findings...",
-                    iteration=result.get("iterations", 0)
-                )
-                curated = _rerank_severities(curated, audit_config)
-
             overview = _compute_deep_audit_overview(
-                raw_count=len(hypotheses),
-                curated_hypotheses=curated,
+                raw_count=raw_count,
+                curated_hypotheses=hypotheses,
                 config=audit_config,
             )
             print(f"[DEBUG] Deep audit overview: assessment={overview.get('assessment_level')}, "
-                  f"credible={overview.get('credible_findings_count')}/{len(hypotheses)} raw")
+                  f"credible={overview.get('credible_findings_count')}/{raw_count} raw")
         except Exception as e:
             print(f"[DEBUG] Failed to compute deep audit overview: {e}")
             traceback.print_exc()
 
-        # Build summary from overview if available
+        # Build summary
         if overview:
             summary_text = overview.get("headline", f"Deep audit found {len(hypotheses)} potential issues")
         else:
             summary_text = f"Deep audit found {len(hypotheses)} potential issues"
 
-        # Update final status (writes to ScanExecution if present, else AuditSession)
+        # Count contracts from manifest
+        contracts_total = 0
+        try:
+            manifest_files_path = manifest_dir / "files.json"
+            if manifest_files_path.exists():
+                manifest_files = json.loads(manifest_files_path.read_text())
+                contracts_total = len([
+                    f for f in manifest_files
+                    if f.get("relpath", "").endswith((".sol", ".vy"))
+                ])
+                print(f"[DEBUG] Contracts from manifest: {contracts_total}")
+        except Exception as e:
+            print(f"[DEBUG] Failed to count contracts from manifest: {e}")
+
+        # Update status to in_review (human can finalize to completed)
         update_fields = dict(
             findings=normalized_findings,
             summary=summary_text,
             risk_score=risk_score,
             risk_level=risk_level,
+            contracts_scanned=contracts_total,
+            contracts_total=contracts_total,
         )
         if overview:
             update_fields["deep_audit_overview"] = overview
 
-        self._update_scan_status(scan_id, "completed", **update_fields)
+        self._update_scan_status(scan_id, "in_review", **update_fields)
 
-        # Send Telegram notification for deep audit completion (fire-and-forget)
+        # Send Telegram notification (fire-and-forget)
         try:
             assessment = overview.get("assessment_level") if overview else None
             asyncio.run(notify_deep_audit_completed(
                 repo_url=repo_url, session_id=scan_id, tenant_id=tenant_id,
-                status="completed", findings_count=len(hypotheses),
+                status="in_review", findings_count=len(hypotheses),
                 risk_level=risk_level, risk_score=risk_score,
                 assessment_level=assessment,
                 project_name=project_name,
@@ -786,8 +873,28 @@ def execute_audit_task(
         except Exception:
             pass  # non-critical
 
+        # Send email notification if tenant has contact_email
+        try:
+            from database.models import Tenant
+            _db = self.get_db_session()
+            try:
+                _tenant = _db.query(Tenant).filter(Tenant.id == tenant_id).first()
+                if _tenant and _tenant.contact_email:
+                    from integrations.email import send_audit_complete_email
+                    asyncio.run(send_audit_complete_email(
+                        to_email=_tenant.contact_email,
+                        project_name=project_name or "your repository",
+                        findings_count=len(hypotheses),
+                        assessment_level=assessment,
+                        session_id=scan_id,
+                    ))
+            finally:
+                _db.close()
+        except Exception as e:
+            print(f"[DEBUG] Email notification failed (non-critical): {e}")
+
         publisher.publish_status(
-            "completed",
+            "in_review",
             f"Audit complete. Found {len(hypotheses)} potential vulnerabilities."
         )
 
@@ -996,6 +1103,24 @@ def execute_scan_task(
         clear_token_context()
 
 
+KNOWN_TEST_CONTRACTS = {"MockHook", "MockERC20", "MockToken", "TestHelper", "MockOracle"}
+
+
+def _filter_test_contract_findings(hypotheses: list) -> list:
+    """Remove findings about known test/mock contracts."""
+    def _is_test_finding(h):
+        desc = h.get("description", "")
+        title = h.get("title", "")
+        text = f"{title} {desc}"
+        return any(tc in text for tc in KNOWN_TEST_CONTRACTS)
+
+    filtered = [h for h in hypotheses if not _is_test_finding(h)]
+    removed = len(hypotheses) - len(filtered)
+    if removed:
+        print(f"[test_filter] Removed {removed} test contract findings")
+    return filtered
+
+
 def _store_hypotheses_in_db(
     get_db_session,
     project_id: int | None,
@@ -1091,8 +1216,9 @@ def _semantic_dedup_hypotheses(hypotheses: list, config: dict | None = None) -> 
             match = re.search(r'\{[\s\S]*"keep"[\s\S]*\}', text)
             if match:
                 result = json.loads(match.group())
+                max_valid = offset + len(batch)
                 return {idx for idx in result.get("keep", [])
-                        if isinstance(idx, int) and 0 <= idx < len(hypotheses)}
+                        if isinstance(idx, int) and offset <= idx < max_valid}
         except Exception as e:
             print(f"[deep_audit_dedup] LLM dedup failed: {e}")
 
@@ -1869,3 +1995,46 @@ def check_stripe_webhook_health_task():
     else:
         logger.info("Stripe webhook health OK: config=%s, probe=%s, age=%s days",
                      config_ok, probe.get("status"), age_days)
+
+
+@celery_app.task(name="worker.tasks.auto_finalize_reviews_task")
+def auto_finalize_reviews_task():
+    """Auto-finalize in_review scans older than 24 hours."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    from database.models import AuditSession, ScanExecution, create_db_engine, create_db_session
+
+    db_url = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
+    engine = create_db_engine(db_url)
+    db = create_db_session(engine)
+
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        stale = db.query(ScanExecution).filter(
+            ScanExecution.status == "in_review",
+            ScanExecution.completed_at < cutoff,
+        ).all()
+
+        if not stale:
+            logger.info("auto_finalize: no stale in_review scans")
+            return
+
+        scan_ids = []
+        for scan in stale:
+            scan.status = "completed"
+            scan_ids.append(scan.execution_id)
+
+        if scan_ids:
+            db.query(AuditSession).filter(
+                AuditSession.session_id.in_(scan_ids),
+            ).update({"status": "completed"}, synchronize_session="fetch")
+
+        db.commit()
+        logger.info("auto_finalize: finalized %d scans: %s", len(scan_ids), scan_ids)
+    except Exception:
+        logger.exception("auto_finalize: failed")
+        db.rollback()
+    finally:
+        db.close()

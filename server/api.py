@@ -4982,6 +4982,11 @@ class UserProfileResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class UserProfileUpdateRequest(BaseModel):
+    """Request model for updating user profile."""
+    email: str | None = None
+
+
 class OrganizationResponse(BaseModel):
     """Response model for organization details."""
     id: int
@@ -5178,6 +5183,35 @@ async def get_current_user_profile(
         org_type=tenant.github_account_type or "User",
         role="admin",  # In current model, installation owner is admin
     )
+
+
+@app.patch("/users/me")
+async def update_user_profile(
+    body: UserProfileUpdateRequest,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+    _: None = Depends(reject_preview_writes),
+):
+    """Update current user profile (contact email)."""
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="User not found")
+    was_empty = not tenant.contact_email
+    if body.email is not None:
+        tenant.contact_email = body.email
+    db.commit()
+    # Notify team when a user first provides contact email
+    if was_empty and tenant.contact_email:
+        try:
+            from integrations.telegram import notify_contact_captured
+            await notify_contact_captured(
+                tenant_id=tenant_id,
+                tenant_name=tenant.github_account_login or tenant.name,
+                email=tenant.contact_email,
+            )
+        except Exception:
+            pass
+    return {"email": tenant.contact_email}
 
 
 @app.get("/organizations/{org_id}", response_model=OrganizationResponse)
@@ -5427,7 +5461,7 @@ def _latest_scan_by_type(db: Session, project_id: int, scan_type: str):
     """
     scans = db.query(ScanExecution).filter(
         ScanExecution.project_id == project_id,
-        ScanExecution.status == "completed",
+        ScanExecution.status.in_(["completed", "in_review"]),
         ScanExecution.findings.isnot(None),
     ).order_by(ScanExecution.created_at.desc()).all()
 
@@ -8124,6 +8158,38 @@ async def delete_surface_scan(
     db.commit()
     
     return {"status": "deleted", "execution_id": execution_id}
+
+
+@app.post("/surface/scans/{execution_id}/finalize")
+async def finalize_scan(
+    execution_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Finalize an in_review scan to completed. Admin only."""
+    if not _verify_explicit_admin_header(request):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    scan = db.query(ScanExecution).filter(
+        ScanExecution.execution_id == execution_id,
+    ).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    if scan.status != "in_review":
+        raise HTTPException(status_code=400, detail=f"Cannot finalize: status is {scan.status}")
+    scan.status = "completed"
+    session = db.query(AuditSession).filter_by(session_id=execution_id).first()
+    if session:
+        session.status = "completed"
+    db.commit()
+    # Publish WebSocket event for live UI update
+    try:
+        from worker.redis_publisher import RedisPublisher
+        publisher = RedisPublisher(execution_id)
+        publisher.publish_status("completed", "Audit finalized")
+        publisher.close()
+    except Exception:
+        pass
+    return {"status": "completed", "execution_id": execution_id}
 
 
 @app.get("/surface/stats")

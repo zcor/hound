@@ -356,7 +356,7 @@ async def notify_deep_audit_completed(
     """
     repo_display = f'<a href="{_escape_html(repo_url)}">{_escape_html(repo_url)}</a>' if repo_url.startswith("http") else _escape_html(repo_url)
 
-    if status == "completed":
+    if status in ("completed", "in_review"):
         header = "✅ <b>Deep Audit Complete</b>"
     else:
         header = "❌ <b>Deep Audit Failed</b>"
@@ -370,7 +370,7 @@ async def notify_deep_audit_completed(
     if project_name:
         message_parts.append(f"📋 <b>Project:</b> {_escape_html(project_name)}")
 
-    if status == "completed":
+    if status in ("completed", "in_review"):
         if findings_count is not None:
             message_parts.append(f"🔍 <b>Findings:</b> {findings_count}")
 
@@ -466,6 +466,23 @@ async def notify_stripe_webhook_stale(
     ])
 
     message = "\n".join(p for p in parts if p is not None)
+    return await send_telegram_message(message)
+
+
+async def notify_contact_captured(
+    tenant_id: int,
+    tenant_name: str,
+    email: str,
+) -> bool:
+    """Notify team when a user provides their contact email for the first time."""
+    message_parts = [
+        "📧 <b>Contact Email Captured!</b>",
+        "",
+        f"🆔 <b>Tenant ID:</b> {tenant_id}",
+        f"👤 <b>Account:</b> {_escape_html(tenant_name)}",
+        f"📧 <b>Email:</b> {_escape_html(email)}",
+    ]
+    message = "\n".join(message_parts)
     return await send_telegram_message(message)
 
 

@@ -50,6 +50,13 @@ celery_app.conf.update(
     # Task time limits (audits can run for hours)
     task_soft_time_limit=3600 * 6,  # 6 hours soft limit
     task_time_limit=3600 * 8,  # 8 hours hard limit
+
+    # Redis visibility timeout — must match task_time_limit so Redis doesn't
+    # redeliver long-running deep audits while still in progress.
+    # Tradeoff: crash recovery takes up to 8hr instead of default 1hr.
+    broker_transport_options={
+        'visibility_timeout': 3600 * 8,
+    },
     
     # Result settings
     result_expires=86400,  # Results expire after 24 hours
@@ -87,5 +94,9 @@ celery_app.conf.beat_schedule = {
     "daily-stripe-health": {
         "task": "worker.tasks.check_stripe_webhook_health_task",
         "schedule": crontab(hour=10, minute=0),  # Daily 10am UTC
+    },
+    "auto-finalize-reviews": {
+        "task": "worker.tasks.auto_finalize_reviews_task",
+        "schedule": crontab(hour="*/6", minute=15),  # Every 6 hours
     },
 }

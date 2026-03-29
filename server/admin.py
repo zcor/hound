@@ -449,10 +449,10 @@ class ProjectAdmin(ModelView, model=Project):
                         if not project:
                             continue
                         
-                        # Find most recent completed audit session for this project
+                        # Find most recent completed/in_review audit session for this project
                         latest_session = db.query(AuditSession).filter(
                             AuditSession.project_id == project.id,
-                            AuditSession.status == "completed"
+                            AuditSession.status.in_(["completed", "in_review"])
                         ).order_by(AuditSession.start_time.desc()).first()
                         
                         if not latest_session:
@@ -1425,10 +1425,10 @@ class HypothesisAdmin(ModelView, model=Hypothesis):
                 )
             
             
-            # Find most recent completed audit session
+            # Find most recent completed/in_review audit session
             latest_session = db.query(AuditSession).filter(
                 AuditSession.project_id == project_id,
-                AuditSession.status == "completed"
+                AuditSession.status.in_(["completed", "in_review"])
             ).order_by(AuditSession.start_time.desc()).first()
             
             if not latest_session:

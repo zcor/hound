@@ -252,9 +252,12 @@ def execute_audit_task(
                 Hypothesis.created_at >= scan.started_at,
             ).count()
             if orphan_count > 0:
+                error_msg = f"Aborted: {orphan_count} findings from crashed prior run. Manual review needed."
                 print(f"[IDEMPOTENCY] Scan {scan_id} has {orphan_count} orphan hypotheses from crashed prior run")
-                self._update_scan_status(scan_id, "failed",
-                    error_message=f"Aborted: {orphan_count} findings from crashed prior run. Manual review needed.")
+                self._update_scan_status(scan_id, "failed", error_message=error_msg)
+                # Publish terminal event so WebSocket/polling consumers see the failure
+                publisher.publish_status("failed", error_msg)
+                publisher.close()
                 return {"status": "partial_crash", "scan_id": scan_id}
     finally:
         db.close()

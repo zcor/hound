@@ -93,6 +93,16 @@ def test_health_stripe_reports_config(client):
     assert "config_ok" in data
     assert "issues" in data
     assert "last_event_processed" in data
+    assert "webhook_probe" in data
+
+
+def test_health_stripe_probe_verifies_endpoint(client):
+    """Webhook probe confirms the endpoint is mounted and checking signatures."""
+    response = client.get("/health/stripe")
+    data = response.json()
+    probe = data["webhook_probe"]
+    assert probe["status"] == "ok"
+    assert "signature" in probe["detail"].lower()
 
 
 def test_health_stripe_shows_no_events(client):

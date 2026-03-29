@@ -9352,9 +9352,34 @@ async def stripe_webhook_health(db: Session = Depends(get_db)):
         if latest.tzinfo is None:
             latest = latest.replace(tzinfo=timezone.utc)
 
+    # Live probe: POST to the webhook endpoint with a dummy payload.
+    # A healthy webhook returns 400 "Invalid Stripe signature" (signature check active).
+    # Anything else (404, 500, crash) means the endpoint is broken.
+    webhook_probe = {"status": "unknown", "detail": "not tested"}
+    try:
+        from starlette.testclient import TestClient
+        probe_client = TestClient(app, raise_server_exceptions=False)
+        probe_resp = probe_client.post(
+            "/webhooks/stripe",
+            content=b'{"type":"health_probe"}',
+            headers={"Content-Type": "application/json", "Stripe-Signature": "t=0,v1=probe"},
+        )
+        if probe_resp.status_code == 400 and "signature" in probe_resp.text.lower():
+            webhook_probe = {"status": "ok", "detail": "Signature verification active"}
+        else:
+            webhook_probe = {
+                "status": "error",
+                "detail": f"Unexpected response: {probe_resp.status_code} {probe_resp.text[:200]}",
+            }
+            issues.append(f"Webhook probe returned {probe_resp.status_code} instead of 400")
+    except Exception as e:
+        webhook_probe = {"status": "error", "detail": str(e)[:200]}
+        issues.append(f"Webhook probe failed: {e}")
+
     result = {
         "config_ok": len(issues) == 0,
         "issues": issues,
+        "webhook_probe": webhook_probe,
         "last_event_processed": latest.isoformat() if latest else None,
     }
 

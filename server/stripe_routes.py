@@ -30,6 +30,20 @@ logger = logging.getLogger(__name__)
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
+if not STRIPE_SECRET_KEY:
+    logger.critical(
+        "STRIPE_SECRET_KEY is empty — ALL outgoing Stripe API calls will fail. "
+        "Billing checkout, portal, and plan queries are broken. "
+        "Set in docker-compose.yml AND .env."
+    )
+if not STRIPE_WEBHOOK_SECRET:
+    logger.critical(
+        "STRIPE_WEBHOOK_SECRET is empty — ALL Stripe webhooks will fail "
+        "signature verification (400). Subscription events, payment notifications, "
+        "and invoice updates will be silently dropped. "
+        "Set in docker-compose.yml AND .env."
+    )
+
 if STRIPE_SECRET_KEY.startswith("sk_live_") and os.environ.get("STRIPE_LIVE_CONFIRMED") != "true":
     raise RuntimeError(
         "STRIPE_SECRET_KEY is a live key but STRIPE_LIVE_CONFIRMED is not set. "

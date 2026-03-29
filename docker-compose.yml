@@ -71,6 +71,8 @@ services:
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
       HOUND_ALLOWED_ORIGINS: ${HOUND_ALLOWED_ORIGINS:-http://localhost:3000}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-secret-change-in-production}
+      # Token encryption for GitHub OAuth tokens
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-}
       # Google OAuth
       GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
       GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}

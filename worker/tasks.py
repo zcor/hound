@@ -1797,3 +1797,63 @@ def send_funnel_digest_task():
         logger.exception("Failed to send funnel digest")
     finally:
         db.close()
+
+
+@celery_app.task(name="worker.tasks.check_stripe_webhook_health_task")
+def check_stripe_webhook_health_task():
+    """Weekly check: alert if Stripe webhooks appear stale with monthly subs."""
+    from database.models import Tenant, create_db_engine, create_db_session
+    from integrations.telegram import notify_stripe_webhook_stale
+    from sqlalchemy import func as sqlfunc, text
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    db_url = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
+    engine = create_db_engine(db_url)
+    db = create_db_session(engine)
+
+    PAID_PLANS = ['starter', 'professional', 'enterprise']
+
+    try:
+        # Count monthly paid tenants only — annual subs can go months without events
+        monthly_paid = db.query(sqlfunc.count(Tenant.id)).filter(
+            Tenant.plan.in_(PAID_PLANS),
+            Tenant.plan_period == 'monthly',
+        ).scalar() or 0
+
+        if monthly_paid == 0:
+            logger.info("No monthly paid tenants — skipping stripe webhook health check")
+            return
+
+        # Get last processed webhook event
+        latest = db.execute(text(
+            "SELECT MAX(processed_at) FROM stripe_processed_events"
+        )).scalar()
+
+        if latest is None:
+            logger.warning("No Stripe webhook events ever processed")
+            asyncio.run(notify_stripe_webhook_stale(
+                last_event_days_ago=-1,
+                monthly_paid_count=monthly_paid,
+            ))
+            return
+
+        now = datetime.now(timezone.utc)
+        age_days = (now - latest).days
+
+        if age_days > 30:
+            logger.warning(
+                "Stripe webhook stale: last event %d days ago, %d monthly paid tenants",
+                age_days, monthly_paid,
+            )
+            asyncio.run(notify_stripe_webhook_stale(
+                last_event_days_ago=age_days,
+                monthly_paid_count=monthly_paid,
+            ))
+        else:
+            logger.info("Stripe webhook health OK: last event %d days ago", age_days)
+    except Exception:
+        logger.exception("Failed to check Stripe webhook health")
+    finally:
+        db.close()

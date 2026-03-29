@@ -440,6 +440,26 @@ async def notify_funnel_digest(
     return await send_telegram_message(message)
 
 
+async def notify_stripe_webhook_stale(
+    last_event_days_ago: int,
+    monthly_paid_count: int,
+) -> bool:
+    """Alert when Stripe webhooks appear stale with active monthly subscriptions."""
+    message = (
+        "\u26a0\ufe0f <b>Stripe Webhook Stale</b>\n"
+        "\n"
+        f"\U0001f4c5 <b>Last processed event:</b> {last_event_days_ago} days ago\n"
+        f"\U0001f4b3 <b>Monthly paid tenants:</b> {monthly_paid_count}\n"
+        "\n"
+        "Stripe sends periodic events (invoice.upcoming) for active subscriptions. "
+        "No webhook processed in 30+ days with monthly subs is abnormal.\n"
+        "\n"
+        "<b>Check:</b> <code>curl https://api.firepan.com/health/stripe</code>\n"
+        "<b>Dashboard:</b> Stripe \u2192 Developers \u2192 Webhooks \u2192 Deliveries"
+    )
+    return await send_telegram_message(message)
+
+
 def _escape_html(text: str) -> str:
     """Escape HTML special characters for Telegram HTML parse mode."""
     return (

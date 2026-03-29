@@ -9326,6 +9326,45 @@ async def track_page_view(request: Request, db: Session = Depends(get_db)):
     return Response(status_code=204)
 
 
+# Stripe webhook health check
+@app.get("/health/stripe")
+async def stripe_webhook_health(db: Session = Depends(get_db)):
+    """Check Stripe webhook configuration and last processed event."""
+    from server.stripe_routes import STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET
+
+    issues = []
+    if not STRIPE_WEBHOOK_SECRET:
+        issues.append("STRIPE_WEBHOOK_SECRET not configured")
+    if not STRIPE_SECRET_KEY:
+        issues.append("STRIPE_SECRET_KEY not configured")
+
+    raw_latest = db.execute(text(
+        "SELECT MAX(processed_at) FROM stripe_processed_events"
+    )).scalar()
+
+    # Parse timestamp — Postgres returns datetime, SQLite returns string
+    latest = None
+    if raw_latest is not None:
+        if isinstance(raw_latest, str):
+            latest = datetime.fromisoformat(raw_latest)
+        else:
+            latest = raw_latest
+        if latest.tzinfo is None:
+            latest = latest.replace(tzinfo=timezone.utc)
+
+    result = {
+        "config_ok": len(issues) == 0,
+        "issues": issues,
+        "last_event_processed": latest.isoformat() if latest else None,
+    }
+
+    if latest:
+        age_days = (datetime.now(timezone.utc) - latest).days
+        result["last_event_days_ago"] = age_days
+
+    return result
+
+
 # Health check endpoint
 @app.get("/health")
 async def health_check():

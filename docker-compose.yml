@@ -96,8 +96,11 @@ services:
       STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_LIVE_CONFIRMED: ${STRIPE_LIVE_CONFIRMED:-}
+      # Hound Config
+      HOUND_CONFIG: ${HOUND_CONFIG:-}
     volumes:
       - ./secrets:/secrets:ro
+      - ./config.yaml:/config/config.yaml:ro
     depends_on:
       db:
         condition: service_healthy
@@ -148,6 +151,8 @@ services:
       # Telegram Notifications (needed for funnel digest task)
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
     depends_on:
       db:
         condition: service_healthy

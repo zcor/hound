@@ -558,6 +558,16 @@ async def google_callback(
         user.google_avatar_url = google_avatar
         if google_email and not user.email:
             user.email = google_email
+
+        # Auto-verify tenant email if safe (blank or matches Google email)
+        if google_email and user.tenant_id:
+            tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+            if tenant and not tenant.email_verified:
+                if not tenant.contact_email or tenant.contact_email.lower() == google_email.lower():
+                    tenant.contact_email = google_email
+                    tenant.email_verified = True
+                    tenant.email_verified_at = datetime.now(timezone.utc)
+
         _log_oauth_event(db, user.id, "login", "google", google_id, request)
         db.commit()
         db.refresh(user)
@@ -599,6 +609,8 @@ async def google_callback(
             name=tenant_name,
             contact_email=google_email,
             status="active",
+            email_verified=True,
+            email_verified_at=datetime.now(timezone.utc),
         )
         db.add(tenant)
         db.flush()
@@ -822,12 +834,22 @@ async def link_google(
         raise HTTPException(404, "User not found")
 
     user.google_id = google_id
-    user.google_email = google_user.get("email")
+    google_email = google_user.get("email")
+    user.google_email = google_email
     user.google_name = google_user.get("name")
     user.google_avatar_url = google_user.get("picture")
     user.google_connected_at = datetime.now(timezone.utc)
-    if not user.email and google_user.get("email"):
-        user.email = google_user["email"]
+    if not user.email and google_email:
+        user.email = google_email
+
+    # Auto-verify tenant email if safe (blank or matches Google email)
+    if google_email and user.tenant_id:
+        tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+        if tenant and not tenant.email_verified:
+            if not tenant.contact_email or tenant.contact_email.lower() == google_email.lower():
+                tenant.contact_email = google_email
+                tenant.email_verified = True
+                tenant.email_verified_at = datetime.now(timezone.utc)
 
     _log_oauth_event(db, user.id, "link", "google", google_id, request)
     db.commit()

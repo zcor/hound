@@ -2,11 +2,14 @@
 Centralized configuration loading utility.
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def get_default_config() -> dict[str, Any]:
@@ -197,40 +200,49 @@ def load_config(config_path: Path | None = None) -> dict[str, Any]:
     6. Auto-generated default config based on environment variables
     """
     
+    def _log_loaded(source: str, config: dict) -> dict:
+        models = config.get("models", {})
+        model_summary = {k: f"{v.get('provider', '?')}/{v.get('model', '?')}" for k, v in models.items() if isinstance(v, dict)}
+        logger.info("Config loaded from %s — models: %s", source, model_summary)
+        return config
+
     # If explicit path provided, use it
     if config_path and config_path.exists():
         with open(config_path) as f:
-            return yaml.safe_load(f) or {}
-    
+            return _log_loaded(f"explicit path: {config_path}", yaml.safe_load(f) or {})
+
     # Check environment variable
     if os.environ.get('HOUND_CONFIG'):
         env_config = Path(os.environ['HOUND_CONFIG'])
         if env_config.exists():
             with open(env_config) as f:
-                return yaml.safe_load(f) or {}
-    
+                return _log_loaded(f"HOUND_CONFIG={env_config}", yaml.safe_load(f) or {})
+        else:
+            logger.warning("HOUND_CONFIG=%s set but file does not exist", env_config)
+
     # Try current directory
     cwd_config = Path.cwd() / "config.yaml"
     if cwd_config.exists():
         with open(cwd_config) as f:
-            return yaml.safe_load(f) or {}
-    
+            return _log_loaded(f"cwd: {cwd_config}", yaml.safe_load(f) or {})
+
     # Try hound directory (where this module lives)
     hound_dir = Path(__file__).parent.parent
-    
+
     # Try config.yaml in hound directory
     hound_config = hound_dir / "config.yaml"
     if hound_config.exists():
         with open(hound_config) as f:
-            return yaml.safe_load(f) or {}
-    
+            return _log_loaded(f"hound dir: {hound_config}", yaml.safe_load(f) or {})
+
     # Fallback to example config (try both naming conventions)
     for example_name in ["config.example.yaml", "config.yaml.example"]:
         example_config = hound_dir / example_name
         if example_config.exists():
             with open(example_config) as f:
-                return yaml.safe_load(f) or {}
-    
+                return _log_loaded(f"example: {example_config}", yaml.safe_load(f) or {})
+
     # Last resort: generate default config from environment variables
     # This allows Docker/cloud deployments to work without a config file
-    return get_default_config()
+    logger.warning("No config.yaml found — generating default config from env vars")
+    return _log_loaded("auto-generated from env vars", get_default_config())

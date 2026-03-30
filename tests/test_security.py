@@ -96,7 +96,7 @@ def admin_key(monkeypatch):
 @pytest.fixture
 def tenant_a(test_db):
     """Create tenant A for isolation tests."""
-    tenant = Tenant(name="tenant_a")
+    tenant = Tenant(name="tenant_a", email_verified=True)
     test_db.add(tenant)
     test_db.commit()
     test_db.refresh(tenant)
@@ -106,7 +106,7 @@ def tenant_a(test_db):
 @pytest.fixture
 def tenant_b(test_db):
     """Create tenant B for isolation tests."""
-    tenant = Tenant(name="tenant_b")
+    tenant = Tenant(name="tenant_b", email_verified=True)
     test_db.add(tenant)
     test_db.commit()
     test_db.refresh(tenant)

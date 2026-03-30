@@ -113,7 +113,7 @@ def client(test_db):
 @pytest.fixture
 def sample_tenant(test_db):
     """Create a sample tenant for testing."""
-    tenant = Tenant(name="test_tenant")
+    tenant = Tenant(name="test_tenant", email_verified=True)
     test_db.add(tenant)
     test_db.commit()
     test_db.refresh(tenant)
@@ -576,9 +576,9 @@ def test_github_webhook_push_event(client):
 # ============================================================================
 
 
-def test_get_current_user(client, sample_tenant):
+def test_get_current_user(client, sample_tenant, github_user):
     """Test getting current user profile."""
-    token = create_access_token({"tenant_id": sample_tenant.id, "user_id": sample_tenant.id, "github_login": "test"})
+    token = create_access_token({"tenant_id": sample_tenant.id, "user_id": github_user.id, "github_login": "test"})
     response = client.get("/users/me", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     data = response.json()
@@ -586,6 +586,7 @@ def test_get_current_user(client, sample_tenant):
     assert data["org_id"] == sample_tenant.id
     assert data["name"] == sample_tenant.name
     assert data["role"] == "admin"
+    assert "suggested_email" in data
 
 
 def test_get_current_user_not_found(client):
@@ -689,6 +690,44 @@ def test_get_current_subscription_not_found(client, test_db):
     token = create_access_token({"tenant_id": 999, "user_id": 999, "github_login": "ghost"})
     response = client.get("/subscriptions/current", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 404
+
+
+def test_email_verification_gate_blocks_unverified(client, test_db):
+    """Test that gated endpoints return 403 for unverified tenants."""
+    unverified = Tenant(name="unverified_tenant", email_verified=False)
+    test_db.add(unverified)
+    test_db.commit()
+    test_db.refresh(unverified)
+    token = create_access_token({"tenant_id": unverified.id, "user_id": unverified.id})
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # These endpoints require verified email
+    gated = [
+        ("GET", "/findings"),
+        ("GET", "/findings/stats"),
+    ]
+    for method, path in gated:
+        response = client.request(method, path, headers=headers)
+        assert response.status_code == 403, f"{method} {path} should be gated"
+        detail = response.json().get("detail", {})
+        assert detail.get("error") == "email_not_verified"
+
+
+def test_email_verification_gate_allows_verified(client, sample_tenant):
+    """Test that gated endpoints pass through for verified tenants."""
+    # sample_tenant has email_verified=True
+    response = client.get("/findings", headers=auth_headers(sample_tenant))
+    # Should not be 403 (may be 200 with empty list)
+    assert response.status_code != 403
+
+
+def test_subscription_includes_email_verified(client, sample_tenant):
+    """Test that subscription response includes email_verified field."""
+    response = client.get("/subscriptions/current", headers=auth_headers(sample_tenant))
+    assert response.status_code == 200
+    data = response.json()
+    assert "email_verified" in data
+    assert data["email_verified"] is True
 
 
 def test_get_current_month_usage(client, sample_tenant, test_db):

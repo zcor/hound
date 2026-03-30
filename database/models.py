@@ -99,6 +99,10 @@ class Tenant(Base):
     trial_ends_at = Column(DateTime, nullable=True)
     trial_plan = Column(String(50), nullable=True)
 
+    # Email verification gate
+    email_verified = Column(Boolean, nullable=False, default=False)
+    email_verified_at = Column(DateTime, nullable=True)
+
     # Relationships
     projects = relationship("Project", back_populates="tenant", cascade="all, delete-orphan")
     scan_executions = relationship("ScanExecution", back_populates="tenant", cascade="all, delete-orphan")
@@ -789,6 +793,9 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE scan_executions ADD COLUMN IF NOT EXISTS deep_audit_overview JSONB"))
             # Funnel analytics: first paid conversion timestamp
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS first_paid_at TIMESTAMP"))
+            # Email verification gate
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE"))
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMP WITH TIME ZONE"))
 
 
 def init_database(engine):

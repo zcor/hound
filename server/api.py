@@ -335,7 +335,6 @@ from server.x402_routes import router as x402_router  # noqa: E402
 
 app.include_router(x402_router)
 
-
 # Redirect for URL compatibility - auditsession -> audit-session
 from starlette.responses import RedirectResponse as StarletteRedirect  # noqa: E402
 
@@ -491,6 +490,16 @@ async def require_github_linked(request: Request, db: Session = Depends(get_db))
             headers={"X-Requires-Github": "true"},
         )
     return user
+
+
+# =============================================================================
+# EMAIL VERIFICATION GATE — require verified email for analysis endpoints
+# =============================================================================
+
+from server.email_verification import mount_email_routes, _make_require_verified_email  # noqa: E402
+
+mount_email_routes(app)
+require_verified_email = _make_require_verified_email(get_current_tenant_id)
 
 
 # =============================================================================
@@ -2935,6 +2944,7 @@ async def start_audit(
     db: Session = Depends(get_db),
     tenant_id: int = Depends(get_current_tenant_id),
     _: None = Depends(reject_preview_writes),
+    __: None = Depends(require_verified_email),
 ):
     """
     Start a new security audit (async, returns immediately).
@@ -3099,6 +3109,7 @@ async def get_audit_status(
     session_id: str,
     tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
+    _: None = Depends(require_verified_email),
 ):
     """
     Get the current status of an audit.
@@ -4701,6 +4712,7 @@ async def get_session_findings(
     session_id: str,
     tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
+    _: None = Depends(require_verified_email),
 ):
     """
     Return the list of confirmed hypotheses (findings).
@@ -4978,6 +4990,7 @@ class UserProfileResponse(BaseModel):
     org_name: str
     org_type: str  # "User" or "Organization"
     role: str = "member"  # For future role-based access control
+    suggested_email: str | None = None  # Best-guess email for verification pre-fill
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -5027,6 +5040,8 @@ class SubscriptionResponse(BaseModel):
     trial_ends_at: datetime | None = None
     trial_plan: str | None = None
     is_trial: bool = False
+    email_verified: bool = False
+    contact_email: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -5161,19 +5176,22 @@ class FindingListResponse(BaseModel):
 
 @app.get("/users/me", response_model=UserProfileResponse)
 async def get_current_user_profile(
-    tenant_id: int = Depends(get_current_tenant_id),
-    db: Session = Depends(get_db)
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
     Get current user profile from JWT token.
-    
+
     Returns user information including organization details.
     Requires JWT authentication via Authorization header.
     """
-    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
     if not tenant:
         raise HTTPException(status_code=404, detail="User/Organization not found")
-    
+
+    # Best-guess email for verification dialog pre-fill
+    suggested = user.email or getattr(user, "google_email", None) or None
+
     return UserProfileResponse(
         id=tenant.id,
         name=tenant.github_account_login or tenant.name,
@@ -5182,6 +5200,7 @@ async def get_current_user_profile(
         org_name=tenant.name,
         org_type=tenant.github_account_type or "User",
         role="admin",  # In current model, installation owner is admin
+        suggested_email=suggested,
     )
 
 
@@ -5198,7 +5217,12 @@ async def update_user_profile(
         raise HTTPException(status_code=404, detail="User not found")
     was_empty = not tenant.contact_email
     if body.email is not None:
-        tenant.contact_email = body.email
+        new_email = body.email.strip()
+        # If email changed, reset verification
+        if new_email.lower() != (tenant.contact_email or "").lower():
+            tenant.email_verified = False
+            tenant.email_verified_at = None
+        tenant.contact_email = new_email
     db.commit()
     # Notify team when a user first provides contact email
     if was_empty and tenant.contact_email:
@@ -5346,6 +5370,8 @@ async def get_current_subscription(
         trial_ends_at=tenant.trial_ends_at,
         trial_plan=tenant.trial_plan,
         is_trial=is_trial,
+        email_verified=tenant.email_verified if tenant.email_verified is not None else False,
+        contact_email=tenant.contact_email,
     )
 
 
@@ -5516,41 +5542,46 @@ async def list_repositories(
 ):
     """
     List all connected GitHub repositories for tenant/user.
-    
+
     Returns paginated list of repositories (projects) with scan statistics.
+    Redacts scan stats for unverified tenants.
     """
+    # Check email verification for stats redaction
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    verified = tenant.email_verified if tenant else False
+
     query = db.query(Project).filter(
         Project.tenant_id == tenant_id,
         Project.status != "removed",
     )
-    
+
     # Apply search filter
     if search:
         query = query.filter(Project.name.ilike(f"%{search}%"))
-    
+
     # Get total count
     total = query.count()
-    
+
     # Apply pagination
     offset = (page - 1) * page_size
     projects = query.order_by(Project.created_at.desc()).offset(offset).limit(page_size).all()
-    
+
     # Build response with statistics
     repositories = []
     for project in projects:
-        # Get last scan time from scan_executions
-        last_scan = db.query(ScanExecution).filter(
-            ScanExecution.project_id == project.id
-        ).order_by(ScanExecution.created_at.desc()).first()
-        
-        last_scan_at = last_scan.created_at if last_scan else None
-        
-        # Count scans and findings
-        scans_count = db.query(func.count(ScanExecution.id)).filter(
-            ScanExecution.project_id == project.id
-        ).scalar() or 0
-
-        findings_count = _count_findings_for_project(db, project.id)
+        if verified:
+            last_scan = db.query(ScanExecution).filter(
+                ScanExecution.project_id == project.id
+            ).order_by(ScanExecution.created_at.desc()).first()
+            last_scan_at = last_scan.created_at if last_scan else None
+            scans_count = db.query(func.count(ScanExecution.id)).filter(
+                ScanExecution.project_id == project.id
+            ).scalar() or 0
+            findings_count = _count_findings_for_project(db, project.id)
+        else:
+            last_scan_at = None
+            scans_count = 0
+            findings_count = 0
 
         repositories.append(RepositoryResponse(
             id=project.id,
@@ -5871,6 +5902,7 @@ async def create_repository(
     tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
     _: None = Depends(reject_preview_writes),
+    __: None = Depends(require_verified_email),
 ):
     """
     Add a GitHub repository to the tenant's monitored repositories.
@@ -6002,6 +6034,7 @@ async def get_repository(
     Get details for a single repository by ID.
 
     Returns repository info with scan statistics.
+    Redacts scan stats for unverified tenants.
     """
     project = (
         db.query(Project)
@@ -6015,19 +6048,23 @@ async def get_repository(
     if not project:
         raise HTTPException(status_code=404, detail="Repository not found")
 
-    # Get last scan time
-    last_scan = db.query(ScanExecution).filter(
-        ScanExecution.project_id == project.id
-    ).order_by(ScanExecution.created_at.desc()).first()
+    # Check email verification for stats redaction
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    verified = tenant.email_verified if tenant else False
 
-    last_scan_at = last_scan.created_at if last_scan else None
-
-    # Count scans and findings
-    scans_count = db.query(func.count(ScanExecution.id)).filter(
-        ScanExecution.project_id == project.id
-    ).scalar() or 0
-
-    findings_count = _count_findings_for_project(db, project.id)
+    if verified:
+        last_scan = db.query(ScanExecution).filter(
+            ScanExecution.project_id == project.id
+        ).order_by(ScanExecution.created_at.desc()).first()
+        last_scan_at = last_scan.created_at if last_scan else None
+        scans_count = db.query(func.count(ScanExecution.id)).filter(
+            ScanExecution.project_id == project.id
+        ).scalar() or 0
+        findings_count = _count_findings_for_project(db, project.id)
+    else:
+        last_scan_at = None
+        scans_count = 0
+        findings_count = 0
 
     return RepositoryResponse(
         id=project.id,
@@ -6334,6 +6371,7 @@ async def trigger_repository_scan(
     db: Session = Depends(get_db),
     _: None = Depends(reject_preview_writes),
     __: User = Depends(require_github_linked),
+    ___: None = Depends(require_verified_email),
 ):
     """
     Trigger a new scan for a repository.
@@ -6418,6 +6456,7 @@ async def list_repository_scans(
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
+    _: None = Depends(require_verified_email),
 ):
     """
     List scan history for a repository.
@@ -6483,7 +6522,8 @@ async def list_all_findings(
     severity: str | None = Query(None, description="Filter by severity (critical, high, medium, low)"),
     status: str | None = Query(None, description="Filter by status"),
     repository_id: int | None = Query(None, description="Filter by repository ID"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(require_verified_email),
 ):
     """
     List all findings for a tenant: deep-audit hypotheses + surface scan findings.
@@ -6627,7 +6667,8 @@ async def list_all_findings(
 @app.get("/findings/stats", response_model=FindingStatsResponse)
 async def get_findings_statistics(
     tenant_id: int = Depends(get_current_tenant_id),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: None = Depends(require_verified_email),
 ):
     """
     Get summary statistics for findings.
@@ -8064,6 +8105,7 @@ async def get_surface_scan(
     execution_id: str,
     tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
+    _: None = Depends(require_verified_email),
 ):
     """
     Get details of a specific surface scan.

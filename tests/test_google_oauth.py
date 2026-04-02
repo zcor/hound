@@ -79,6 +79,7 @@ def sample_tenant(test_db):
 @pytest.fixture
 def github_user(test_db, sample_tenant):
     """Create a GitHub-only user."""
+    from server.token_crypto import encrypt_token
     user = User(
         github_id=12345678,
         github_login="ghuser",
@@ -87,7 +88,7 @@ def github_user(test_db, sample_tenant):
         avatar_url="https://avatars.githubusercontent.com/u/12345678",
         tenant_id=sample_tenant.id,
         signup_provider="github",
-        github_access_token="ghp_test_token",
+        github_token_encrypted=encrypt_token("ghp_test_token"),
     )
     test_db.add(user)
     test_db.commit()

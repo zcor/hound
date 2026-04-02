@@ -569,12 +569,13 @@ def scan_a(test_db, project_a, tenant_a):
 @pytest.fixture
 def github_user_a(test_db, tenant_a):
     """Create a user with GitHub linked for tenant A."""
+    from server.token_crypto import encrypt_token
     user = User(
         tenant_id=tenant_a.id,
         email="user_a@test.com",
         github_id=111,
         github_login="user_a",
-        github_access_token="ghp_fake_token_a",
+        github_token_encrypted=encrypt_token("ghp_fake_token_a"),
     )
     test_db.add(user)
     test_db.commit()
@@ -585,12 +586,13 @@ def github_user_a(test_db, tenant_a):
 @pytest.fixture
 def github_user_b(test_db, tenant_b):
     """Create a user with GitHub linked for tenant B."""
+    from server.token_crypto import encrypt_token
     user = User(
         tenant_id=tenant_b.id,
         email="user_b@test.com",
         github_id=222,
         github_login="user_b",
-        github_access_token="ghp_fake_token_b",
+        github_token_encrypted=encrypt_token("ghp_fake_token_b"),
     )
     test_db.add(user)
     test_db.commit()

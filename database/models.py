@@ -336,6 +336,7 @@ class AuditSession(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)  # Optional - can be set later
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True, index=True)  # Direct tenant link for agent-native audits
     session_id = Column(String(255), nullable=False, unique=True, index=True)
     status = Column(String(50), nullable=False, default="active")
     start_time = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -367,7 +368,8 @@ class Graph(Base):
     __tablename__ = "graphs"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    session_id = Column(String(255), nullable=True, index=True)  # For agent audits without a project
     name = Column(String(255), nullable=False)
     internal_name = Column(String(255), nullable=True)
     data = Column(JSONType, nullable=False)  # Complete graph structure

@@ -117,19 +117,23 @@ def rate_limit_key_tenant_or_ip(request: Request) -> str:
 # =============================================================================
 # ADMIN AUTHENTICATION
 # =============================================================================
-# Set HOUND_ADMIN_KEY environment variable to protect admin panel
-# If not set, admin panel is open (for local development)
+# Set HOUND_ADMIN_KEY environment variable to protect admin panel.
+# Fails CLOSED when HOUND_ADMIN_KEY is unset, UNLESS HOUND_DEV_MODE=1.
 ADMIN_API_KEY = os.environ.get("HOUND_ADMIN_KEY", "")
+_DEV_MODE = os.environ.get("HOUND_DEV_MODE", "") == "1"
 
 
 def verify_admin_auth(request: Request) -> bool:
     """
     Verify admin authentication.
     Returns True if authenticated, False if not.
+
+    Fails CLOSED: if HOUND_ADMIN_KEY is not set the admin panel is locked
+    unless HOUND_DEV_MODE=1 (explicit local development opt-in).
     """
-    # If no admin key is set, allow access (local development)
+    # Fail closed unless explicitly in dev mode
     if not ADMIN_API_KEY:
-        return True
+        return _DEV_MODE
 
     # Starlette session (set by SQLAdmin auth backend login)
     if request.session.get("admin_logged_in"):
@@ -483,7 +487,7 @@ async def require_github_linked(request: Request, db: Session = Depends(get_db))
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     user = db.query(User).filter(User.id == payload["user_id"]).first()
-    if not user or not user.github_id or not user.github_access_token:
+    if not user or not user.github_id or not user.github_token_encrypted:
         raise HTTPException(
             status_code=403,
             detail="GitHub account required. Connect GitHub in Settings to run scans.",
@@ -500,6 +504,16 @@ from server.email_verification import mount_email_routes, _make_require_verified
 
 mount_email_routes(app)
 require_verified_email = _make_require_verified_email(get_current_tenant_id)
+
+
+# =============================================================================
+# AGENT-NATIVE AUDIT ROUTES — mounted after dependencies are defined
+# =============================================================================
+
+from server.agent_routes import router as agent_router, configure_dependencies as _configure_agent_deps  # noqa: E402
+
+_configure_agent_deps(get_db, get_current_tenant_id)
+app.include_router(agent_router)
 
 
 # =============================================================================
@@ -4631,24 +4645,7 @@ async def get_session_graph(
     if system_graph:
         return system_graph.data
 
-    # Fallback: Try to load from filesystem
-    manager = ProjectManager()
-    project_path = manager.get_project_path(project.name)
-
-    if not project_path:
-        raise HTTPException(status_code=404, detail="Project path not found")
-
-    graphs_dir = project_path / "graphs"
-    system_graph_file = graphs_dir / "graph_SystemArchitecture.json"
-
-    if system_graph_file.exists():
-        try:
-            with open(system_graph_file) as f:
-                graph_data = json.load(f)
-            return graph_data
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load graph: {str(e)}")
-
+    # No filesystem fallback — all graphs must come from the database.
     raise HTTPException(status_code=404, detail="System graph not found")
 
 
@@ -6148,10 +6145,18 @@ async def sync_team_from_github(
         raise HTTPException(status_code=404, detail="Repository not found")
     
     # Verify user has access (must have GitHub token)
-    if not current_user.github_access_token:
+    if not current_user.github_token_encrypted:
         raise HTTPException(
             status_code=401, 
             detail="GitHub access token not found. Please re-authenticate."
+        )
+    
+    try:
+        _gh_token = decrypt_token(current_user.github_token_encrypted)
+    except ValueError:
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub token expired. Please reconnect your GitHub account.",
         )
     
     # Parse owner/repo from URL
@@ -6161,7 +6166,7 @@ async def sync_team_from_github(
         raise HTTPException(status_code=400, detail=str(e))
     
     # Fetch GitHub data
-    github = GitHubService(current_user.github_access_token)
+    github = GitHubService(_gh_token)
     
     try:
         # Verify user has access to repo

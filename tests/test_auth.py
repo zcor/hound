@@ -279,7 +279,8 @@ class TestAuthRoutes:
                 "GITHUB_CLIENT_ID": "test_id",
                 "GITHUB_CLIENT_SECRET": "test_secret",
             }):
-                response = client.post("/auth/github/callback", json={"code": "github_code_123"})
+                with patch("server.auth_routes.consume_oauth_state", new=AsyncMock(return_value={"intent": "login", "nonce": "n", "exp": 9999999999})):
+                    response = client.post("/auth/github/callback", json={"code": "github_code_123", "state": "test_state"})
 
         assert response.status_code == 200
         test_db.refresh(sample_user)
@@ -332,7 +333,8 @@ class TestAuthRoutes:
                 "GITHUB_CLIENT_ID": "test_id",
                 "GITHUB_CLIENT_SECRET": "test_secret",
             }):
-                response = client.post("/auth/github/callback", json={"code": "github_code_123"})
+                with patch("server.auth_routes.consume_oauth_state", new=AsyncMock(return_value={"intent": "login", "nonce": "n", "exp": 9999999999})):
+                    response = client.post("/auth/github/callback", json={"code": "github_code_123", "state": "test_state"})
 
         assert response.status_code == 200
         test_db.refresh(sample_user)
@@ -379,7 +381,8 @@ class TestAuthRoutes:
                 "GITHUB_CLIENT_ID": "test_id",
                 "GITHUB_CLIENT_SECRET": "test_secret",
             }):
-                response = client.post("/auth/github/callback", json={"code": "github_code_123"})
+                with patch("server.auth_routes.consume_oauth_state", new=AsyncMock(return_value={"intent": "login", "nonce": "n", "exp": 9999999999})):
+                    response = client.post("/auth/github/callback", json={"code": "github_code_123", "state": "test_state"})
 
         assert response.status_code == 200
         user = test_db.query(User).filter(User.github_id == 98765432).first()
@@ -436,7 +439,8 @@ class TestAuthRoutes:
                 "GITHUB_CLIENT_ID": "test_id",
                 "GITHUB_CLIENT_SECRET": "test_secret",
             }):
-                response = client.post("/auth/github/callback", json={"code": "github_code_123"})
+                with patch("server.auth_routes.consume_oauth_state", new=AsyncMock(return_value={"intent": "login", "nonce": "n", "exp": 9999999999})):
+                    response = client.post("/auth/github/callback", json={"code": "github_code_123", "state": "test_state"})
 
         assert response.status_code == 200
         user = test_db.query(User).filter(User.github_id == 98765433).first()

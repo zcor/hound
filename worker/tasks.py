@@ -437,8 +437,8 @@ def execute_audit_task(
                 iteration=0
             )
             
-            # Store graphs in database if project_id provided
-            if project_id:
+            # Store graphs in database
+            if project_id or scan_id:
                 try:
                     db_url = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
                     engine = create_db_engine(db_url)
@@ -450,11 +450,18 @@ def execute_audit_task(
                         
                         graph_name = gf.stem.replace("graph_", "")
                         
-                        # Check if graph already exists for this project
-                        existing = db.query(Graph).filter(
-                            Graph.project_id == project_id,
-                            Graph.internal_name == graph_name
-                        ).first()
+                        if project_id:
+                            # Check if graph already exists for this project
+                            existing = db.query(Graph).filter(
+                                Graph.project_id == project_id,
+                                Graph.internal_name == graph_name
+                            ).first()
+                        else:
+                            # Agent audit: check by session_id
+                            existing = db.query(Graph).filter(
+                                Graph.session_id == scan_id,
+                                Graph.internal_name == graph_name
+                            ).first()
                         
                         if existing:
                             # Update existing graph
@@ -464,6 +471,7 @@ def execute_audit_task(
                             # Create new graph
                             db_graph = Graph(
                                 project_id=project_id,
+                                session_id=scan_id if not project_id else None,
                                 name=graph_name.replace("_", " ").title(),
                                 internal_name=graph_name,
                                 data=graph_data,

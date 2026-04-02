@@ -81,6 +81,7 @@ def sample_tenant(test_db):
 @pytest.fixture
 def sample_user(test_db, sample_tenant):
     """Create a sample user for testing."""
+    from server.token_crypto import encrypt_token
     user = User(
         github_id=12345678,
         github_login="testuser",
@@ -88,7 +89,7 @@ def sample_user(test_db, sample_tenant):
         name="Test User",
         avatar_url="https://avatars.githubusercontent.com/u/12345678",
         tenant_id=sample_tenant.id,
-        github_access_token="ghp_test_token_12345"
+        github_token_encrypted=encrypt_token("ghp_test_token_12345"),
     )
     test_db.add(user)
     test_db.commit()
@@ -279,7 +280,7 @@ class TestTeamSyncEndpoint:
     ):
         """Test that syncing team requires GitHub access token."""
         # Remove GitHub access token
-        sample_user.github_access_token = None
+        sample_user.github_token_encrypted = None
         test_db.commit()
         
         response = client.post(

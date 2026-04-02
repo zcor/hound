@@ -8,6 +8,14 @@
       "price": "$5.00",
       "description": "Deep autonomous security audit"
     },
+    "POST /agent/audits": {
+      "price": "$5.00",
+      "description": "Agent-native deep audit (pay-per-audit, no project setup required)"
+    },
+    "POST /agent/surface-scan": {
+      "price": "$0.50",
+      "description": "Agent-native quick surface scan (pattern + LLM verification)"
+    },
     "GET /audits/{id}/report": {
       "price": "$0.10",
       "description": "Formatted audit report (30-day access per payment)"

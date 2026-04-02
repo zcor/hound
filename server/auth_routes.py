@@ -265,14 +265,15 @@ async def github_callback(
     if not config["client_id"] or not config["client_secret"]:
         raise HTTPException(status_code=500, detail="GitHub OAuth not configured")
 
-    # Validate state (CSRF protection) — tolerate missing state for backwards compat
-    if request_body.state:
-        try:
-            state_data = await consume_oauth_state(request_body.state)
-            if state_data["intent"] != "login":
-                raise HTTPException(400, "Invalid OAuth state intent")
-        except ValueError as e:
-            raise HTTPException(400, str(e))
+    # Validate state (CSRF protection) — REQUIRED
+    if not request_body.state:
+        raise HTTPException(400, "OAuth state parameter is required")
+    try:
+        state_data = await consume_oauth_state(request_body.state)
+        if state_data["intent"] != "login":
+            raise HTTPException(400, "Invalid OAuth state intent")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     # 1. Exchange code for GitHub access token
     user_orgs: list[dict] = []
@@ -350,7 +351,7 @@ async def github_callback(
         user.avatar_url = github_user.get("avatar_url")
         user.github_login = github_user["login"]
         user.github_token_encrypted = encrypt_token(github_token)
-        user.github_access_token = github_token
+        user.github_access_token = None  # Deprecated: use encrypted column only
         user.github_connected_at = datetime.now(timezone.utc)
         current_tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
         target_tenant = current_tenant
@@ -430,7 +431,7 @@ async def github_callback(
             avatar_url=github_user.get("avatar_url"),
             tenant_id=tenant.id,
             github_token_encrypted=encrypt_token(github_token),
-            github_access_token=github_token,
+            github_access_token=None,  # Deprecated: use encrypted column only
             github_connected_at=datetime.now(timezone.utc),
             signup_provider="github",
         )
@@ -779,7 +780,7 @@ async def link_github(
     user.name = user.name or github_user.get("name")
     user.avatar_url = user.avatar_url or github_user.get("avatar_url")
     user.github_token_encrypted = encrypt_token(github_token)
-    user.github_access_token = github_token
+    user.github_access_token = None  # Deprecated: use encrypted column only
     user.github_connected_at = datetime.now(timezone.utc)
 
     _log_oauth_event(db, user.id, "link", "github", str(github_id), request)

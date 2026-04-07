@@ -469,6 +469,47 @@ async def notify_stripe_webhook_stale(
     return await send_telegram_message(message)
 
 
+async def notify_daily_digest(
+    stripe_status: str,
+    beads_tasks: list[dict] | None = None,
+    stripe_issues: list[str] | None = None,
+) -> bool:
+    """Daily team digest: one-line Stripe health + open Beads tasks."""
+    # Stripe one-liner
+    stripe_icon = "\u2705" if not stripe_issues else "\u26a0\ufe0f"
+    parts = [
+        f"\U0001f4cb <b>Daily Digest</b>",
+        "",
+        f"{stripe_icon} <b>Stripe:</b> {_escape_html(stripe_status)}",
+    ]
+    if stripe_issues:
+        for issue in stripe_issues:
+            parts.append(f"  \u2022 {_escape_html(issue)}")
+
+    # Beads tasks
+    if beads_tasks:
+        parts.append("")
+        parts.append(f"\U0001f4cc <b>Open Tasks ({len(beads_tasks)})</b>")
+        for task in beads_tasks[:15]:
+            priority = task.get("priority", "")
+            title = _escape_html(task.get("title", "untitled"))
+            assignee = task.get("assignee", "")
+            p_label = f"P{priority}" if priority != "" else ""
+            assignee_label = f" \u2022 {_escape_html(assignee)}" if assignee else ""
+            parts.append(f"  {p_label} {title}{assignee_label}")
+        if len(beads_tasks) > 15:
+            parts.append(f"  <i>... and {len(beads_tasks) - 15} more</i>")
+    elif beads_tasks is not None:
+        parts.append("")
+        parts.append("\U0001f4cc <b>Open Tasks:</b> none")
+    else:
+        parts.append("")
+        parts.append("\U0001f4cc <b>Open Tasks:</b> <i>could not load</i>")
+
+    message = "\n".join(parts)
+    return await send_telegram_message(message)
+
+
 async def notify_contact_captured(
     tenant_id: int,
     tenant_name: str,

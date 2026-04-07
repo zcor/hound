@@ -153,6 +153,7 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
+      - ./beads_summary.json:/config/beads_summary.json:ro
     depends_on:
       db:
         condition: service_healthy

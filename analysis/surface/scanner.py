@@ -409,7 +409,19 @@ class SurfaceScanner:
 
             with httpx.Client(follow_redirects=True, timeout=60.0) as client:
                 response = client.get(api_url, headers=headers)
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code
+                    if status == 404 and not self.github_token:
+                        raise ValueError("REPO_AUTH_REQUIRED: Repository not accessible — may be private or require authentication") from e
+                    elif status == 404 and self.github_token:
+                        raise ValueError("REPO_AUTH_REQUIRED: Repository not accessible with current permissions") from e
+                    elif status in (401, 403) and self.github_token:
+                        raise ValueError("REPO_TOKEN_INVALID: GitHub token was rejected — may be revoked or expired") from e
+                    elif status in (401, 403):
+                        raise ValueError("REPO_AUTH_REQUIRED: Repository requires authentication") from e
+                    raise
 
                 # Save and extract tarball
                 tarball_path = Path(temp_dir) / "repo.tar.gz"
@@ -425,6 +437,12 @@ class SurfaceScanner:
 
                 return extracted_dirs[0], url, cleanup
 
+        except ValueError as e:
+            if "REPO_AUTH_REQUIRED" in str(e) or "REPO_TOKEN_INVALID" in str(e):
+                cleanup()
+                raise  # Preserve sentinel for worker-level handling
+            cleanup()
+            raise ValueError(f"Failed to fetch {url}: {e}")
         except Exception as e:
             cleanup()
             raise ValueError(f"Failed to fetch {url}: {e}")

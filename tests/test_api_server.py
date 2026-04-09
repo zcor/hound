@@ -1666,6 +1666,10 @@ def test_create_repository_autoscan_uses_github_user_id_without_installation(
     """Autoscan should pass the acting GitHub user id when no installation exists."""
     from unittest.mock import AsyncMock, MagicMock, patch
 
+    # User needs repo scope for private repo auto-scan
+    github_user.github_token_scopes = "repo,read:org,read:user,user:email"
+    test_db.commit()
+
     with patch("server.api.notify_repo_added", new_callable=AsyncMock):
         with patch.dict("sys.modules", {"worker.tasks": MagicMock()}):
             import sys

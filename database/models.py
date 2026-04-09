@@ -129,6 +129,7 @@ class User(Base):
     github_token_encrypted = Column(Text, nullable=True)  # Fernet-encrypted GitHub OAuth token
     github_connected_at = Column(DateTime, nullable=True)  # When the GitHub token was stored
     github_access_token = Column(String(500), nullable=True)  # GitHub OAuth access token for API calls
+    github_token_scopes = Column(String(500), nullable=True)  # Comma-separated OAuth scopes granted
 
     # Google provider (nullable — GitHub-only users won't have these)
     google_id = Column(String(255), unique=True, index=True, nullable=True)
@@ -181,6 +182,11 @@ class User(Base):
     @property
     def has_google(self) -> bool:
         return self.google_id is not None
+
+    @property
+    def has_repo_scope(self) -> bool:
+        """Whether the stored GitHub OAuth token includes the 'repo' scope."""
+        return bool(self.github_token_scopes and "repo" in self.github_token_scopes.split(","))
 
     def to_profile_dict(self) -> dict:
         """Full profile for /auth/me — null-safe for all optional fields."""
@@ -798,6 +804,8 @@ def ensure_schema(engine):
             # Email verification gate
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE"))
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMP WITH TIME ZONE"))
+            # GitHub OAuth scope tracking
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS github_token_scopes VARCHAR(500)"))
 
 
 def init_database(engine):

@@ -28,6 +28,10 @@ from server.token_crypto import encrypt_token
 
 logger = logging.getLogger(__name__)
 
+# OAuth scope sets — minimal for login/link, with_repo for scope upgrade
+GITHUB_SCOPES_MINIMAL = "read:org,read:user,user:email"
+GITHUB_SCOPES_WITH_REPO = "repo,read:org,read:user,user:email"
+
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
 
@@ -248,7 +252,7 @@ async def github_login():
         f"https://github.com/login/oauth/authorize"
         f"?client_id={config['client_id']}"
         f"&redirect_uri={config['frontend_url']}/auth/callback"
-        f"&scope=repo read:org read:user user:email"
+        f"&scope=read:org read:user user:email"
         f"&state={state}"
     )
     return {"url": github_auth_url}
@@ -351,6 +355,7 @@ async def github_callback(
         user.avatar_url = github_user.get("avatar_url")
         user.github_login = github_user["login"]
         user.github_token_encrypted = encrypt_token(github_token)
+        user.github_token_scopes = GITHUB_SCOPES_MINIMAL
         user.github_access_token = None  # Deprecated: use encrypted column only
         user.github_connected_at = datetime.now(timezone.utc)
         current_tenant = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
@@ -431,6 +436,7 @@ async def github_callback(
             avatar_url=github_user.get("avatar_url"),
             tenant_id=tenant.id,
             github_token_encrypted=encrypt_token(github_token),
+            github_token_scopes=GITHUB_SCOPES_MINIMAL,
             github_access_token=None,  # Deprecated: use encrypted column only
             github_connected_at=datetime.now(timezone.utc),
             signup_provider="github",
@@ -680,7 +686,7 @@ async def connect_github(request: Request):
         f"https://github.com/login/oauth/authorize"
         f"?client_id={config['client_id']}"
         f"&redirect_uri={config['frontend_url']}/auth/callback/link"
-        f"&scope=repo read:user user:email"
+        f"&scope=read:org read:user user:email"
         f"&state={state}"
     )
     return {"url": github_auth_url}
@@ -780,6 +786,7 @@ async def link_github(
     user.name = user.name or github_user.get("name")
     user.avatar_url = user.avatar_url or github_user.get("avatar_url")
     user.github_token_encrypted = encrypt_token(github_token)
+    user.github_token_scopes = GITHUB_SCOPES_MINIMAL
     user.github_access_token = None  # Deprecated: use encrypted column only
     user.github_connected_at = datetime.now(timezone.utc)
 
@@ -968,3 +975,100 @@ async def delete_me(
         raise HTTPException(status_code=500, detail="Account deletion failed.")
 
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# GitHub scope upgrade — progressive permission escalation
+# ---------------------------------------------------------------------------
+
+@router.get("/github/upgrade-scope")
+async def upgrade_github_scope(request: Request):
+    """
+    Return a GitHub OAuth URL that requests the 'repo' scope.
+
+    Used when a user needs private repo scanning without a GitHub App installation.
+    Requires authentication — the user must already be logged in.
+    """
+    token = get_token_from_header(request)
+    payload = get_current_user_from_token(token)
+
+    config = get_github_config()
+    if not config["client_id"]:
+        raise HTTPException(500, "GitHub OAuth not configured")
+
+    state = await create_oauth_state(
+        intent="upgrade_scope",
+        user_id=payload["user_id"],
+        provider="github",
+    )
+    github_auth_url = (
+        f"https://github.com/login/oauth/authorize"
+        f"?client_id={config['client_id']}"
+        f"&redirect_uri={config['frontend_url']}/auth/callback/upgrade"
+        f"&scope={GITHUB_SCOPES_WITH_REPO.replace(',', ' ')}"
+        f"&state={state}"
+    )
+    return {"url": github_auth_url}
+
+
+@router.post("/github/upgrade-callback")
+async def upgrade_github_callback(
+    request_body: LinkCallbackRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Exchange GitHub code for a repo-scoped token after scope upgrade.
+
+    Validates that the authenticated user matches the state, exchanges the code,
+    and stores the new token with updated scopes.
+    """
+    token = get_token_from_header(request)
+    payload = get_current_user_from_token(token)
+
+    # Validate state
+    try:
+        state_data = await consume_oauth_state(request_body.state)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    if state_data["intent"] != "upgrade_scope" or state_data["provider"] != "github":
+        raise HTTPException(400, "Invalid OAuth state for scope upgrade")
+    if state_data["user_id"] != payload["user_id"]:
+        raise HTTPException(400, "OAuth state user mismatch")
+
+    # Exchange code for token
+    config = get_github_config()
+    if not config["client_id"] or not config["client_secret"]:
+        raise HTTPException(500, "GitHub OAuth not configured")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://github.com/login/oauth/access_token",
+            data={
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
+                "code": request_body.code,
+            },
+            headers={"Accept": "application/json"},
+        )
+        token_data = resp.json()
+
+    github_token = token_data.get("access_token")
+    if not github_token:
+        error = token_data.get("error_description", token_data.get("error", "Unknown error"))
+        raise HTTPException(400, f"GitHub token exchange failed: {error}")
+
+    # Update user's token and scopes
+    user = db.query(User).filter(User.id == payload["user_id"]).first()
+    if not user:
+        raise HTTPException(404, "User not found")
+
+    user.github_token_encrypted = encrypt_token(github_token)
+    user.github_token_scopes = GITHUB_SCOPES_WITH_REPO
+    user.github_connected_at = datetime.now(timezone.utc)
+
+    _log_oauth_event(db, user.id, "scope_upgrade", "github", str(user.github_id or ""), request)
+    db.commit()
+
+    return {"success": True}

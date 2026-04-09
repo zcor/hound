@@ -1084,6 +1084,21 @@ def execute_scan_task(
 
         # If scanner returned an error, mark as failed
         scan_error = result_dict.get("error")
+
+        # Handle auth failures: structured error + credit refund
+        if scan_error and "REPO_AUTH_REQUIRED" in scan_error:
+            self._update_scan_status(scan_id, "failed", error_message="insufficient_github_scope", scan_log=safe_log)
+            self._refund_if_credit_used(scan_id)
+            publisher.publish_status("failed", "insufficient_github_scope")
+            publisher.close()
+            return result_dict
+        elif scan_error and "REPO_TOKEN_INVALID" in scan_error:
+            self._update_scan_status(scan_id, "failed", error_message="github_token_invalid", scan_log=safe_log)
+            self._refund_if_credit_used(scan_id)
+            publisher.publish_status("failed", "github_token_invalid")
+            publisher.close()
+            return result_dict
+
         final_status = "failed" if scan_error else "completed"
 
         # Update database

@@ -5072,6 +5072,7 @@ class RepositoryResponse(BaseModel):
     tenant_id: int | None = None
     created_at: datetime
     updated_at: datetime | None = None
+    initial_scan_id: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -5125,6 +5126,7 @@ class GitHubStatusResponse(BaseModel):
     avatar_url: str | None = None
     scopes: list[str] = []
     connected_at: str | None = None
+    has_repo_scope: bool = False
 
 
 class ScanHistoryItem(BaseModel):
@@ -5137,6 +5139,7 @@ class ScanHistoryItem(BaseModel):
     started_at: datetime | None
     completed_at: datetime | None
     scan_type: str = "surface"
+    error_message: str | None = None
     # Deep audit curated fields (None for surface scans)
     assessment_level: str | None = None
     credible_findings_count: int | None = None
@@ -5647,6 +5650,28 @@ async def _get_current_user_with_token(
     return user
 
 
+def _check_private_repo_access(project: Project, user: User):
+    """Raise 403 if private repo lacks both installation token and repo-scoped OAuth.
+
+    Best-effort gate: trusts stored scopes without a live GitHub API check.
+    If the token is actually revoked, the worker catches it and refunds credits.
+    """
+    if not project.is_private:
+        return
+    if project.installation_id:
+        return
+    if not user.github_token_encrypted:
+        raise HTTPException(403, detail={
+            "error": "insufficient_github_scope",
+            "message": "Private repo scanning requires GitHub authentication",
+        })
+    if not user.has_repo_scope:
+        raise HTTPException(403, detail={
+            "error": "insufficient_github_scope",
+            "message": "Private repo scanning requires additional GitHub permissions or GitHub App installation",
+        })
+
+
 @app.get("/github/repos", response_model=GitHubRepoListResponse, tags=["github"])
 async def list_github_repos(
     request: Request,
@@ -5972,15 +5997,21 @@ async def create_repository(
         pass  # non-critical
 
     # Auto-trigger initial surface scan (fire-and-forget)
+    initial_execution_id = None
     if project.git_url:
         try:
             github_user_id = None
+            current_user_for_scan = None
             if not project.installation_id:
                 try:
-                    current_user = await _get_current_user_with_token(request, db)
-                    github_user_id = current_user.id
+                    current_user_for_scan = await _get_current_user_with_token(request, db)
+                    github_user_id = current_user_for_scan.id
                 except HTTPException:
-                    github_user_id = None
+                    pass
+
+            # Private repo access check — before tier enforcement so no credits consumed
+            if current_user_for_scan:
+                _check_private_repo_access(project, current_user_for_scan)
 
             # Tier enforcement: check plan limits before auto-scanning
             from server.tier_enforcement import _check_sync
@@ -6034,6 +6065,7 @@ async def create_repository(
         tenant_id=project.tenant_id,
         created_at=project.created_at,
         updated_at=project.last_accessed,
+        initial_scan_id=initial_execution_id,
     )
 
 
@@ -6364,11 +6396,18 @@ async def github_status(
         # Token is revoked or invalid — clear it from the database
         user.github_token_encrypted = None
         user.github_connected_at = None
+        user.github_token_scopes = None
         db.commit()
         return GitHubStatusResponse(connected=False)
 
     github_user = resp.json()
     scopes = [s.strip() for s in resp.headers.get("X-OAuth-Scopes", "").split(",") if s.strip()]
+
+    # Opportunistic backfill: populate stored scopes from live header
+    if scopes and not user.github_token_scopes:
+        user.github_token_scopes = ",".join(scopes)
+        db.commit()
+
     connected_at = (
         user.github_connected_at.isoformat() + "Z"
         if user.github_connected_at
@@ -6381,6 +6420,7 @@ async def github_status(
         avatar_url=github_user.get("avatar_url"),
         scopes=scopes,
         connected_at=connected_at,
+        has_repo_scope="repo" in scopes,
     )
 
 
@@ -6409,7 +6449,10 @@ async def trigger_repository_scan(
     if not project:
         raise HTTPException(status_code=404, detail="Repository not found")
 
-    # 2. Tier enforcement SECOND — only after we know the repo is theirs
+    # 2. Private repo access check — before tier enforcement so no credits consumed
+    _check_private_repo_access(project, current_user)
+
+    # 3. Tier enforcement — only after we know the repo is theirs and accessible
     from server.tier_enforcement import require_plan_allowance
     tier_check = require_plan_allowance("scan")
     allowance = await tier_check(request)
@@ -6523,6 +6566,7 @@ async def list_repository_scans(
             started_at=scan.started_at,
             completed_at=scan.completed_at,
             scan_type=scan.scan_config.get("scan_type", "surface") if scan.scan_config else "surface",
+            error_message=scan.error_message,
             assessment_level=assessment_level,
             credible_findings_count=credible_findings_count,
         ))

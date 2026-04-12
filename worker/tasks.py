@@ -1101,6 +1101,21 @@ def execute_scan_task(
 
         final_status = "failed" if scan_error else "completed"
 
+        # Generate executive summary overview
+        overview = None
+        if not scan_error and result_dict.get("findings"):
+            try:
+                overview = _compute_surface_scan_overview(
+                    findings=result_dict["findings"],
+                    quality_metrics=result_dict.get("quality_metrics", {}),
+                    risk_score=result_dict.get("risk_score", 0),
+                    risk_level=result_dict.get("risk_level", "low"),
+                    repo_name=result_dict.get("repo_name", repo_url),
+                    config=config,
+                )
+            except Exception as e:
+                print(f"[execute_scan_task] Overview generation failed: {e}")
+
         # Update database
         self._update_scan_status(
             scan_id,
@@ -1114,6 +1129,7 @@ def execute_scan_task(
             contracts_total=result_dict.get("contracts_total", 0),
             scan_log=safe_log,
             error_message=scan_error,
+            deep_audit_overview=overview,
         )
 
         publisher.publish_status(
@@ -1549,6 +1565,198 @@ def _compute_deep_audit_overview(raw_count: int, curated_hypotheses: list, confi
         "credible_findings_count": len(credible),
         "credible_findings": credible_findings,
         "raw_findings_count": raw_count,
+        "assessment_level": assessment_level,
+        "review_note": review_note,
+    }
+
+
+def _generate_surface_scan_headline(
+    findings: list[dict],
+    credible: list[dict],
+    top_concerns: list[dict],
+    assessment_level: str,
+    repo_name: str,
+    quality_metrics: dict,
+    config: dict | None = None,
+) -> str:
+    """Generate an auditor-quality headline for a surface scan overview.
+
+    Tries LLM first, falls back to deterministic summary.
+    """
+    # Deterministic fallback
+    if not credible:
+        fallback = (
+            f"Surface scan of {repo_name} reviewed {len(findings)} potential issues. "
+            f"No findings met the threshold for notable vulnerabilities."
+        )
+    else:
+        sev_counts: dict[str, int] = {}
+        for f in credible:
+            s = f.get("severity", "medium")
+            sev_counts[s] = sev_counts.get(s, 0) + 1
+        sev_parts = []
+        for s in ["critical", "high", "medium", "low"]:
+            if sev_counts.get(s):
+                sev_parts.append(f"{sev_counts[s]} {s}")
+        contract_count = quality_metrics.get("contract_count", 0)
+        total_loc = quality_metrics.get("total_loc", 0)
+        fallback = (
+            f"Surface scan identified {len(credible)} notable findings "
+            f"({', '.join(sev_parts)}) across {contract_count} contracts "
+            f"({total_loc} LOC)."
+        )
+
+    # Try LLM headline
+    try:
+        from analysis.hypothesis_dedup import _get_lightweight_client
+        client = _get_lightweight_client(config or {})
+        if not client:
+            return fallback
+
+        concerns_text = "\n".join(
+            f"- [{tc.get('severity', 'medium')}] {tc.get('title', '')}"
+            for tc in top_concerns
+        )
+
+        system = (
+            "You are a senior smart contract security auditor writing a pre-audit surface scan assessment. "
+            "Write a single paragraph (3-5 sentences) summarizing the security posture after an automated surface scan. "
+            "Be specific. Auditor tone. Mention what the contract does, key risks, and overall assessment. "
+            "Do not list individual findings. Prose only — no bullet points, no headers."
+        )
+
+        user = (
+            f"Surface scan of {repo_name} reviewed {len(findings)} patterns, "
+            f"{len(credible)} notable findings remain.\n"
+            f"Assessment level: {assessment_level}.\n"
+            f"Contracts: {quality_metrics.get('contract_count', 0)}, "
+            f"LOC: {quality_metrics.get('total_loc', 0)}\n"
+            f"Top concerns:\n{concerns_text}\n\n"
+            f"Write the assessment paragraph."
+        )
+
+        result = client.raw(system=system, user=user)
+        result = result.strip().strip('"').strip("'") if isinstance(result, str) else str(result).strip()
+        if result and len(result) > 50:
+            return result
+    except Exception as e:
+        print(f"[surface_scan_overview] LLM headline failed: {e}")
+
+    return fallback
+
+
+def _compute_surface_scan_overview(
+    findings: list[dict],
+    quality_metrics: dict,
+    risk_score: int,
+    risk_level: str,
+    repo_name: str,
+    config: dict | None = None,
+) -> dict | None:
+    """Compute a curated overview for surface scans.
+
+    Returns a dict compatible with DeepAuditOverview TypeScript type,
+    or None if there are no findings.
+    """
+    if not findings:
+        return None
+
+    # Triage counts: map severity to the existing confirmed/investigating/proposed buckets
+    # so the frontend renders correctly without changes
+    triage_counts = {
+        "confirmed": 0,
+        "investigating": 0,
+        "proposed": 0,
+        "rejected": 0,
+        "uncertain": 0,
+    }
+
+    for f in findings:
+        severity = f.get("severity", "medium")
+        llm_verified = f.get("llm_verified", False)
+        confidence = float(f.get("confidence", 0.5))
+
+        if llm_verified and confidence >= 0.7:
+            triage_counts["confirmed"] += 1
+        elif llm_verified:
+            triage_counts["investigating"] += 1
+        else:
+            triage_counts["proposed"] += 1
+
+    # Credible findings: LLM-verified high-confidence, or critical/high severity
+    credible = []
+    for f in findings:
+        severity = f.get("severity", "medium")
+        llm_verified = f.get("llm_verified", False)
+        confidence = float(f.get("confidence", 0.5))
+
+        if llm_verified and confidence >= 0.7:
+            credible.append(f)
+        elif severity in ("critical", "high"):
+            credible.append(f)
+
+    # Top concerns: up to 3 most severe
+    severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    sorted_credible = sorted(
+        credible,
+        key=lambda f: (severity_rank.get(f.get("severity", "medium"), 2), float(f.get("confidence", 0.5))),
+        reverse=True,
+    )
+    top_concerns = []
+    for f in sorted_credible[:3]:
+        top_concerns.append({
+            "title": f.get("title") or f.get("description", "")[:80],
+            "description": f.get("description", ""),
+            "severity": f.get("severity", "medium"),
+            "confidence": float(f.get("confidence", 0.5)),
+            "hypothesis_id": f.get("pattern_id", ""),
+        })
+
+    # Assessment level
+    credible_severity_weights = {"critical": 25, "high": 15, "medium": 5, "low": 1}
+    credible_score = min(100, sum(
+        credible_severity_weights.get(f.get("severity", "medium"), 5)
+        for f in credible
+    ))
+    assessment_level = (
+        "critical" if credible_score >= 75
+        else "high" if credible_score >= 50
+        else "medium" if credible_score >= 25
+        else "low"
+    )
+
+    # Review note
+    unverified_count = len(findings) - len(credible)
+    review_note = None
+    if unverified_count > 0 and len(findings) > 3:
+        review_note = (
+            f"{unverified_count} of {len(findings)} findings are pattern-matched "
+            f"and may need manual verification."
+        )
+
+    # Headline
+    headline = _generate_surface_scan_headline(
+        findings, credible, top_concerns, assessment_level,
+        repo_name, quality_metrics, config,
+    )
+
+    # Credible findings list
+    credible_findings = []
+    for f in sorted_credible:
+        credible_findings.append({
+            "hypothesis_id": f.get("pattern_id", ""),
+            "title": f.get("title") or f.get("description", "")[:80],
+            "severity": f.get("severity", "medium"),
+            "confidence": float(f.get("confidence", 0.5)),
+        })
+
+    return {
+        "headline": headline,
+        "top_concerns": top_concerns,
+        "triage_counts": triage_counts,
+        "credible_findings_count": len(credible),
+        "credible_findings": credible_findings,
+        "raw_findings_count": len(findings),
         "assessment_level": assessment_level,
         "review_note": review_note,
     }

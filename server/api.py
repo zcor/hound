@@ -7852,7 +7852,22 @@ async def run_surface_scan(
     
     # Generate unique execution ID
     execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
-    
+
+    # Generate executive summary overview
+    overview = None
+    if result.findings and not result.error:
+        try:
+            from worker.tasks import _compute_surface_scan_overview
+            overview = _compute_surface_scan_overview(
+                findings=[f.model_dump() for f in result.findings],
+                quality_metrics=result.quality_metrics.model_dump(),
+                risk_score=result.risk_score,
+                risk_level=result.risk_level,
+                repo_name=result.repo_name,
+            )
+        except Exception as e:
+            logger.warning(f"Surface scan overview generation failed: {e}")
+
     # Save to database
     try:
         # Get or create default tenant
@@ -7862,7 +7877,7 @@ async def run_surface_scan(
             db.add(tenant)
             db.commit()
             db.refresh(tenant)
-        
+
         scan_exec = ScanExecution(
             execution_id=execution_id,
             tenant_id=tenant.id,
@@ -7886,6 +7901,7 @@ async def run_surface_scan(
             scan_log=result.scan_log,
             started_at=result.scan_timestamp,
             completed_at=datetime.now(),
+            deep_audit_overview=overview,
         )
 
         db.add(scan_exec)
@@ -7933,6 +7949,7 @@ async def run_surface_scan(
         summary=result.summary,
         error=result.error,
         scan_log=result.scan_log,
+        deep_audit_overview=overview,
     )
 
 
@@ -7977,6 +7994,21 @@ async def run_full_surface_scan(
     result = scanner.scan(request_body.target)
     execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
 
+    # Generate executive summary overview
+    overview = None
+    if result.findings and not result.error:
+        try:
+            from worker.tasks import _compute_surface_scan_overview
+            overview = _compute_surface_scan_overview(
+                findings=[f.model_dump() for f in result.findings],
+                quality_metrics=result.quality_metrics.model_dump(),
+                risk_score=result.risk_score,
+                risk_level=result.risk_level,
+                repo_name=result.repo_name,
+            )
+        except Exception as e:
+            logger.warning(f"Surface scan overview generation failed: {e}")
+
     try:
         scan_exec = ScanExecution(
             execution_id=execution_id,
@@ -8002,6 +8034,7 @@ async def run_full_surface_scan(
             scan_log=result.scan_log,
             started_at=result.scan_timestamp,
             completed_at=datetime.now(),
+            deep_audit_overview=overview,
         )
         db.add(scan_exec)
         db.commit()
@@ -8056,6 +8089,7 @@ async def run_full_surface_scan(
         summary=result.summary,
         error=result.error,
         scan_log=result.scan_log,
+        deep_audit_overview=overview,
     )
 
 

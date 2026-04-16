@@ -22,6 +22,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -52,6 +53,8 @@ def fetch_design_html(api_key: str, design_id: str) -> str:
     if not html:
         raise RuntimeError(f"Design {design_id} has no html_content")
     print(f"Fetched design: {design.get('name')!r} ({len(html)} bytes HTML)")
+
+    # Patch 1: body_content → raw HTML passthrough.
     # Ian's Design (c1af79cf-…) uses `{{body_content}}` (double braces, HTML-escaped)
     # for the main content block. That escapes `<p>` to `&lt;p&gt;` which renders as
     # literal text. Our LIFECYCLE_CONFIG body snippets are trusted HTML we wrote
@@ -63,6 +66,22 @@ def fetch_design_html(api_key: str, design_id: str) -> str:
         count = html.count("{{body_content}}")
         html = html.replace("{{body_content}}", "{{{body_content}}}")
         print(f"Promoted {count} occurrence(s) of body_content to triple-braces (raw HTML passthrough)")
+
+    # Patch 2: remove the "Manage Preferences" link.
+    # SendGrid fills `{{{unsubscribe_preferences}}}` with a URL from its Unsubscribe
+    # Groups feature. We don't use Unsubscribe Groups — we have exactly one boolean
+    # tenant.email_unsubscribed flag. Clicking "Manage Preferences" sent users to
+    # SendGrid's default global-unsub page (reported 2026-04-16 by Ian: "both links
+    # unsubscribe"). Better to remove it entirely than have a misleading link.
+    mp_pattern = re.compile(
+        r'(?:\s|&nbsp;)*\|(?:\s|&nbsp;)*<a\s+href="\{\{\{unsubscribe_preferences\}\}\}"[^>]*>Manage Preferences</a>',
+        re.IGNORECASE,
+    )
+    mp_matches = mp_pattern.findall(html)
+    if mp_matches:
+        html = mp_pattern.sub('', html)
+        print(f"Removed {len(mp_matches)} 'Manage Preferences' link(s) from footer")
+
     return html
 
 

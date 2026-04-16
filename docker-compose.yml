@@ -91,6 +91,13 @@ services:
       # Telegram Notifications
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # SendGrid / Lifecycle Emails
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      SENDGRID_FROM_EMAIL: ${SENDGRID_FROM_EMAIL:-noreply@firepan.com}
+      SENDGRID_FROM_NAME: ${SENDGRID_FROM_NAME:-Firepan Team}
+      SENDGRID_REPLY_TO: ${SENDGRID_REPLY_TO:-support@firepan.com}
+      SENDGRID_TEMPLATE_ID_DEFAULT: ${SENDGRID_TEMPLATE_ID_DEFAULT:-}
+      API_BASE_URL: ${API_BASE_URL:-https://api.firepan.com}
       # x402 Agent Payments
       X402_ENABLED: ${X402_ENABLED:-false}
       X402_WALLET_ADDRESS: ${X402_WALLET_ADDRESS:-}
@@ -159,6 +166,13 @@ services:
       # Telegram Notifications (needed for funnel digest task)
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # SendGrid / Lifecycle Emails (needed for DEEP_AUDIT_DONE + retry task)
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      SENDGRID_FROM_EMAIL: ${SENDGRID_FROM_EMAIL:-noreply@firepan.com}
+      SENDGRID_FROM_NAME: ${SENDGRID_FROM_NAME:-Firepan Team}
+      SENDGRID_REPLY_TO: ${SENDGRID_REPLY_TO:-support@firepan.com}
+      SENDGRID_TEMPLATE_ID_DEFAULT: ${SENDGRID_TEMPLATE_ID_DEFAULT:-}
+      API_BASE_URL: ${API_BASE_URL:-https://api.firepan.com}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ./beads_summary.json:/config/beads_summary.json:ro
@@ -184,6 +198,14 @@ services:
       CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-hound_redis_secret}@redis:6379/0
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # SendGrid / Lifecycle Emails (beat dispatches lifecycle tick, worker executes)
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      SENDGRID_FROM_EMAIL: ${SENDGRID_FROM_EMAIL:-noreply@firepan.com}
+      SENDGRID_FROM_NAME: ${SENDGRID_FROM_NAME:-Firepan Team}
+      SENDGRID_REPLY_TO: ${SENDGRID_REPLY_TO:-support@firepan.com}
+      SENDGRID_TEMPLATE_ID_DEFAULT: ${SENDGRID_TEMPLATE_ID_DEFAULT:-}
+      API_BASE_URL: ${API_BASE_URL:-https://api.firepan.com}
+      HOUND_SECRET_KEY: ${HOUND_SECRET_KEY:-}
     depends_on:
       redis:
         condition: service_healthy

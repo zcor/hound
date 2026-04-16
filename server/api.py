@@ -507,6 +507,59 @@ require_verified_email = _make_require_verified_email(get_current_tenant_id)
 
 
 # =============================================================================
+# EMAIL UNSUBSCRIBE — canonical URL for lifecycle emails
+# =============================================================================
+# Token shape is defined in integrations/lifecycle_emails.py. Self-contained HMAC
+# opaque token; no login required.
+
+@app.get("/email/unsubscribe", response_class=HTMLResponse)
+async def email_unsubscribe(t: str = "", db: Session = Depends(get_db)):
+    """Honor an unsubscribe click from a lifecycle email.
+
+    The token carries the tenant_id + HMAC signature. We flip
+    tenant.email_unsubscribed=True (idempotent) and return a simple HTML page.
+    Transactional emails (force_send=True, e.g. DEEP_AUDIT_DONE) still go through.
+    """
+    from integrations.lifecycle_emails import verify_unsubscribe_token
+
+    tenant_id = verify_unsubscribe_token(t)
+    if tenant_id is None:
+        return HTMLResponse(
+            content=(
+                "<html><body style='font-family:-apple-system,sans-serif;max-width:500px;margin:60px auto;padding:24px;'>"
+                "<h2>Invalid link</h2>"
+                "<p>This unsubscribe link is invalid or has expired.</p>"
+                "<p style='color:#666;font-size:13px;'>Email <a href='mailto:support@firepan.com'>support@firepan.com</a> if you keep receiving mail.</p>"
+                "</body></html>"
+            ),
+            status_code=400,
+        )
+
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if tenant is None:
+        return HTMLResponse(
+            content="<html><body><h2>Account not found</h2></body></html>",
+            status_code=404,
+        )
+
+    if not tenant.email_unsubscribed:
+        tenant.email_unsubscribed = True
+        db.commit()
+
+    return HTMLResponse(
+        content=(
+            "<html><body style='font-family:-apple-system,sans-serif;max-width:500px;margin:60px auto;padding:24px;'>"
+            "<h2>You've been unsubscribed</h2>"
+            "<p>You will no longer receive marketing emails from Firepan.</p>"
+            "<p style='color:#666;font-size:14px;'>Critical security notifications (completed deep audits, etc.) will still reach you.</p>"
+            "<p><a href='https://app.firepan.com'>Return to Firepan</a></p>"
+            "</body></html>"
+        ),
+        status_code=200,
+    )
+
+
+# =============================================================================
 # AGENT-NATIVE AUDIT ROUTES — mounted after dependencies are defined
 # =============================================================================
 
@@ -5983,6 +6036,17 @@ async def create_repository(
     db.add(project)
     db.commit()
     db.refresh(project)
+
+    # Lifecycle: stamp first_repo_connected_at + last_activity_at (dashboard path).
+    # The GitHub App webhook path in integrations/github_app.py does the same.
+    try:
+        if tenant is not None:
+            if tenant.first_repo_connected_at is None:
+                tenant.first_repo_connected_at = now
+            tenant.last_activity_at = now
+            db.commit()
+    except Exception:
+        logger.exception("Lifecycle stamp (first_repo_connected_at) failed for tenant=%s", tenant_id)
 
     # Send Telegram notification for new repo (fire-and-forget)
     try:

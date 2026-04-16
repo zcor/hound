@@ -455,6 +455,29 @@ async def github_callback(
         db.commit()
         logger.info("GitHub login: %s (tenant_id=%d, new=%s)", github_user["login"], user.tenant_id, is_new_user)
 
+    # 3b. Lifecycle hooks (post-both-branches — covers both existing-user and new-user paths)
+    try:
+        tenant_obj = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+        if tenant_obj is not None:
+            tenant_obj.last_activity_at = datetime.now(timezone.utc)
+            if is_new_user and not tenant_obj.contact_email:
+                # Backfill contact_email from GitHub profile (leave email_verified=False —
+                # GitHub "email verified" is not our bar; user must still verify via our flow).
+                gh_email = (github_user.get("email") or user.email or "").strip()
+                if gh_email:
+                    tenant_obj.contact_email = gh_email
+            db.commit()
+            if is_new_user and tenant_obj.contact_email:
+                from integrations.lifecycle_emails import EmailCode, safe_dispatch
+                await safe_dispatch(
+                    EmailCode.WELCOME_VERIFY,
+                    tenant_obj,
+                    db,
+                    dedup_key=EmailCode.WELCOME_VERIFY.value,
+                )
+    except Exception:
+        logger.exception("Lifecycle hook (github login) failed for tenant=%s", user.tenant_id)
+
     # 4. Generate slim JWT (no PII)
     access_token = create_access_token(data={
         "user_id": user.id,
@@ -576,6 +599,15 @@ async def google_callback(
                     tenant.email_verified_at = datetime.now(timezone.utc)
 
         _log_oauth_event(db, user.id, "login", "google", google_id, request)
+        # Lifecycle: stamp last_activity_at. No email dispatch here — the Beat
+        # tick fires GETTING_STARTED 1h after email_verified_at is set.
+        try:
+            if user.tenant_id:
+                tenant_obj = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+                if tenant_obj is not None:
+                    tenant_obj.last_activity_at = datetime.now(timezone.utc)
+        except Exception:
+            logger.exception("last_activity_at bump failed (google login) for tenant=%s", user.tenant_id)
         db.commit()
         db.refresh(user)
 
@@ -651,6 +683,24 @@ async def google_callback(
     _log_oauth_event(db, user.id, "login_new", "google", google_id, request)
     db.commit()
     logger.info("Google login (new): %s (tenant_id=%d)", google_email, user.tenant_id)
+
+    # Lifecycle: Google auto-verifies email, so send WELCOME_VERIFIED (not WELCOME_VERIFY —
+    # that copy asks the user to verify their email, which would be wrong here).
+    # The Beat tick will fire GETTING_STARTED 1h after email_verified_at (set above at tenant create).
+    try:
+        tenant_obj = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
+        if tenant_obj is not None:
+            tenant_obj.last_activity_at = datetime.now(timezone.utc)
+            db.commit()
+            from integrations.lifecycle_emails import EmailCode, safe_dispatch
+            await safe_dispatch(
+                EmailCode.WELCOME_VERIFIED,
+                tenant_obj,
+                db,
+                dedup_key=EmailCode.WELCOME_VERIFIED.value,
+            )
+    except Exception:
+        logger.exception("WELCOME_VERIFIED dispatch failed for tenant=%s", user.tenant_id)
 
     access_token = create_access_token(data={
         "user_id": user.id,

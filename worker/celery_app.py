@@ -99,4 +99,12 @@ celery_app.conf.beat_schedule = {
         "task": "worker.tasks.auto_finalize_reviews_task",
         "schedule": crontab(hour="*/6", minute=15),  # Every 6 hours
     },
+    "lifecycle-tick": {
+        "task": "worker.tasks.run_lifecycle_tick_task",
+        "schedule": crontab(minute="*/10"),  # Every 10 minutes — evaluates time-gated lifecycle email rules
+    },
+    "retry-failed-lifecycle": {
+        "task": "worker.tasks.retry_failed_lifecycle_emails_task",
+        "schedule": crontab(minute="*/15"),  # Every 15 minutes — reaps stale pending + retries failed sends
+    },
 }

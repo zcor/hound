@@ -203,7 +203,15 @@ def handle_installation_created(payload: dict[str, Any], db_session: Session) ->
                 status="active"
             )
             db_session.add(project)
-    
+
+    # Lifecycle: stamp first_repo_connected_at on the tenant if this batch introduced any repos.
+    # (The commit below persists both the new Project rows and this stamp atomically.)
+    from datetime import datetime, timezone
+    now_ts = datetime.now(timezone.utc)
+    if tenant.first_repo_connected_at is None:
+        tenant.first_repo_connected_at = now_ts
+    tenant.last_activity_at = now_ts
+
     db_session.commit()
 
 

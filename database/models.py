@@ -103,6 +103,14 @@ class Tenant(Base):
     email_verified = Column(Boolean, nullable=False, default=False)
     email_verified_at = Column(DateTime, nullable=True)
 
+    # Lifecycle email funnel — timestamps drive time-gated Beat rules (Ian's cadence)
+    first_repo_connected_at = Column(DateTime, nullable=True)
+    first_scan_at = Column(DateTime, nullable=True)
+    first_deep_audit_at = Column(DateTime, nullable=True)
+    last_activity_at = Column(DateTime, nullable=True)  # any scan/audit/login
+    last_email_sent_at = Column(DateTime, nullable=True)  # throttling for follow-up rules
+    email_unsubscribed = Column(Boolean, nullable=False, default=False)
+
     # Relationships
     projects = relationship("Project", back_populates="tenant", cascade="all, delete-orphan")
     scan_executions = relationship("ScanExecution", back_populates="tenant", cascade="all, delete-orphan")
@@ -667,6 +675,50 @@ class PageView(Base):
         return f"<PageView(path='{self.path}', visitor_id='{self.visitor_id}')>"
 
 
+class SentEmail(Base):
+    """Lifecycle email send log — idempotency, status tracking, retry state.
+
+    One row per (tenant_id, code, dedup_key). See docs in
+    `integrations/lifecycle_emails.py` and the implementation plan
+    `/Users/gerrithall/.claude/plans/eventual-shimmying-flame.md` for the full contract.
+
+    Key invariants:
+      - Only `_perform_send_and_update_status()` in `lifecycle_emails.py` mutates
+        `attempt_count` and the during-send `last_attempt_at`. The INSERT path
+        uses `last_attempt_at` as a claim marker (not an attempt timestamp).
+      - `metadata_json` holds everything the retry task needs to resend byte-
+        equivalent email content: `{"extra_data": {...}, "force_send": bool, "to_email": "..."}`.
+      - `dispatch()` (request path) NEVER retries `failed` rows. Beat task
+        `retry_failed_lifecycle_emails_task` owns all retry/backoff behavior.
+    """
+    __tablename__ = "sent_emails"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
+    code = Column(String(64), nullable=False, index=True)  # EmailCode enum value
+    dedup_key = Column(String(255), nullable=False)         # per-rule idempotency key
+    status = Column(String(16), nullable=False, default="pending")  # pending | sent | failed
+
+    created_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+    last_attempt_at = Column(DateTime, nullable=True)   # bumped by helper on each POST attempt
+    sent_at = Column(DateTime, nullable=True)           # set once on successful send
+
+    template_id = Column(String(64), nullable=True)     # SendGrid template ID snapshot
+    subject = Column(String(255), nullable=True)        # rendered subject snapshot for auditability
+    metadata_json = Column(JSONType, nullable=True)     # resend payload (see docstring)
+    send_error = Column(Text, nullable=True)            # last SendGrid error message
+    attempt_count = Column(Integer, nullable=False, default=0)  # helper-incremented
+
+    tenant = relationship("Tenant")
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "code", "dedup_key", name="uq_sent_email_tenant_code_dedup"),
+    )
+
+    def __repr__(self):
+        return f"<SentEmail(id={self.id}, tenant_id={self.tenant_id}, code='{self.code}', status='{self.status}')>"
+
+
 # Model pricing table (per 1M tokens) - Updated January 2026
 MODEL_PRICING = {
     # OpenAI
@@ -806,6 +858,15 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMP WITH TIME ZONE"))
             # GitHub OAuth scope tracking
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS github_token_scopes VARCHAR(500)"))
+
+            # Lifecycle email funnel columns on tenants
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS first_repo_connected_at TIMESTAMP WITH TIME ZONE"))
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS first_scan_at TIMESTAMP WITH TIME ZONE"))
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS first_deep_audit_at TIMESTAMP WITH TIME ZONE"))
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMP WITH TIME ZONE"))
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_email_sent_at TIMESTAMP WITH TIME ZONE"))
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS email_unsubscribed BOOLEAN NOT NULL DEFAULT FALSE"))
+            # sent_emails table (create_all() handles new table creation; no ALTERs needed here unless columns change later)
 
 
 def init_database(engine):

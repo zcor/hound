@@ -89,3 +89,53 @@ def test_beat_has_required_vars():
     required = {"DATABASE_URL", "REDIS_URL", "CELERY_BROKER_URL"}
     missing = required - compose_vars
     assert not missing, f"Beat missing required env vars: {sorted(missing)}"
+
+
+# -----------------------------------------------------------------------------
+# Lifecycle email funnel — SendGrid env vars must be wired to api/worker/beat
+# -----------------------------------------------------------------------------
+
+# Rationale: same Stripe-incident pattern. If SENDGRID_* vars are in .env but
+# not in docker-compose.yml environment section, containers get empty strings
+# and all lifecycle emails silently fail. api dispatches event-driven emails
+# (WELCOME_*, DEEP_AUDIT_DONE) and serves the unsubscribe endpoint. worker runs
+# the lifecycle tick + retry task. beat schedules them.
+
+SENDGRID_LIFECYCLE_VARS = {
+    "SENDGRID_API_KEY",
+    "SENDGRID_FROM_EMAIL",
+    "SENDGRID_FROM_NAME",
+    "SENDGRID_REPLY_TO",
+    "SENDGRID_TEMPLATE_ID_DEFAULT",
+    "API_BASE_URL",
+}
+
+
+def test_api_has_sendgrid_lifecycle_vars():
+    compose_vars = _parse_compose_env_vars("api")
+    missing = SENDGRID_LIFECYCLE_VARS - compose_vars
+    assert not missing, (
+        f"API service missing lifecycle email env vars: {sorted(missing)}. "
+        f"Without these, WELCOME_VERIFY/WELCOME_VERIFIED/DEEP_AUDIT_DONE dispatches and "
+        f"the unsubscribe endpoint will silently fail with empty-string config."
+    )
+
+
+def test_worker_has_sendgrid_lifecycle_vars():
+    compose_vars = _parse_compose_env_vars("worker")
+    missing = SENDGRID_LIFECYCLE_VARS - compose_vars
+    assert not missing, (
+        f"Worker service missing lifecycle email env vars: {sorted(missing)}. "
+        f"Worker runs run_lifecycle_tick_task + retry_failed_lifecycle_emails_task; "
+        f"without these, Beat-driven lifecycle emails (GETTING_STARTED, FIRST_SCAN_CELEBRATION) silently fail."
+    )
+
+
+def test_beat_has_sendgrid_lifecycle_vars():
+    compose_vars = _parse_compose_env_vars("beat")
+    missing = SENDGRID_LIFECYCLE_VARS - compose_vars
+    assert not missing, (
+        f"Beat service missing lifecycle email env vars: {sorted(missing)}. "
+        f"Beat imports worker tasks at startup (including run_lifecycle_tick_task) — "
+        f"SendGrid env must be present even though Beat itself doesn't call SendGrid."
+    )

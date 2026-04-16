@@ -920,25 +920,39 @@ def execute_audit_task(
         except Exception:
             pass  # non-critical
 
-        # Send email notification if tenant has contact_email
+        # Lifecycle: stamp first_deep_audit_at + last_activity_at, send transactional email
         try:
             from database.models import Tenant
+            from datetime import datetime, timezone
             _db = self.get_db_session()
             try:
                 _tenant = _db.query(Tenant).filter(Tenant.id == tenant_id).first()
-                if _tenant and _tenant.contact_email:
-                    from integrations.email import send_audit_complete_email
-                    asyncio.run(send_audit_complete_email(
-                        to_email=_tenant.contact_email,
-                        project_name=project_name or "your repository",
-                        findings_count=len(hypotheses),
-                        assessment_level=assessment,
-                        session_id=scan_id,
-                    ))
+                if _tenant:
+                    now_ts = datetime.now(timezone.utc)
+                    if _tenant.first_deep_audit_at is None:
+                        _tenant.first_deep_audit_at = now_ts
+                    _tenant.last_activity_at = now_ts
+                    _db.commit()
+
+                    if _tenant.contact_email:
+                        from integrations.lifecycle_emails import EmailCode, safe_dispatch
+                        asyncio.run(safe_dispatch(
+                            EmailCode.DEEP_AUDIT_DONE,
+                            _tenant,
+                            _db,
+                            dedup_key=f"audit:{scan_id}",
+                            extra_data={
+                                "project_name": project_name or "your repository",
+                                "findings_count": len(hypotheses),
+                                "assessment_level": (assessment or "COMPLETE").upper(),
+                                "session_id": scan_id,
+                            },
+                            force_send=True,  # transactional — ignore email_unsubscribed
+                        ))
             finally:
                 _db.close()
         except Exception as e:
-            print(f"[DEBUG] Email notification failed (non-critical): {e}")
+            print(f"[DEBUG] Lifecycle hook (deep audit complete) failed (non-critical): {e}")
 
         publisher.publish_status(
             "in_review",
@@ -1136,6 +1150,26 @@ def execute_scan_task(
             final_status,
             scan_error or f"Scan complete. Risk score: {result_dict.get('risk_score', 0)}"
         )
+
+        # Lifecycle: stamp first_scan_at + last_activity_at so the Beat tick can
+        # fire FIRST_SCAN_CELEBRATION 30min later. Only on success.
+        if final_status == "completed":
+            try:
+                from database.models import Tenant
+                from datetime import datetime, timezone
+                _db = self.get_db_session()
+                try:
+                    _tenant = _db.query(Tenant).filter(Tenant.id == tenant_id).first()
+                    if _tenant:
+                        now_ts = datetime.now(timezone.utc)
+                        if _tenant.first_scan_at is None:
+                            _tenant.first_scan_at = now_ts
+                        _tenant.last_activity_at = now_ts
+                        _db.commit()
+                finally:
+                    _db.close()
+            except Exception as e:
+                print(f"[DEBUG] Lifecycle stamp (first_scan_at) failed (non-critical): {e}")
 
         # Post findings to PR if this was triggered by a PR event
         if pr_number and repo_full_name and installation_id:
@@ -2295,5 +2329,251 @@ def auto_finalize_reviews_task():
     except Exception:
         logger.exception("auto_finalize: failed")
         db.rollback()
+    finally:
+        db.close()
+
+
+# ============================================================================
+# Lifecycle email Beat tasks
+# ============================================================================
+# See integrations/lifecycle_emails.py for the dispatcher contract.
+# Invariants (see module docstring there):
+#   1. dispatch() never retries failed rows.
+#   2. Beat owns ALL retry/backoff behavior.
+#   3. _perform_send_and_update_status() is the only writer of attempt_count.
+#   4. metadata_json contains everything needed for byte-equivalent resend.
+
+
+def _backoff_minutes(attempt_count: int) -> int:
+    """Step-function backoff: 1→15min, 2→60min, 3→240min (4h), 4→720min (12h), >=5→1440min (24h)."""
+    if attempt_count <= 1:
+        return 15
+    if attempt_count == 2:
+        return 60
+    if attempt_count == 3:
+        return 240
+    if attempt_count == 4:
+        return 720
+    return 1440
+
+
+@celery_app.task(name="worker.tasks.run_lifecycle_tick_task")
+def run_lifecycle_tick_task():
+    """Evaluate time-gated lifecycle-email rules and dispatch due sends.
+
+    MVP rules:
+      - rule_getting_started: 1h post email_verified_at
+      - rule_first_scan_celebration: 30min post first_scan_at (skipped if deep-audit already ran)
+
+    Follow-up PR will append more rules to the RULES list inside this task.
+    """
+    import asyncio as _asyncio
+    import logging
+
+    from database.models import SentEmail, Tenant, create_db_engine, create_db_session
+    from integrations.lifecycle_emails import EmailCode, dispatch
+
+    logger = logging.getLogger(__name__)
+    db_url = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
+    engine = create_db_engine(db_url)
+    db = create_db_session(engine)
+
+    try:
+        now = datetime.now(timezone.utc)
+        # Narrow scan: only tenants with at least one trigger stamp in the last 30 days.
+        # Keeps the query cheap even at scale; follow-up rules with longer windows
+        # can add more OR predicates here.
+        cutoff = now - timedelta(days=30)
+        tenants = (
+            db.query(Tenant)
+            .filter(
+                (Tenant.email_verified_at >= cutoff) |
+                (Tenant.first_scan_at >= cutoff)
+            )
+            .all()
+        )
+
+        def _already_sent_or_pending(tenant_id: int, code: str, dedup_key: str) -> bool:
+            existing = (
+                db.query(SentEmail)
+                .filter(
+                    SentEmail.tenant_id == tenant_id,
+                    SentEmail.code == code,
+                    SentEmail.dedup_key == dedup_key,
+                )
+                .first()
+            )
+            # We skip if anything already exists — dispatch() handles the fine-grained
+            # duplicate/pending/failed cases; the tick just avoids pointless calls.
+            return existing is not None
+
+        dispatched = 0
+        for tenant in tenants:
+            # Rule 1: GETTING_STARTED — 1h after email_verified_at
+            try:
+                if tenant.email_verified_at:
+                    elapsed = now - tenant.email_verified_at
+                    if elapsed >= timedelta(hours=1):
+                        dedup = EmailCode.GETTING_STARTED.value
+                        if not _already_sent_or_pending(tenant.id, EmailCode.GETTING_STARTED.value, dedup):
+                            _asyncio.run(dispatch(
+                                EmailCode.GETTING_STARTED,
+                                tenant, db,
+                                dedup_key=dedup,
+                                extra_data={},
+                            ))
+                            dispatched += 1
+            except Exception:
+                logger.exception("lifecycle_tick GETTING_STARTED failed for tenant=%s", tenant.id)
+
+            # Rule 2: FIRST_SCAN_CELEBRATION — 30min after first_scan_at, and only if deep audit hasn't run yet
+            try:
+                if tenant.first_scan_at and not tenant.first_deep_audit_at:
+                    elapsed = now - tenant.first_scan_at
+                    if elapsed >= timedelta(minutes=30):
+                        dedup = EmailCode.FIRST_SCAN_CELEBRATION.value
+                        if not _already_sent_or_pending(tenant.id, EmailCode.FIRST_SCAN_CELEBRATION.value, dedup):
+                            _asyncio.run(dispatch(
+                                EmailCode.FIRST_SCAN_CELEBRATION,
+                                tenant, db,
+                                dedup_key=dedup,
+                                extra_data={},
+                            ))
+                            dispatched += 1
+            except Exception:
+                logger.exception("lifecycle_tick FIRST_SCAN_CELEBRATION failed for tenant=%s", tenant.id)
+
+        if dispatched:
+            logger.info("lifecycle_tick: dispatched %d lifecycle email(s) across %d tenants",
+                        dispatched, len(tenants))
+    except Exception:
+        logger.exception("lifecycle_tick: top-level failure")
+    finally:
+        db.close()
+
+
+@celery_app.task(name="worker.tasks.retry_failed_lifecycle_emails_task")
+def retry_failed_lifecycle_emails_task():
+    """Reclaim stale pending rows and retry failed rows with exponential backoff.
+
+    Two passes per run (every 15 min):
+      A. Stale-pending reaper: status='pending' AND last_attempt_at < now - 10min
+         → re-claim marker and run shared helper.
+      B. Failed-row retry with backoff: status='failed' AND created_at within 72h
+         AND last_attempt_at < now - backoff(attempt_count)
+         → re-claim (flip status='pending') and run shared helper.
+    """
+    import asyncio as _asyncio
+    import logging
+
+    from database.models import SentEmail, Tenant, create_db_engine, create_db_session
+    from integrations.lifecycle_emails import _perform_send_and_update_status
+
+    logger = logging.getLogger(__name__)
+    db_url = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
+    engine = create_db_engine(db_url)
+    db = create_db_session(engine)
+
+    try:
+        now = datetime.now(timezone.utc)
+        stale_cutoff = now - timedelta(minutes=10)
+        created_cutoff = now - timedelta(hours=72)
+
+        retried = 0
+        reaped = 0
+
+        # Pass A: Stale-pending reaper
+        stale_rows = (
+            db.query(SentEmail)
+            .filter(
+                SentEmail.status == "pending",
+                SentEmail.last_attempt_at < stale_cutoff,
+            )
+            .limit(100)
+            .all()
+        )
+        for row in stale_rows:
+            original_last_attempt = row.last_attempt_at
+            claimed = (
+                db.query(SentEmail)
+                .filter(
+                    SentEmail.id == row.id,
+                    SentEmail.status == "pending",
+                    SentEmail.last_attempt_at == original_last_attempt,
+                )
+                .update(
+                    {SentEmail.last_attempt_at: now},
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            if claimed != 1:
+                continue  # lost race
+            db.refresh(row)
+            tenant = db.query(Tenant).filter(Tenant.id == row.tenant_id).first()
+            if tenant is None:
+                row.status = "failed"
+                row.send_error = "tenant missing"
+                db.commit()
+                continue
+            try:
+                _asyncio.run(_perform_send_and_update_status(row, tenant, db))
+                reaped += 1
+            except Exception:
+                logger.exception("retry_failed_lifecycle: helper crashed on stale row id=%s", row.id)
+
+        # Pass B: Failed-row retry with exponential backoff
+        failed_rows = (
+            db.query(SentEmail)
+            .filter(
+                SentEmail.status == "failed",
+                SentEmail.created_at > created_cutoff,
+            )
+            .limit(500)
+            .all()
+        )
+        for row in failed_rows:
+            backoff = _backoff_minutes(row.attempt_count or 1)
+            if row.last_attempt_at is None:
+                # No attempt yet recorded — eligible
+                eligible = True
+            else:
+                eligible = row.last_attempt_at < now - timedelta(minutes=backoff)
+            if not eligible:
+                continue
+
+            original_last_attempt = row.last_attempt_at
+            claimed = (
+                db.query(SentEmail)
+                .filter(
+                    SentEmail.id == row.id,
+                    SentEmail.status == "failed",
+                    SentEmail.last_attempt_at == original_last_attempt,
+                )
+                .update(
+                    {SentEmail.status: "pending", SentEmail.last_attempt_at: now},
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            if claimed != 1:
+                continue  # lost race
+            db.refresh(row)
+            tenant = db.query(Tenant).filter(Tenant.id == row.tenant_id).first()
+            if tenant is None:
+                row.status = "failed"
+                row.send_error = "tenant missing"
+                db.commit()
+                continue
+            try:
+                _asyncio.run(_perform_send_and_update_status(row, tenant, db))
+                retried += 1
+            except Exception:
+                logger.exception("retry_failed_lifecycle: helper crashed on failed row id=%s", row.id)
+
+        if reaped or retried:
+            logger.info("retry_failed_lifecycle: reaped=%d, retried=%d", reaped, retried)
+    except Exception:
+        logger.exception("retry_failed_lifecycle: top-level failure")
     finally:
         db.close()

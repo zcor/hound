@@ -11,9 +11,16 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
-FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "noreply@firepan.com")
-FROM_NAME = os.environ.get("SENDGRID_FROM_NAME", "FirePan")
+
+def _env(name: str, default: str | None = None) -> str | None:
+    """Read env at call time, not import time.
+
+    Celery workers, FastAPI workers, and scripts all import this module at
+    different times. Reading at import time means changes to os.environ after
+    dotenv-loading don't propagate.
+    """
+    return os.environ.get(name, default)
+
 
 SENDGRID_API_URL = "https://api.sendgrid.com/v3/mail/send"
 
@@ -27,13 +34,16 @@ async def send_email(
 
     Returns True if sent successfully, False otherwise.
     """
-    if not SENDGRID_API_KEY:
+    api_key = _env("SENDGRID_API_KEY")
+    from_email = _env("SENDGRID_FROM_EMAIL", "noreply@firepan.com")
+    from_name = _env("SENDGRID_FROM_NAME", "Firepan Team")
+    if not api_key:
         logger.warning("SENDGRID_API_KEY not configured — skipping email")
         return False
 
     payload = {
         "personalizations": [{"to": [{"email": to_email}]}],
-        "from": {"email": FROM_EMAIL, "name": FROM_NAME},
+        "from": {"email": from_email, "name": from_name},
         "subject": subject,
         "content": [{"type": "text/html", "value": html_content}],
     }
@@ -44,7 +54,7 @@ async def send_email(
                 SENDGRID_API_URL,
                 json=payload,
                 headers={
-                    "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                    "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
             )
@@ -59,6 +69,75 @@ async def send_email(
     except Exception:
         logger.exception("Failed to send email to %s", to_email)
         return False
+
+
+async def send_template_email(
+    to_email: str,
+    template_id: str,
+    dynamic_data: dict,
+    *,
+    categories: list[str] | None = None,
+    custom_args: dict | None = None,
+) -> tuple[bool, str | None]:
+    """Send a Dynamic Template email via SendGrid API.
+
+    All lifecycle emails go through this function. Subject is controlled by the
+    template's `subject: {{subject_line}}` configuration (we don't set a top-level
+    subject here — it would override the template).
+
+    Returns (success, error_message). On success, error_message is None. On
+    failure, error_message is a short description suitable for `SentEmail.send_error`.
+    """
+    api_key = _env("SENDGRID_API_KEY")
+    from_email = _env("SENDGRID_FROM_EMAIL", "noreply@firepan.com")
+    from_name = _env("SENDGRID_FROM_NAME", "Firepan Team")
+    reply_to = _env("SENDGRID_REPLY_TO", "support@firepan.com")
+
+    if not api_key:
+        logger.warning("SENDGRID_API_KEY not configured — skipping template email")
+        return False, "SENDGRID_API_KEY not configured"
+    if not template_id:
+        logger.error("No template_id provided for send_template_email")
+        return False, "no template_id provided"
+
+    payload: dict = {
+        "personalizations": [{
+            "to": [{"email": to_email}],
+            "dynamic_template_data": dynamic_data,
+        }],
+        "from": {"email": from_email, "name": from_name},
+        "reply_to": {"email": reply_to},
+        "template_id": template_id,
+    }
+    if categories:
+        payload["categories"] = categories
+    if custom_args:
+        # SendGrid custom_args must be strings
+        payload["custom_args"] = {k: str(v) for k, v in custom_args.items()}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                SENDGRID_API_URL,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+            if response.status_code in (200, 201, 202):
+                logger.info(
+                    "Template email sent to %s (template=%s, categories=%s)",
+                    to_email, template_id, categories,
+                )
+                return True, None
+            else:
+                err = f"SendGrid {response.status_code}: {response.text[:500]}"
+                logger.error(err)
+                return False, err
+    except Exception as exc:
+        logger.exception("Failed to send template email to %s", to_email)
+        return False, f"exception: {type(exc).__name__}: {exc}"
 
 
 async def send_audit_complete_email(

@@ -95,74 +95,92 @@ class EmailSpec:
 # Keep the inline HTML tight and free of per-email template tags — the master
 # SendGrid design wraps everything with header/footer/unsubscribe. Only put
 # hero copy + body paragraphs + optional P.S. here.
+#
+# STYLING NOTES (2026-04-16 — after the first send rendered unreadable):
+#   - The SendGrid design uses a DARK theme: bg #0D0D0D, body text #CCCCCC,
+#     muted #AAAAAA, accent #DEFF71.
+#   - Ian's `{{{body_content}}}` slot is wrapped in an outer
+#     `<p style="color:#CCCCCC">`. When our body HTML contains nested `<p>`
+#     tags, Gmail / Outlook break out of the outer `<p>` and the inner ones
+#     inherit nothing — rendering as near-invisible very-dark-grey text.
+#   - Fix: do NOT wrap paragraphs in `<p>`. Use `<div style="margin:0 0 18px 0">`
+#     blocks (block-level, colors can be set explicitly, no `<p>`-in-`<p>` issue).
+#   - Every block sets an explicit color from the design palette so email
+#     clients that strip the outer wrapper still render readably.
+#   - Code blocks use a dark-mode-appropriate bg (#1A1A1A) and light text.
 
-_WELCOME_VERIFY_BODY = """
-<p>Welcome to Firepan. You just signed up for the most important thing you can do for your protocol — continuous security monitoring that works as fast as you ship.</p>
-<p>Before you can run your first scan, one quick step: <strong>verify your email.</strong></p>
-<p>Once verified, you'll be able to:</p>
-<ul>
+_TEXT_COLOR = "#CCCCCC"         # primary body
+_MUTED_COLOR = "#AAAAAA"        # PS / sender footer (muted but still readable on #0D0D0D)
+_ACCENT_COLOR = "#DEFF71"       # brand yellow accent
+_BLOCK_STYLE = f"margin:0 0 18px 0; font-family:Arial,sans-serif; font-size:15px; color:{_TEXT_COLOR}; line-height:1.7;"
+_MUTED_STYLE = f"margin:0 0 12px 0; font-family:Arial,sans-serif; font-size:14px; color:{_MUTED_COLOR}; line-height:1.6;"
+_CODE_STYLE = "margin:0 0 18px 0; background:#1A1A1A; border:1px solid #2A2A2A; padding:12px 14px; border-radius:6px; font-family:'Space Mono',Consolas,monospace; font-size:13px; color:#E0E0E0; white-space:pre-wrap;"
+_UL_STYLE = f"margin:0 0 18px 0; padding-left:22px; font-family:Arial,sans-serif; font-size:15px; color:{_TEXT_COLOR}; line-height:1.7;"
+
+_WELCOME_VERIFY_BODY = f"""
+<div style="{_BLOCK_STYLE}">Welcome to Firepan. You just signed up for the most important thing you can do for your protocol — continuous security monitoring that works as fast as you ship.</div>
+<div style="{_BLOCK_STYLE}">Before you can run your first scan, one quick step: <strong style="color:#FFFFFF;">verify your email.</strong></div>
+<div style="{_BLOCK_STYLE}">Once verified, you'll be able to:</div>
+<ul style="{_UL_STYLE}">
   <li>Run a Surface Scan on your contracts in ~2 seconds</li>
   <li>Get a security score from 0–100 across your codebase</li>
   <li>See open vulnerabilities sorted by severity</li>
 </ul>
-<p>Your trial is already running — most teams get value in the first 24 hours.</p>
-<p style="color: #666; font-size: 14px;">— The Firepan Team</p>
-<p style="color: #666; font-size: 13px;">P.S. If you have a Solidity or Vyper repo ready, installing the <a href="https://github.com/apps/firepan-ai">Firepan GitHub App</a> takes about 60 seconds and will automatically scan every PR going forward.</p>
+<div style="{_BLOCK_STYLE}">Your trial is already running — most teams get value in the first 24 hours.</div>
+<div style="{_MUTED_STYLE}">— The Firepan Team</div>
+<div style="{_MUTED_STYLE}">P.S. If you have a Solidity or Vyper repo ready, installing the <a href="https://github.com/apps/firepan-ai" style="color:{_ACCENT_COLOR};">Firepan GitHub App</a> takes about 60 seconds and will automatically scan every PR going forward.</div>
 """
 
-_WELCOME_VERIFIED_BODY = """
-<p>Welcome to Firepan. You just signed up for the most important thing you can do for your protocol — continuous security monitoring that works as fast as you ship.</p>
-<p>You're all set — let's get your contracts scan-ready.</p>
-<p>Once signed in, you'll be able to:</p>
-<ul>
+_WELCOME_VERIFIED_BODY = f"""
+<div style="{_BLOCK_STYLE}">Welcome to Firepan. You just signed up for the most important thing you can do for your protocol — continuous security monitoring that works as fast as you ship.</div>
+<div style="{_BLOCK_STYLE}">You're all set — let's get your contracts scan-ready.</div>
+<div style="{_BLOCK_STYLE}">Once signed in, you'll be able to:</div>
+<ul style="{_UL_STYLE}">
   <li>Run a Surface Scan on your contracts in ~2 seconds</li>
   <li>Get a security score from 0–100 across your codebase</li>
   <li>See open vulnerabilities sorted by severity</li>
 </ul>
-<p>Your trial is already running — most teams get value in the first 24 hours.</p>
-<p style="color: #666; font-size: 14px;">— The Firepan Team</p>
-<p style="color: #666; font-size: 13px;">P.S. If you have a Solidity or Vyper repo ready, installing the <a href="https://github.com/apps/firepan-ai">Firepan GitHub App</a> takes about 60 seconds and will automatically scan every PR going forward.</p>
+<div style="{_BLOCK_STYLE}">Your trial is already running — most teams get value in the first 24 hours.</div>
+<div style="{_MUTED_STYLE}">— The Firepan Team</div>
+<div style="{_MUTED_STYLE}">P.S. If you have a Solidity or Vyper repo ready, installing the <a href="https://github.com/apps/firepan-ai" style="color:{_ACCENT_COLOR};">Firepan GitHub App</a> takes about 60 seconds and will automatically scan every PR going forward.</div>
 """
 
-_GETTING_STARTED_BODY = """
-<p>You're verified. Now let's make your contracts scan-ready.</p>
-<p>You have three ways to get started — pick the one that fits your workflow:</p>
-<p><strong>Option 1: GitHub App (Recommended)</strong><br/>
-Install the GitHub App → select your repos → done. Every PR gets automatically scanned from here on.</p>
-<p><strong>Option 2: CLI</strong></p>
-<pre style="background:#f5f5f5;padding:12px;border-radius:6px;">pip install firepan-cli
+_GETTING_STARTED_BODY = f"""
+<div style="{_BLOCK_STYLE}">You're verified. Now let's make your contracts scan-ready.</div>
+<div style="{_BLOCK_STYLE}">You have three ways to get started — pick the one that fits your workflow:</div>
+<div style="{_BLOCK_STYLE}"><strong style="color:#FFFFFF;">Option 1: GitHub App (Recommended)</strong><br/>Install the GitHub App → select your repos → done. Every PR gets automatically scanned from here on.</div>
+<div style="{_BLOCK_STYLE}"><strong style="color:#FFFFFF;">Option 2: CLI</strong></div>
+<div style="{_CODE_STYLE}">pip install firepan-cli
 firepan login
-firepan scan https://github.com/your-org/your-repo --format html</pre>
-<p><strong>Option 3: Dashboard</strong><br/>
-Head to your Repositories page, connect a repo, and hit "Run Surface Scan."</p>
-<p>Most teams get their first results in under 5 minutes. The security score alone tends to be eye-opening.</p>
-<p style="color: #666; font-size: 14px;">— The Firepan Team</p>
+firepan scan https://github.com/your-org/your-repo --format html</div>
+<div style="{_BLOCK_STYLE}"><strong style="color:#FFFFFF;">Option 3: Dashboard</strong><br/>Head to your Repositories page, connect a repo, and hit "Run Surface Scan."</div>
+<div style="{_BLOCK_STYLE}">Most teams get their first results in under 5 minutes. The security score alone tends to be eye-opening.</div>
+<div style="{_MUTED_STYLE}">— The Firepan Team</div>
 """
 
-_FIRST_SCAN_CELEBRATION_BODY = """
-<p>Your first Firepan scan just finished.</p>
-<p>That's a good start, but here's the truth:</p>
-<p><strong>You haven't actually used Firepan yet.</strong></p>
-<p>Surface scans are fast — they catch obvious issues.</p>
-<p><strong>Deep Audits are where things break.</strong></p>
-<p>Deep Audits are where Firepan:</p>
-<ul>
+_FIRST_SCAN_CELEBRATION_BODY = f"""
+<div style="{_BLOCK_STYLE}">Your first Firepan scan just finished.</div>
+<div style="{_BLOCK_STYLE}">That's a good start, but here's the truth:</div>
+<div style="{_BLOCK_STYLE}"><strong style="color:#FFFFFF;">You haven't actually used Firepan yet.</strong></div>
+<div style="{_BLOCK_STYLE}">Surface scans are fast — they catch obvious issues.</div>
+<div style="{_BLOCK_STYLE}"><strong style="color:#FFFFFF;">Deep Audits are where things break.</strong></div>
+<div style="{_BLOCK_STYLE}">Deep Audits are where Firepan:</div>
+<ul style="{_UL_STYLE}">
   <li>Traces reentrancy paths across contracts</li>
   <li>Maps access control chains end-to-end</li>
   <li>Identifies edge cases that look safe in isolation but fail in composition</li>
 </ul>
-<p>It's not a scan. It's a full system analysis powered by multiple AI agents running in parallel.</p>
-<p>Most teams that convert run a Deep Audit within their first 24 hours — because it's the first time they actually <em>see</em> their risk. Your trial includes one.</p>
-<p>If you want help interpreting results, just reply. Happy to take a look.</p>
-<p style="color: #666; font-size: 14px;">— The Firepan Team</p>
+<div style="{_BLOCK_STYLE}">It's not a scan. It's a full system analysis powered by multiple AI agents running in parallel.</div>
+<div style="{_BLOCK_STYLE}">Most teams that convert run a Deep Audit within their first 24 hours — because it's the first time they actually <em style="color:#FFFFFF;">see</em> their risk. Your trial includes one.</div>
+<div style="{_BLOCK_STYLE}">If you want help interpreting results, just reply. Happy to take a look.</div>
+<div style="{_MUTED_STYLE}">— The Firepan Team</div>
 """
 
-_DEEP_AUDIT_DONE_BODY = """
-<p>Your deep audit for <strong>{project_name}</strong> is complete.</p>
-<p><strong>Assessment:</strong> {assessment_level}<br/>
-<strong>Findings:</strong> {findings_count}</p>
-<p>Open the full report in your dashboard to review findings, severity breakdowns, and proof-of-concept details for each.</p>
-<p style="color: #666; font-size: 14px;">— The Firepan Team</p>
+_DEEP_AUDIT_DONE_BODY = f"""
+<div style="{_BLOCK_STYLE}">Your deep audit for <strong style="color:#FFFFFF;">{{project_name}}</strong> is complete.</div>
+<div style="{_BLOCK_STYLE}"><strong style="color:#FFFFFF;">Assessment:</strong> {{assessment_level}}<br/><strong style="color:#FFFFFF;">Findings:</strong> {{findings_count}}</div>
+<div style="{_BLOCK_STYLE}">Open the full report in your dashboard to review findings, severity breakdowns, and proof-of-concept details for each.</div>
+<div style="{_MUTED_STYLE}">— The Firepan Team</div>
 """
 
 

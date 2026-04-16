@@ -337,6 +337,49 @@ def test_to_email_snapshotted_at_send_time(db, tenant, fake_send):
 
 
 # ---------------------------------------------------------------------------
+# Escape contract — body_content is raw HTML passthrough in the template,
+# so extra_data fields substituted into the body MUST be HTML-escaped to
+# prevent script injection. Subject/CTA fields are plain text — they keep
+# apostrophes raw (template uses triple-braces for subject too).
+# ---------------------------------------------------------------------------
+
+def test_body_escapes_extra_data_to_prevent_html_injection(db, tenant, fake_send):
+    """A malicious project_name must not inject HTML into the rendered body."""
+    _run(le.dispatch(
+        EmailCode.DEEP_AUDIT_DONE, tenant, db,
+        dedup_key="audit:evil",
+        extra_data={
+            "project_name": "<script>alert(1)</script>",
+            "session_id": "evil",
+            "findings_count": 0,
+            "assessment_level": "LOW",
+        },
+        force_send=True,
+    ))
+    fake_send.assert_called_once()
+    _args, kwargs = fake_send.call_args
+    body = kwargs["dynamic_data"]["body_content"]
+    assert "<script>" not in body, "body_content must HTML-escape user-controlled fields"
+    assert "&lt;script&gt;" in body, "expected HTML-entity-encoded script tag"
+
+
+def test_subject_and_cta_not_double_escaped(db, tenant, fake_send):
+    """Subject / cta_label stay plain text — apostrophes should pass through, not become `&#x27;`."""
+    _run(le.dispatch(
+        EmailCode.FIRST_SCAN_CELEBRATION, tenant, db,
+        dedup_key=EmailCode.FIRST_SCAN_CELEBRATION.value,
+    ))
+    fake_send.assert_called_once()
+    _args, kwargs = fake_send.call_args
+    data = kwargs["dynamic_data"]
+    # The subject is "You haven't actually used Firepan yet." — apostrophe must
+    # render as a real apostrophe, not as `&#x27;` or `&apos;`.
+    assert "haven't" in data["subject_line"]
+    assert "&apos;" not in data["subject_line"]
+    assert "&#x27;" not in data["subject_line"]
+
+
+# ---------------------------------------------------------------------------
 # first_name resolution
 # ---------------------------------------------------------------------------
 

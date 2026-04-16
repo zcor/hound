@@ -28,7 +28,7 @@ from urllib.error import HTTPError
 
 DEFAULT_DESIGN_ID = "c1af79cf-a682-4888-b435-5656829d0ee6"
 DEFAULT_TEMPLATE_NAME = "firepan-lifecycle-v1"
-DEFAULT_SUBJECT = "{{subject_line}}"
+DEFAULT_SUBJECT = "{{{subject_line}}}"  # triple-braces: do NOT HTML-escape (preserve apostrophes in subject)
 
 
 def _request(method: str, url: str, api_key: str, body: dict | None = None) -> dict:
@@ -52,6 +52,17 @@ def fetch_design_html(api_key: str, design_id: str) -> str:
     if not html:
         raise RuntimeError(f"Design {design_id} has no html_content")
     print(f"Fetched design: {design.get('name')!r} ({len(html)} bytes HTML)")
+    # Ian's Design (c1af79cf-…) uses `{{body_content}}` (double braces, HTML-escaped)
+    # for the main content block. That escapes `<p>` to `&lt;p&gt;` which renders as
+    # literal text. Our LIFECYCLE_CONFIG body snippets are trusted HTML we wrote
+    # ourselves, so promote to `{{{body_content}}}` (raw passthrough).
+    # The other vars (subject, hero, cta_label, first_name) stay as double-braces
+    # because they're plain text — the one exception is the subject field which we
+    # set explicitly to `{{{subject_line}}}` below (the Design has no subject field).
+    if "{{{body_content}}}" not in html:
+        count = html.count("{{body_content}}")
+        html = html.replace("{{body_content}}", "{{{body_content}}}")
+        print(f"Promoted {count} occurrence(s) of body_content to triple-braces (raw HTML passthrough)")
     return html
 
 

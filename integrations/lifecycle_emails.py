@@ -23,6 +23,7 @@ from __future__ import annotations
 import hmac
 import hashlib
 import base64
+import html as _html
 import logging
 import os
 from dataclasses import dataclass, field
@@ -357,26 +358,51 @@ def _render_dynamic_data(
     subject_line, hero_subtitle, category, body_content, cta_label, cta_url,
     first_name, unsubscribe. Everything else (Sender_*, unsubscribe_preferences)
     is provided by SendGrid itself.
+
+    Escape contract (matched to `scripts/sendgrid_setup_template.py` template setup):
+      - `body_content`: rendered as `{{{body_content}}}` (triple-braces, raw HTML).
+        Any user-controlled fields we `.format()` into the body MUST be HTML-escaped
+        first — otherwise a malicious `project_name` could inject scripts.
+      - `subject_line`: rendered as `{{{subject_line}}}` (triple-braces, plain text
+        passthrough). Apostrophes are preserved; we don't put HTML in subjects.
+      - All other vars (hero_subtitle, cta_label, cta_url, first_name): rendered as
+        `{{var}}` (double-braces). SendGrid HTML-escapes them — we pass plain text.
     """
-    ctx = {"app_base": _app_base_url(), **extra_data}
-    # Format body with extra_data — missing keys fall back to literal braces.
+    # `body_content` is sent as raw HTML passthrough in the SendGrid template
+    # (the design uses `{{{body_content}}}` per scripts/sendgrid_setup_template.py),
+    # so any user-controlled fields we format INTO the body must be HTML-escaped
+    # first. `app_base` comes from our own env, safe to leave raw.
+    safe_ctx = {"app_base": _app_base_url()}
+    for k, v in extra_data.items():
+        if isinstance(v, str):
+            safe_ctx[k] = _html.escape(v, quote=True)
+        else:
+            safe_ctx[k] = v
+
+    # subject_line / hero_subtitle / cta_label / cta_url are plain-text fields
+    # rendered via double-brace {{var}} in the template (SendGrid HTML-escapes
+    # automatically), so they use the UN-escaped extra_data — otherwise single
+    # quotes would render as `&#x27;`. The subject field itself is triple-braced
+    # in our setup script so apostrophes there also pass through raw.
+    plain_ctx = {"app_base": _app_base_url(), **extra_data}
+
     try:
-        body = spec.body_content_html.format(**ctx)
+        body = spec.body_content_html.format(**safe_ctx)
     except (KeyError, IndexError):
         body = spec.body_content_html
 
     try:
-        hero = spec.hero_subtitle.format(**ctx)
+        hero = spec.hero_subtitle.format(**plain_ctx)
     except (KeyError, IndexError):
         hero = spec.hero_subtitle
 
     return {
-        "subject_line": _render_subject(spec, ctx),
+        "subject_line": _render_subject(spec, plain_ctx),
         "hero_subtitle": hero,
         "category": spec.category,
         "body_content": body,
         "cta_label": spec.cta_label,
-        "cta_url": _render_cta_url(spec, ctx),
+        "cta_url": _render_cta_url(spec, plain_ctx),
         "first_name": resolve_first_name(user),
         "unsubscribe": unsubscribe_url,
     }

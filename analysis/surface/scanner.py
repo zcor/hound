@@ -113,11 +113,12 @@ class SurfaceScanner:
         elapsed = time.time() - self._start_time if self._start_time else 0.0
         self._log_lines.append(f"[{elapsed:.1f}s] {msg}")
 
-    def scan(self, target: str) -> ScanResult:
+    def scan(self, target: str, ref: str | None = None) -> ScanResult:
         """Scan a repository for vulnerabilities.
 
         Args:
             target: GitHub URL or local path
+            ref: Optional git ref (branch/tag/SHA) to scan; defaults to repo HEAD
 
         Returns:
             ScanResult with findings and risk score
@@ -129,8 +130,8 @@ class SurfaceScanner:
 
         try:
             # Resolve target to local path
-            self._log(f"Resolving target: {target}")
-            repo_path, repo_url, cleanup_fn = self._resolve_target(target)
+            self._log(f"Resolving target: {target}" + (f" @ ref={ref}" if ref else ""))
+            repo_path, repo_url, cleanup_fn = self._resolve_target(target, ref=ref)
             self._log(f"Cloned/resolved to: {repo_path.name}")
 
             if not self.quiet:
@@ -356,7 +357,9 @@ class SurfaceScanner:
 
         return batch_result
 
-    def _resolve_target(self, target: str) -> tuple[Path, str | None, Callable[[], None] | None]:
+    def _resolve_target(
+        self, target: str, ref: str | None = None
+    ) -> tuple[Path, str | None, Callable[[], None] | None]:
         """Resolve target to local path, downloading if needed.
 
         Returns:
@@ -366,19 +369,27 @@ class SurfaceScanner:
         if target.startswith("http://") or target.startswith("https://"):
             # GitHub URL
             if "github.com" in target:
-                return self._fetch_github_repo(target)
+                return self._fetch_github_repo(target, ref=ref)
             else:
                 raise ValueError(f"Unsupported URL: {target}")
 
         # Local path
+        if ref:
+            self._log(f"Warning: ref={ref!r} ignored for local path target")
         local_path = Path(target).resolve()
         if not local_path.exists():
             raise ValueError(f"Path does not exist: {target}")
 
         return local_path, None, None
 
-    def _fetch_github_repo(self, url: str) -> tuple[Path, str, Callable[[], None]]:
+    def _fetch_github_repo(
+        self, url: str, ref: str | None = None
+    ) -> tuple[Path, str, Callable[[], None]]:
         """Fetch a GitHub repository as a tarball.
+
+        Args:
+            url: GitHub repo URL
+            ref: Optional git ref (branch/tag/SHA). Defaults to repo HEAD.
 
         Returns:
             (temp_dir_path, original_url, cleanup_function)
@@ -391,6 +402,12 @@ class SurfaceScanner:
 
         owner, repo = parts[0], parts[1].replace('.git', '')
         api_url = f"https://api.github.com/repos/{owner}/{repo}/tarball"
+        if ref:
+            from urllib.parse import quote
+            # GitHub treats {ref} as a single path segment — slashes must be %2F.
+            # Otherwise `feature/foo` parses as owner/repo/tarball/feature/foo
+            # and 404s.
+            api_url = f"{api_url}/{quote(ref, safe='')}"
 
         # Create temp directory
         temp_dir = tempfile.mkdtemp(prefix=f"hound_scan_{repo}_")
@@ -405,7 +422,8 @@ class SurfaceScanner:
                 headers["Authorization"] = f"token {self.github_token}"
 
             if not self.quiet:
-                console.print(f"[dim]Downloading {owner}/{repo}...[/dim]")
+                ref_disp = f" @ {ref}" if ref else ""
+                console.print(f"[dim]Downloading {owner}/{repo}{ref_disp}...[/dim]")
 
             with httpx.Client(follow_redirects=True, timeout=60.0) as client:
                 response = client.get(api_url, headers=headers)
@@ -413,6 +431,29 @@ class SurfaceScanner:
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
                     status = e.response.status_code
+                    # If a ref was specified and we got 404, the failure could be
+                    # a missing branch OR a private-repo auth problem (GitHub
+                    # returns 404 for both). Pre-flight the repo URL itself to
+                    # disambiguate before raising the wrong sentinel.
+                    if status == 404 and ref:
+                        probe_url = f"https://api.github.com/repos/{owner}/{repo}"
+                        try:
+                            probe = client.get(probe_url, headers=headers)
+                            if probe.status_code == 200:
+                                raise ValueError(
+                                    f"REPO_BRANCH_NOT_FOUND: Branch '{ref}' not found in repository"
+                                ) from e
+                            if probe.status_code in (401, 403):
+                                if self.github_token:
+                                    raise ValueError(
+                                        "REPO_TOKEN_INVALID: GitHub token was rejected — may be revoked or expired"
+                                    ) from e
+                                raise ValueError(
+                                    "REPO_AUTH_REQUIRED: Repository requires authentication"
+                                ) from e
+                            # probe also 404 → fall through to repo-not-accessible mapping below
+                        except httpx.RequestError:
+                            pass  # network error during probe; fall through
                     if status == 404 and not self.github_token:
                         raise ValueError("REPO_AUTH_REQUIRED: Repository not accessible — may be private or require authentication") from e
                     elif status == 404 and self.github_token:
@@ -438,7 +479,12 @@ class SurfaceScanner:
                 return extracted_dirs[0], url, cleanup
 
         except ValueError as e:
-            if "REPO_AUTH_REQUIRED" in str(e) or "REPO_TOKEN_INVALID" in str(e):
+            msg = str(e)
+            if (
+                "REPO_AUTH_REQUIRED" in msg
+                or "REPO_TOKEN_INVALID" in msg
+                or "REPO_BRANCH_NOT_FOUND" in msg
+            ):
                 cleanup()
                 raise  # Preserve sentinel for worker-level handling
             cleanup()

@@ -1105,6 +1105,112 @@ def test_trigger_scan_dispatches_github_user_id_for_oauth_repo(client, sample_pr
     assert call_kwargs["github_user_id"] == github_user.id
 
 
+def test_trigger_scan_passes_user_branch_to_worker_and_persists_in_scan_config(
+    client, sample_project, github_user, test_db
+):
+    """User-supplied branch flows into worker kwargs AND ScanExecution.scan_config."""
+    from unittest.mock import MagicMock, patch
+
+    from database.models import ScanExecution
+
+    mock_task = MagicMock()
+
+    def fake_require(action):
+        async def _check(request):
+            return {"uses_credit": False}
+        return _check
+
+    with patch("server.tier_enforcement.require_plan_allowance", fake_require):
+        with patch.dict("sys.modules", {"worker.tasks": MagicMock()}):
+            import sys
+            sys.modules["worker.tasks"].execute_scan_task = mock_task
+
+            response = client.post(
+                f"/repositories/{sample_project.id}/scan",
+                json={"branch": "feature/some-branch"},
+                headers=github_auth_headers(github_user),
+            )
+
+    assert response.status_code == 200
+    assert mock_task.delay.call_args.kwargs["branch"] == "feature/some-branch"
+
+    scan = (
+        test_db.query(ScanExecution)
+        .filter(ScanExecution.project_id == sample_project.id)
+        .order_by(ScanExecution.created_at.desc())
+        .first()
+    )
+    assert scan is not None
+    assert (scan.scan_config or {}).get("branch") == "feature/some-branch"
+    assert (scan.scan_config or {}).get("scan_type") == "surface"
+
+
+def test_trigger_scan_falls_back_to_default_branch_when_body_omitted(
+    client, sample_project, github_user, test_db
+):
+    """No body → resolve to project.default_branch (or 'main' if column NULL)."""
+    from unittest.mock import MagicMock, patch
+
+    from database.models import ScanExecution
+
+    mock_task = MagicMock()
+
+    def fake_require(action):
+        async def _check(request):
+            return {"uses_credit": False}
+        return _check
+
+    with patch("server.tier_enforcement.require_plan_allowance", fake_require):
+        with patch.dict("sys.modules", {"worker.tasks": MagicMock()}):
+            import sys
+            sys.modules["worker.tasks"].execute_scan_task = mock_task
+
+            response = client.post(
+                f"/repositories/{sample_project.id}/scan",
+                headers=github_auth_headers(github_user),
+            )
+
+    assert response.status_code == 200
+    expected_branch = sample_project.default_branch or "main"
+    assert mock_task.delay.call_args.kwargs["branch"] == expected_branch
+
+    scan = (
+        test_db.query(ScanExecution)
+        .filter(ScanExecution.project_id == sample_project.id)
+        .order_by(ScanExecution.created_at.desc())
+        .first()
+    )
+    assert (scan.scan_config or {}).get("branch") == expected_branch
+
+
+def test_trigger_scan_rejects_branch_with_shell_metacharacters(
+    client, sample_project, github_user
+):
+    """Defence in depth: branches with `;`, backtick, etc. are 400, not dispatched."""
+    from unittest.mock import MagicMock, patch
+
+    mock_task = MagicMock()
+
+    def fake_require(action):
+        async def _check(request):
+            return {"uses_credit": False}
+        return _check
+
+    with patch("server.tier_enforcement.require_plan_allowance", fake_require):
+        with patch.dict("sys.modules", {"worker.tasks": MagicMock()}):
+            import sys
+            sys.modules["worker.tasks"].execute_scan_task = mock_task
+
+            response = client.post(
+                f"/repositories/{sample_project.id}/scan",
+                json={"branch": "main; rm -rf /"},
+                headers=github_auth_headers(github_user),
+            )
+
+    assert response.status_code == 400
+    mock_task.delay.assert_not_called()
+
+
 def test_trigger_scan_dispatch_failure_returns_500(client, sample_project, github_user, test_db):
     """Test that dispatch failure marks scan as failed and returns 500."""
     from unittest.mock import patch

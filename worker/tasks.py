@@ -219,6 +219,7 @@ def execute_audit_task(
     time_limit_minutes: int = 120,
     mode: str = "sweep",
     plan_n: int = 5,
+    branch: str | None = None,
 ) -> dict:
     """
     Execute a full autonomous security audit with planning loop.
@@ -335,20 +336,33 @@ def execute_audit_task(
                         iteration=0
                     )
             
-            publisher.publish_thought(f"Cloning repository: {repo_url}", iteration=0)
-            
+            ref_disp = f" @ {branch}" if branch else ""
+            publisher.publish_thought(f"Cloning repository: {repo_url}{ref_disp}", iteration=0)
+
             import subprocess
             clone_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+            clone_cmd = ["git", "clone", "--depth", "1"]
+            if branch:
+                clone_cmd.extend(["--branch", branch])
+            clone_cmd.extend([clone_url, str(repo_path)])
             clone_result = subprocess.run(
-                ["git", "clone", "--depth", "1", clone_url, str(repo_path)],
+                clone_cmd,
                 capture_output=True,
                 text=True,
                 timeout=300,  # 5 minute timeout for clone
                 env=clone_env,
             )
-            
+
             if clone_result.returncode != 0:
-                raise RuntimeError(f"Git clone failed: {clone_result.stderr}")
+                stderr = clone_result.stderr or ""
+                # Distinguish missing branch from other clone failures so the
+                # worker-level handler (below) can refund the credit and toast
+                # a branch-specific error to the user.
+                if branch and "Remote branch" in stderr and "not found in upstream origin" in stderr:
+                    raise RuntimeError(
+                        f"REPO_BRANCH_NOT_FOUND: Branch '{branch}' not found in repository"
+                    )
+                raise RuntimeError(f"Git clone failed: {stderr}")
         else:
             repo_path = Path(repo_url).expanduser().resolve()
             if not repo_path.exists():
@@ -1026,20 +1040,22 @@ def execute_scan_task(
     repo_full_name: str | None = None,
     installation_id: int | None = None,
     github_user_id: int | None = None,
+    branch: str | None = None,
 ) -> dict:
     """
     Execute a lightweight surface scan.
-    
+
     This is faster and cheaper than a full audit, designed for
     lead generation and preliminary assessment.
-    
+
     Args:
         repo_url: Git repository URL or local path
         scan_id: Unique identifier for this scan
         tenant_id: Tenant ID for multi-tenancy
         llm_budget: Maximum LLM calls (default: 5)
         model: LLM model to use (default: gpt-4o-mini)
-        
+        branch: Git ref (branch/tag/SHA) to scan; defaults to repo HEAD
+
     Returns:
         dict with scan results
     """
@@ -1085,8 +1101,9 @@ def execute_scan_task(
         )
         
         # Run scan
-        publisher.publish_thought(f"Scanning repository: {repo_url}", iteration=1)
-        result = scanner.scan(repo_url)
+        ref_disp = f" @ {branch}" if branch else ""
+        publisher.publish_thought(f"Scanning repository: {repo_url}{ref_disp}", iteration=1)
+        result = scanner.scan(repo_url, ref=branch)
         
         # Convert result to dict
         result_dict = result.model_dump() if hasattr(result, "model_dump") else result.dict()
@@ -1110,6 +1127,13 @@ def execute_scan_task(
             self._update_scan_status(scan_id, "failed", error_message="github_token_invalid", scan_log=safe_log)
             self._refund_if_credit_used(scan_id)
             publisher.publish_status("failed", "github_token_invalid")
+            publisher.close()
+            return result_dict
+        elif scan_error and "REPO_BRANCH_NOT_FOUND" in scan_error:
+            # Surface the full sentinel string so the frontend can extract the branch name.
+            self._update_scan_status(scan_id, "failed", error_message=scan_error, scan_log=safe_log)
+            self._refund_if_credit_used(scan_id)
+            publisher.publish_status("failed", scan_error)
             publisher.close()
             return result_dict
 
@@ -1908,6 +1932,7 @@ def build_graphs_task(
     num_graphs: int = 3,
     init_only: bool = False,
     installation_id: int | None = None,
+    branch: str | None = None,
 ) -> dict:
     """
     Build knowledge graphs for a repository without running the full audit.
@@ -1970,15 +1995,24 @@ def build_graphs_task(
                 except Exception as e:
                     publisher.publish_thought(f"Warning: Could not get GitHub token: {e}", iteration=0)
             
+            graph_clone_cmd = ["git", "clone", "--depth", "1"]
+            if branch:
+                graph_clone_cmd.extend(["--branch", branch])
+            graph_clone_cmd.extend([clone_url, str(repo_path)])
             result = subprocess.run(
-                ["git", "clone", "--depth", "1", clone_url, str(repo_path)],
+                graph_clone_cmd,
                 capture_output=True,
                 text=True,
                 timeout=300,
             )
-            
+
             if result.returncode != 0:
-                raise RuntimeError(f"Git clone failed: {result.stderr}")
+                stderr = result.stderr or ""
+                if branch and "Remote branch" in stderr and "not found in upstream origin" in stderr:
+                    raise RuntimeError(
+                        f"REPO_BRANCH_NOT_FOUND: Branch '{branch}' not found in repository"
+                    )
+                raise RuntimeError(f"Git clone failed: {stderr}")
         else:
             repo_path = Path(repo_url).expanduser().resolve()
             if not repo_path.exists():

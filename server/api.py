@@ -49,6 +49,7 @@ import httpx  # noqa: E402
 import redis.asyncio as aioredis  # noqa: E402
 from fastapi import (  # noqa: E402
     BackgroundTasks,
+    Body,
     Depends,
     FastAPI,
     HTTPException,
@@ -2977,6 +2978,7 @@ class AuditStartRequest(BaseModel):
     plan_n: int = Field(default=5, description="Number of investigations to plan per batch")
     auto_create_fix_pr: bool = Field(default=False, description="Automatically create a PR with fixes for detected issues")
     base_branch: str = Field(default="main", description="Base branch for fix PR (default: main)")
+    audit_branch: str | None = Field(default=None, description="Git ref (branch/tag/SHA) to audit; defaults to project default_branch", max_length=255)
 
 
 class AuditStartResponse(BaseModel):
@@ -3087,6 +3089,15 @@ async def start_audit(
             detail=f"Worker module not available: {e}. Is Celery configured?"
         )
 
+    # Resolve branch: explicit user pick > project default_branch > "main".
+    # Validation enforces no shell metacharacters before we hand it to git clone.
+    requested_audit_branch = _validate_ref(request_body.audit_branch)
+    resolved_audit_branch = (
+        requested_audit_branch
+        or (project.default_branch if project else None)
+        or "main"
+    )
+
     # Generate unique session ID
     session_id = f"audit_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
 
@@ -3113,7 +3124,11 @@ async def start_audit(
             repo_name=project.name,
             status="queued",
             started_at=datetime.now(timezone.utc),
-            scan_config={"scan_type": "deep", "mode": request_body.mode},
+            scan_config={
+                "scan_type": "deep",
+                "mode": request_body.mode,
+                "branch": resolved_audit_branch,
+            },
         )
         db.add(deep_scan)
         db.commit()
@@ -3147,6 +3162,7 @@ async def start_audit(
         time_limit_minutes=request_body.time_limit_minutes,
         mode=request_body.mode,
         plan_n=request_body.plan_n,
+        branch=resolved_audit_branch,
     )
 
     logger.info(f"Dispatched audit task {task.id} for session {session_id}")
@@ -5193,6 +5209,9 @@ class ScanHistoryItem(BaseModel):
     completed_at: datetime | None
     scan_type: str = "surface"
     error_message: str | None = None
+    # Branch this scan ran against. Falls back to project default_branch when
+    # legacy rows have no branch in scan_config.
+    branch: str | None = None
     # Deep audit curated fields (None for surface scans)
     assessment_level: str | None = None
     credible_findings_count: int | None = None
@@ -6488,10 +6507,37 @@ async def github_status(
     )
 
 
+class TriggerScanRequest(BaseModel):
+    """Request body for POST /repositories/{id}/scan."""
+    branch: str | None = Field(
+        default=None,
+        description="Git ref (branch/tag/SHA) to scan; defaults to project default_branch",
+        max_length=255,
+    )
+
+    model_config = ConfigDict(extra="ignore")
+
+
+def _validate_ref(value: str | None) -> str | None:
+    """Sanitize a user-supplied git ref. Returns trimmed value or None."""
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    # Argv-passed (no shell), but reject control chars + obvious shell metas
+    # as defence in depth — also rejects refs git itself would refuse.
+    forbidden = set("\x00\n\r\t ;|&`$<>\"'\\")
+    if any(ch in forbidden for ch in cleaned):
+        raise HTTPException(status_code=400, detail="Invalid branch name")
+    return cleaned
+
+
 @app.post("/repositories/{repository_id}/scan")
 async def trigger_repository_scan(
     repository_id: int,
     request: Request,
+    body: TriggerScanRequest | None = Body(default=None),
     tenant_id: int = Depends(get_current_tenant_id),
     db: Session = Depends(get_db),
     _: None = Depends(reject_preview_writes),
@@ -6521,6 +6567,10 @@ async def trigger_repository_scan(
     tier_check = require_plan_allowance("scan")
     allowance = await tier_check(request)
 
+    # Resolve branch: explicit user pick > project default_branch > "main"
+    requested_branch = _validate_ref(body.branch if body else None)
+    resolved_branch = requested_branch or project.default_branch or "main"
+
     # Generate scan execution ID
     execution_id = f"scan_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
 
@@ -6532,7 +6582,7 @@ async def trigger_repository_scan(
         repo_name=project.name,
         repo_url=project.git_url,
         status="pending",
-        scan_config={"scan_type": "surface"},
+        scan_config={"scan_type": "surface", "branch": resolved_branch},
         created_at=datetime.now(timezone.utc),
     )
     db.add(scan)
@@ -6548,6 +6598,7 @@ async def trigger_repository_scan(
             tenant_id=project.tenant_id,
             installation_id=project.installation_id,
             github_user_id=current_user.id,
+            branch=resolved_branch,
         )
     except Exception as e:
         # Mark scan as failed — don't leave it stuck "pending"
@@ -6621,6 +6672,8 @@ async def list_repository_scans(
         if isinstance(overview, dict):
             assessment_level = overview.get("assessment_level")
             credible_findings_count = overview.get("credible_findings_count")
+        cfg = scan.scan_config or {}
+        scan_branch = cfg.get("branch") or project.default_branch
         scan_items.append(ScanHistoryItem(
             execution_id=scan.execution_id,
             status=scan.status,
@@ -6629,8 +6682,9 @@ async def list_repository_scans(
             findings_count=findings_count,
             started_at=scan.started_at,
             completed_at=scan.completed_at,
-            scan_type=scan.scan_config.get("scan_type", "surface") if scan.scan_config else "surface",
+            scan_type=cfg.get("scan_type", "surface"),
             error_message=scan.error_message,
+            branch=scan_branch,
             assessment_level=assessment_level,
             credible_findings_count=credible_findings_count,
         ))
@@ -6641,6 +6695,110 @@ async def list_repository_scans(
         total=total,
         page=page,
         page_size=page_size,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Branch listing for the per-scan branch picker (firepan-6dx)
+# ---------------------------------------------------------------------------
+
+class BranchInfo(BaseModel):
+    name: str
+    is_default: bool = False
+    protected: bool = False
+    commit_sha: str | None = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class BranchesResponse(BaseModel):
+    repository_id: int
+    default_branch: str | None
+    branches: list[BranchInfo]
+    truncated: bool = False
+
+
+@app.get("/repositories/{repository_id}/branches", response_model=BranchesResponse)
+async def list_repository_branches(
+    repository_id: int,
+    request: Request,
+    tenant_id: int = Depends(get_current_tenant_id),
+    db: Session = Depends(get_db),
+    _: None = Depends(require_verified_email),
+):
+    """List GitHub branches for a repository so the dashboard can offer a picker.
+
+    Token resolution priority (most reliable first):
+    1. Project's GitHub App installation token (works for private + public).
+    2. Caller's user OAuth token (works for any repo they can see).
+    3. Unauthenticated GitHub API (public repos only, 60/hr per IP).
+    """
+    from urllib.parse import urlparse
+
+    project = db.query(Project).filter(
+        Project.id == repository_id,
+        Project.tenant_id == tenant_id,
+    ).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    parsed = urlparse(project.git_url or "")
+    parts = parsed.path.strip("/").split("/")
+    if len(parts) < 2 or "github.com" not in (parsed.netloc or ""):
+        raise HTTPException(status_code=400, detail="Repository is not a GitHub repo")
+    owner, repo = parts[0], parts[1].removesuffix(".git")
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if project.installation_id:
+        try:
+            from integrations.github_auth import get_installation_token
+            headers["Authorization"] = f"Bearer {get_installation_token(project.installation_id)}"
+        except Exception as exc:
+            logger.warning(
+                "branches: installation token failed for project %s: %s",
+                repository_id,
+                exc,
+            )
+    if "Authorization" not in headers:
+        try:
+            user = await _get_current_user_with_token(request, db)
+            headers["Authorization"] = f"Bearer {decrypt_token(user.github_token_encrypted)}"
+        except Exception:
+            pass  # public-repo fallback; GitHub will 404 private repos
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo}/branches",
+            params={"per_page": 100},
+            headers=headers,
+        )
+        if resp.status_code == 404:
+            raise HTTPException(status_code=404, detail="Repository not accessible")
+        if resp.status_code in (401, 403):
+            raise HTTPException(status_code=403, detail="GitHub API rejected request")
+        resp.raise_for_status()
+        raw = resp.json() or []
+
+    out: list[BranchInfo] = [
+        BranchInfo(
+            name=b.get("name", ""),
+            is_default=(b.get("name") == project.default_branch),
+            protected=bool(b.get("protected", False)),
+            commit_sha=(b.get("commit") or {}).get("sha"),
+        )
+        for b in raw
+        if b.get("name")
+    ]
+    out.sort(key=lambda b: (not b.is_default, b.name.lower()))
+
+    return BranchesResponse(
+        repository_id=repository_id,
+        default_branch=project.default_branch,
+        branches=out,
+        truncated=len(raw) >= 100,
     )
 
 
@@ -7856,6 +8014,8 @@ class SurfaceScanResponse(BaseModel):
     error: str | None = None
     scan_log: str | None = None
     scan_type: str = "surface"
+    # Branch this scan ran against (None for legacy rows scanned before per-branch picker shipped).
+    branch: str | None = None
     # Deep audit curated assessment (None for surface scans)
     deep_audit_overview: dict | None = None
 
@@ -8323,6 +8483,9 @@ async def get_surface_scan(
     # Include deep_audit_overview if present
     overview = scan.deep_audit_overview if hasattr(scan, 'deep_audit_overview') else None
 
+    cfg = scan.scan_config or {}
+    project_for_branch = db.query(Project).filter(Project.id == scan.project_id).first()
+    scan_branch = cfg.get("branch") or (project_for_branch.default_branch if project_for_branch else None)
     return SurfaceScanResponse(
         execution_id=scan.execution_id,
         repo_url=scan.repo_url,
@@ -8337,7 +8500,8 @@ async def get_surface_scan(
         summary=scan.summary or "",
         error=scan.error_message,
         scan_log=scan.scan_log,
-        scan_type=scan.scan_config.get("scan_type", "surface") if scan.scan_config else "surface",
+        scan_type=cfg.get("scan_type", "surface"),
+        branch=scan_branch,
         deep_audit_overview=overview if isinstance(overview, dict) else None,
     )
 

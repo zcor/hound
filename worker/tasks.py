@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2310,11 +2311,30 @@ def check_stripe_webhook_health_task():
         stripe_issues.append(str(e))
 
     # --- Beads tasks ---
+    # New file shape: {"total": int, "top": [ {id, title, priority, assignee, status}, ... ]}
+    # Old shape (list-only) kept for backwards compat during rollout.
     beads_tasks: list[dict] | None = None
+    beads_total: int | None = None
     beads_summary_path = "/config/beads_summary.json"
     try:
-        with open(beads_summary_path) as f:
-            beads_tasks = json.load(f)
+        mtime = os.path.getmtime(beads_summary_path)
+        age_hours = (time.time() - mtime) / 3600.0
+        if age_hours > 25:
+            logger.warning("beads summary is %.1fh old — treating as unavailable", age_hours)
+            # Leave beads_tasks=None so the renderer shows "bd summary unavailable".
+            # The age is logged; not surfacing in the digest to keep the Stripe
+            # health line honest (a stale bd cache ≠ a Stripe problem).
+        else:
+            with open(beads_summary_path) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                beads_tasks = data.get("top") or []
+                beads_total = data.get("total")
+            elif isinstance(data, list):
+                beads_tasks = data
+                beads_total = len(data)
+            else:
+                logger.warning("Unexpected beads summary shape: %s", type(data).__name__)
     except FileNotFoundError:
         logger.info("No beads summary at %s", beads_summary_path)
     except Exception as e:
@@ -2325,6 +2345,7 @@ def check_stripe_webhook_health_task():
         stripe_status=stripe_status,
         beads_tasks=beads_tasks,
         stripe_issues=stripe_issues if stripe_issues else None,
+        total_open=beads_total,
     ))
 
 

@@ -1,0 +1,12 @@
+# Host-side crontab for the Hound droplet (gerrit user)
+# Install with: crontab -e  and paste the lines below
+# Verify with:  crontab -l
+#
+# These entries are NOT auto-installed. They must be copied into the host
+# crontab manually after any droplet rebuild. See
+# docs/operations/digitalocean_droplet.md under "Scheduled host jobs".
+
+# Rebuild the Beads top-tasks summary 5 minutes before the daily digest task
+# fires at 10:00 UTC. Writes /opt/hound/beads_summary.json which is bind-mounted
+# read-only into the worker container at /config/beads_summary.json.
+55 9 * * * cd /opt/hound && ./scripts/update_beads_summary.sh >> /home/gerrit/logs/beads_summary.log 2>&1

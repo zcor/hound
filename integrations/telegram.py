@@ -472,9 +472,14 @@ async def notify_daily_digest(
     stripe_status: str,
     beads_tasks: list[dict] | None = None,
     stripe_issues: list[str] | None = None,
+    total_open: int | None = None,
 ) -> bool:
-    """Daily team digest: one-line Stripe health + open Beads tasks."""
-    # Stripe one-liner
+    """Daily team digest: one-line Stripe health + top Beads tasks.
+
+    beads_tasks: pre-curated list (already filtered to non-P4, capped at ~5).
+    total_open:  total count of open+in_progress+blocked (non-P4) for the
+                 "N of M" header. If None, falls back to len(beads_tasks).
+    """
     stripe_icon = "\u2705" if not stripe_issues else "\u26a0\ufe0f"
     parts = [
         "\U0001f4cb <b>Daily Digest</b>",
@@ -487,23 +492,33 @@ async def notify_daily_digest(
 
     # Beads tasks
     if beads_tasks:
+        shown = len(beads_tasks)
+        total = total_open if total_open is not None else shown
         parts.append("")
-        parts.append(f"\U0001f4cc <b>Open Tasks ({len(beads_tasks)})</b>")
-        for task in beads_tasks[:15]:
+        parts.append(f"\U0001f4cc <b>Top Tasks ({shown} of {total})</b>")
+        for task in beads_tasks:
             priority = task.get("priority", "")
             title = _escape_html(task.get("title", "untitled"))
             assignee = task.get("assignee", "")
+            status = task.get("status", "open")
             p_label = f"P{priority}" if priority != "" else ""
             assignee_label = f" \u2022 {_escape_html(assignee)}" if assignee else ""
-            parts.append(f"  {p_label} {title}{assignee_label}")
-        if len(beads_tasks) > 15:
-            parts.append(f"  <i>... and {len(beads_tasks) - 15} more</i>")
+            if status == "in_progress":
+                marker = "\u25b6"  # ▶
+            elif status == "blocked":
+                marker = "\u26d4"  # ⛔
+            else:
+                marker = "  "
+            parts.append(f"  {marker} {p_label} {title}{assignee_label}")
+        remaining = total - shown
+        if remaining > 0:
+            parts.append(f"  <i>... and {remaining} more</i>")
     elif beads_tasks is not None:
         parts.append("")
-        parts.append("\U0001f4cc <b>Open Tasks:</b> none")
+        parts.append("\U0001f4cc <b>Top Tasks:</b> no active tasks")
     else:
         parts.append("")
-        parts.append("\U0001f4cc <b>Open Tasks:</b> <i>could not load</i>")
+        parts.append("\U0001f4cc <b>Top Tasks:</b> <i>bd summary unavailable</i>")
 
     message = "\n".join(parts)
     return await send_telegram_message(message)

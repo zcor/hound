@@ -3,7 +3,7 @@ Tests for team-based access control functionality.
 """
 
 import os
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient

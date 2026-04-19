@@ -6,7 +6,6 @@ to fetch repository details and collaborators for team management.
 """
 
 import re
-from typing import Dict, List
 
 import httpx
 from fastapi import HTTPException
@@ -29,7 +28,7 @@ class GitHubService:
             "Accept": "application/vnd.github.v3+json"
         }
     
-    async def get_repo_details(self, owner: str, repo: str) -> Dict:
+    async def get_repo_details(self, owner: str, repo: str) -> dict:
         """
         Get repository metadata including ID.
         
@@ -63,7 +62,7 @@ class GitHubService:
             response.raise_for_status()
             return response.json()
     
-    async def get_repo_collaborators(self, owner: str, repo: str) -> List[Dict]:
+    async def get_repo_collaborators(self, owner: str, repo: str) -> list[dict]:
         """
         Fetch all collaborators for a repository.
         

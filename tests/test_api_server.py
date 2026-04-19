@@ -133,7 +133,6 @@ def auth_headers(tenant):
 @pytest.fixture
 def github_user(test_db, sample_tenant):
     """Create a user with GitHub linked (needed for scan endpoints)."""
-    from server.token_crypto import encrypt_token
     user = User(
         github_id=12345678,
         github_login="testuser",
@@ -1248,7 +1247,6 @@ def test_trigger_scan_dispatch_failure_refunds_credit(client, sample_project, gi
     """Test that dispatch failure refunds credit when uses_credit is True."""
     from unittest.mock import MagicMock, patch
 
-    from database.models import ScanExecution
 
     mock_refund = MagicMock()
 
@@ -1411,7 +1409,6 @@ def test_findings_stats_includes_surface_scans(client, sample_tenant, sample_pro
 
 def _create_stripe_tables(db):
     """Create stripe_processed_events table for SQLite test DB."""
-    import sqlite3
     from sqlalchemy import event, text
 
     engine = db.get_bind()
@@ -1805,7 +1802,6 @@ def test_github_webhook_installation_signed(client, test_db):
     import hashlib
     import hmac as hmac_mod
     import json
-
     from unittest.mock import AsyncMock, patch
 
     secret = "test-webhook-secret"

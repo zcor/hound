@@ -9,9 +9,7 @@ Concurrency tests require Postgres for IntegrityError behavior.
 import os
 import sys
 import unittest
-from datetime import datetime, timedelta
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

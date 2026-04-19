@@ -22,7 +22,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -116,7 +116,7 @@ def _lookup_tenant_discount(
       2. Fixed-price over percentage
       3. Most recently redeemed
     """
-    from sqlalchemy import or_, func as sa_func
+    from sqlalchemy import func as sa_func, or_
 
     td = db.query(TenantDiscount).join(X402Discount).filter(
         TenantDiscount.tenant_id == tenant_id,

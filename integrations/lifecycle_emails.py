@@ -20,18 +20,17 @@ cadence source `tmp/firepan-email-cadences.md` for product context.
 
 from __future__ import annotations
 
-import hmac
-import hashlib
 import base64
+import hashlib
+import hmac
 import html as _html
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -295,9 +294,9 @@ def build_unsubscribe_token(tenant_id: int) -> str:
     if not secret:
         logger.warning("HOUND_SECRET_KEY not set — unsubscribe tokens will not verify")
     issued_at = int(_now().timestamp())
-    msg = f"{tenant_id}.{issued_at}".encode("utf-8")
+    msg = f"{tenant_id}.{issued_at}".encode()
     sig = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:32]
-    raw = f"{tenant_id}.{issued_at}.{sig}".encode("utf-8")
+    raw = f"{tenant_id}.{issued_at}.{sig}".encode()
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
@@ -333,7 +332,7 @@ def verify_unsubscribe_token(token: str, max_age_days: int = 180) -> int | None:
         return None
 
     secret = _env("HOUND_SECRET_KEY") or ""
-    msg = f"{tenant_id}.{issued_at}".encode("utf-8")
+    msg = f"{tenant_id}.{issued_at}".encode()
     expected = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:32]
 
     if not hmac.compare_digest(expected, sig):

@@ -16,8 +16,7 @@ real SendGrid API.
 from __future__ import annotations
 
 import asyncio
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -25,7 +24,6 @@ import pytest
 from database.models import SentEmail, Tenant, User, create_db_engine, create_db_session, init_database
 from integrations import lifecycle_emails as le
 from integrations.lifecycle_emails import EmailCode
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

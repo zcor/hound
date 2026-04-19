@@ -35,7 +35,6 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 from server.api import app, get_db
 from server.auth_utils import create_access_token
 
-
 # =============================================================================
 # Fixtures
 # =============================================================================

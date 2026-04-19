@@ -92,8 +92,9 @@ def run_audit_task(
         return None
 
     # Create scan execution record
-    from database.models import ScanExecution, create_db_engine, create_db_session
     import os
+
+    from database.models import ScanExecution, create_db_engine, create_db_session
 
     timestamp = int(datetime.now(timezone.utc).timestamp())
     execution_id = f"scan_{uuid.uuid4().hex[:12]}_{timestamp}"

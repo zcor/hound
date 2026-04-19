@@ -11,7 +11,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -311,7 +311,6 @@ class TestGetResourceConfigWithDiscount(DiscountTestBase):
 
     def _mock_config(self):
         """Create a mock x402 config with route pricing."""
-        from unittest.mock import MagicMock
 
         option = MagicMock()
         option.scheme = "exact"

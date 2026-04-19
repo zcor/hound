@@ -301,7 +301,6 @@ async def notify_deep_audit_started(
         True if notification was sent successfully
     """
     repo_display = f'<a href="{_escape_html(repo_url)}">{_escape_html(repo_url)}</a>' if repo_url.startswith("http") else _escape_html(repo_url)
-    display_name = _escape_html(project_name) if project_name else repo_display
 
     message_parts = [
         "🔬 <b>Deep Audit Started</b>",
@@ -478,7 +477,7 @@ async def notify_daily_digest(
     # Stripe one-liner
     stripe_icon = "\u2705" if not stripe_issues else "\u26a0\ufe0f"
     parts = [
-        f"\U0001f4cb <b>Daily Digest</b>",
+        "\U0001f4cb <b>Daily Digest</b>",
         "",
         f"{stripe_icon} <b>Stripe:</b> {_escape_html(stripe_status)}",
     ]

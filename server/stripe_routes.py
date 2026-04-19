@@ -78,11 +78,11 @@ def get_db():
 
 
 def get_current_tenant_id(request: Request) -> int:
-    from server.api import get_current_tenant_id as api_get_tenant
     import asyncio
+
+    from server.api import get_current_tenant_id as api_get_tenant
     loop = asyncio.get_event_loop()
     if loop.is_running():
-        import concurrent.futures
         # We're in an async context; this dependency is called by FastAPI's DI
         # which handles the coroutine for us. Just raise to let FastAPI handle it.
         raise RuntimeError("Use Depends() — do not call directly")

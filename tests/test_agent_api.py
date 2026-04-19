@@ -12,9 +12,8 @@ Covers:
 
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -26,11 +25,9 @@ from database.models import (
     Base,
     Graph,
     Hypothesis,
-    PaymentLog,
     Project,
     ScanExecution,
     Tenant,
-    User,
 )
 
 # Set test database URL before importing app
@@ -39,7 +36,6 @@ os.environ["HOUND_DEV_MODE"] = "1"
 
 from server.api import app, get_db
 from server.auth_utils import create_access_token
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -228,7 +224,7 @@ class TestAgentAuditStatus:
         assert data["status"] == "running"
 
     def test_status_completed_with_findings(self, client, tenant_a, test_db):
-        s = _seed_session(test_db, tenant_a.id, session_id="agent_poll_2", status="completed")
+        _seed_session(test_db, tenant_a.id, session_id="agent_poll_2", status="completed")
         # Add ScanExecution with findings
         se = ScanExecution(
             execution_id="agent_poll_2",
@@ -400,7 +396,6 @@ class TestIdempotency:
             headers={**_headers(tenant_a), "Idempotency-Key": idem_key},
         )
         assert resp1.status_code == 200
-        sid1 = resp1.json()["session_id"]
 
         # Second call — x402 disabled so no double-charge logic, but we verify
         # the endpoint doesn't crash
@@ -590,9 +585,9 @@ class TestAgentAuditGraphs:
 
     def test_list_graphs(self, client, tenant_a, test_db):
         """GET /agent/audits/{id}/graphs returns graph summaries."""
-        s = _seed_session(test_db, tenant_a.id, "graph_list_001")
-        g1 = _seed_graph(test_db, "graph_list_001", "SystemArchitecture", "system_architecture")
-        g2 = _seed_graph(test_db, "graph_list_001", "AssetFlow", "asset_flow")
+        _seed_session(test_db, tenant_a.id, "graph_list_001")
+        _seed_graph(test_db, "graph_list_001", "SystemArchitecture", "system_architecture")
+        _seed_graph(test_db, "graph_list_001", "AssetFlow", "asset_flow")
 
         resp = client.get("/agent/audits/graph_list_001/graphs", headers=_headers(tenant_a))
         assert resp.status_code == 200
@@ -625,7 +620,7 @@ class TestAgentAuditGraphs:
 
     def test_graph_detail(self, client, tenant_a, test_db):
         """GET /agent/audits/{id}/graphs/{graph_id} returns full data."""
-        s = _seed_session(test_db, tenant_a.id, "detail_001")
+        _seed_session(test_db, tenant_a.id, "detail_001")
         g = _seed_graph(test_db, "detail_001", "AuthGraph", "auth_graph")
 
         resp = client.get(
@@ -672,7 +667,7 @@ class TestAgentAuditGraphs:
         test_db.commit()
         test_db.refresh(p)
 
-        s = _seed_session(test_db, tenant_a.id, "fb_001", project_id=p.id)
+        _seed_session(test_db, tenant_a.id, "fb_001", project_id=p.id)
         # Graph linked to project, not session_id
         g = Graph(
             project_id=p.id,

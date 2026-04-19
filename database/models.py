@@ -24,7 +24,6 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     func,
-    or_,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY, JSONB

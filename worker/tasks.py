@@ -22,11 +22,11 @@ if str(_app_root) not in sys.path:
 from celery import Task  # noqa: E402
 from celery.exceptions import SoftTimeLimitExceeded  # noqa: E402
 
+from integrations.telegram import notify_deep_audit_completed  # noqa: E402
+from llm.token_tracker import clear_token_context, set_token_context  # noqa: E402
+
 from .celery_app import celery_app  # noqa: E402
 from .redis_publisher import RedisPublisher  # noqa: E402
-
-from llm.token_tracker import set_token_context, clear_token_context  # noqa: E402
-from integrations.telegram import notify_deep_audit_completed  # noqa: E402
 
 
 def resolve_scan_github_token(
@@ -937,7 +937,6 @@ def execute_audit_task(
         # Lifecycle: stamp first_deep_audit_at + last_activity_at, send transactional email
         try:
             from database.models import Tenant
-            from datetime import datetime, timezone
             _db = self.get_db_session()
             try:
                 _tenant = _db.query(Tenant).filter(Tenant.id == tenant_id).first()
@@ -1179,8 +1178,9 @@ def execute_scan_task(
         # fire FIRST_SCAN_CELEBRATION 30min later. Only on success.
         if final_status == "completed":
             try:
-                from database.models import Tenant
                 from datetime import datetime, timezone
+
+                from database.models import Tenant
                 _db = self.get_db_session()
                 try:
                     _tenant = _db.query(Tenant).filter(Tenant.id == tenant_id).first()
@@ -2171,10 +2171,12 @@ def build_graphs_task(
 @celery_app.task(name="worker.tasks.send_funnel_digest_task")
 def send_funnel_digest_task():
     """Weekly funnel stats digest to internal Telegram channel."""
+    import logging
+
+    from sqlalchemy import func as sqlfunc
+
     from database.models import PageView, ScanExecution, Tenant, User, create_db_engine, create_db_session
     from integrations.telegram import notify_funnel_digest
-    from sqlalchemy import func as sqlfunc
-    import logging
 
     logger = logging.getLogger(__name__)
 
@@ -2272,9 +2274,11 @@ def send_funnel_digest_task():
 @celery_app.task(name="worker.tasks.check_stripe_webhook_health_task")
 def check_stripe_webhook_health_task():
     """Daily digest: one-line Stripe health + open Beads tasks."""
-    from integrations.telegram import notify_daily_digest
-    import httpx
     import logging
+
+    import httpx
+
+    from integrations.telegram import notify_daily_digest
 
     logger = logging.getLogger(__name__)
 

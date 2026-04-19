@@ -3,14 +3,13 @@ Tests for Google OAuth authentication, provider linking, and capability gate.
 """
 
 import os
-from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from database.models import Base, OAuthAuditLog, Tenant, User
+from database.models import Base, Tenant, User
 from server.auth_utils import create_access_token, decode_access_token
 
 # Set test database URL before importing app

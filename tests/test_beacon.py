@@ -1,14 +1,11 @@
 """Tests for the /t page view beacon endpoint."""
 
-import os
 import pytest
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from database.models import Base, PageView
-
 
 # Use in-memory SQLite with StaticPool for cross-thread sharing
 _test_engine = create_engine(
@@ -38,9 +35,10 @@ def setup_db():
 @pytest.fixture
 def client():
     """Create a test client with overridden DB dependency and engine."""
+    from fastapi.testclient import TestClient
+
     import server.api as api_module
     from server.api import app, get_db
-    from fastapi.testclient import TestClient
 
     # Override both the dependency and the global engine (prevents get_engine()
     # from creating its own SQLite/Postgres engine on first request)

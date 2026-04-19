@@ -24,8 +24,8 @@ import json
 import os
 import re
 import sys
-from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 DEFAULT_DESIGN_ID = "c1af79cf-a682-4888-b435-5656829d0ee6"
 DEFAULT_TEMPLATE_NAME = "firepan-lifecycle-v1"
@@ -127,7 +127,7 @@ def main():
 
     if args.update:
         template_id = args.update
-        version_name = f"firepan-lifecycle-update"
+        version_name = "firepan-lifecycle-update"
     else:
         template_id = create_template(api_key, args.name)
         version_name = "v1"

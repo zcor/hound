@@ -1,17 +1,12 @@
 """Tests for Stripe webhook behavior and startup warnings."""
 
-import logging
-import os
 
 import pytest
-from unittest.mock import patch, MagicMock
-
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from database.models import Base
-
 
 _test_engine = create_engine(
     "sqlite://",
@@ -49,9 +44,10 @@ def setup_db():
 
 @pytest.fixture
 def client():
+    from fastapi.testclient import TestClient
+
     import server.api as api_module
     from server.api import app, get_db
-    from fastapi.testclient import TestClient
 
     old_engine = api_module._engine
     api_module._engine = _test_engine

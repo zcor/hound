@@ -26,9 +26,7 @@ from pathlib import Path
 
 import jwt
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
-from x402.http import AuthHeaders, HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
-from x402.http.facilitator_client_base import AuthProvider
+from x402.http import AuthHeaders, FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
 from x402.http.types import RouteConfig
 from x402.http.x402_http_server import x402HTTPResourceServer
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
@@ -70,8 +68,8 @@ class CdpAuthProvider:
         - Raw base64: 64-byte Ed25519 seed+pubkey, DER-encoded keys
         """
         import base64
+
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-        from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
         from cryptography.hazmat.primitives.serialization import load_der_private_key
 
         key_data = key_data.strip().replace("\\n", "\n")

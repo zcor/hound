@@ -87,7 +87,12 @@ from database.models import (  # noqa: E402
     create_db_engine,
     create_db_session,
 )
-from integrations.telegram import notify_new_repo_synced, notify_repo_added, notify_app_installed, notify_deep_audit_started  # noqa: E402
+from integrations.telegram import (  # noqa: E402
+    notify_app_installed,
+    notify_deep_audit_started,
+    notify_new_repo_synced,
+    notify_repo_added,
+)
 from server.auth_utils import reject_preview_writes  # noqa: E402
 from server.token_crypto import decrypt_token  # noqa: E402
 
@@ -327,8 +332,10 @@ app.include_router(auth_router)
 
 # Register Stripe billing routes
 try:
-    from server.stripe_routes import router as stripe_router  # noqa: E402
-    from server.stripe_routes import webhook_router as stripe_webhook_router  # noqa: E402
+    from server.stripe_routes import (
+        router as stripe_router,  # noqa: E402
+        webhook_router as stripe_webhook_router,  # noqa: E402
+    )
 
     app.include_router(stripe_router)           # /billing/* — authenticated endpoints
     app.include_router(stripe_webhook_router)    # /webhooks/stripe — Stripe signature only
@@ -501,7 +508,7 @@ async def require_github_linked(request: Request, db: Session = Depends(get_db))
 # EMAIL VERIFICATION GATE — require verified email for analysis endpoints
 # =============================================================================
 
-from server.email_verification import mount_email_routes, _make_require_verified_email  # noqa: E402
+from server.email_verification import _make_require_verified_email, mount_email_routes  # noqa: E402
 
 mount_email_routes(app)
 require_verified_email = _make_require_verified_email(get_current_tenant_id)
@@ -564,7 +571,7 @@ async def email_unsubscribe(t: str = "", db: Session = Depends(get_db)):
 # AGENT-NATIVE AUDIT ROUTES — mounted after dependencies are defined
 # =============================================================================
 
-from server.agent_routes import router as agent_router, configure_dependencies as _configure_agent_deps  # noqa: E402
+from server.agent_routes import configure_dependencies as _configure_agent_deps, router as agent_router  # noqa: E402
 
 _configure_agent_deps(get_db, get_current_tenant_id)
 app.include_router(agent_router)
@@ -8196,7 +8203,7 @@ async def run_full_surface_scan(
     Returns complete vulnerability findings with details.
     When x402 is disabled, works identically to /surface/scan (no paywall).
     """
-    from server.x402_deps import PaymentGate, create_paid_job, mark_job_failed, require_payment
+    from server.x402_deps import create_paid_job, mark_job_failed, require_payment
 
     # Run payment gate manually (can't use Depends with dynamic factory easily here)
     gate_fn = require_payment("POST /surface/scan/full")

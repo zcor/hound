@@ -97,7 +97,7 @@ def require_plan_allowance(operation: str):
     async def _check_with_di(
         request: Request,
     ) -> dict:
-        from server.api import get_current_tenant_id as _get_tid, get_db as _get_db, get_engine
+        from server.api import get_current_tenant_id as _get_tid, get_engine
 
         tenant_id = await _get_tid(request)
 

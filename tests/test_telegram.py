@@ -1,17 +1,16 @@
 """Tests for Telegram notification functions."""
 
 import asyncio
-
 from unittest.mock import AsyncMock, patch
 
 from integrations.telegram import (
+    _escape_html,
+    notify_app_installed,
+    notify_deep_audit_completed,
+    notify_deep_audit_started,
+    notify_funnel_digest,
     notify_payment_event,
     notify_repo_added,
-    notify_app_installed,
-    notify_deep_audit_started,
-    notify_deep_audit_completed,
-    notify_funnel_digest,
-    _escape_html,
 )
 
 

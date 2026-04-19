@@ -123,7 +123,8 @@ async def get_my_discounts(
     db: Session = Depends(get_db),
 ):
     """List active x402 discounts for the current tenant."""
-    from sqlalchemy import or_, func as sa_func
+    from sqlalchemy import func as sa_func, or_
+
     from server.api import get_current_tenant_id
     tenant_id = await get_current_tenant_id(request)
 

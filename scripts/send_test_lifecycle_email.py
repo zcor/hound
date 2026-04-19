@@ -30,16 +30,15 @@ from pathlib import Path
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from database.models import Tenant, User, create_db_engine, create_db_session  # noqa: E402
+from database.models import Tenant, create_db_engine, create_db_session  # noqa: E402
+from integrations.email import send_template_email  # noqa: E402
 from integrations.lifecycle_emails import (  # noqa: E402
-    EmailCode,
     LIFECYCLE_CONFIG,
+    EmailCode,
     _build_unsubscribe_url,
     _render_dynamic_data,
     _template_id,
-    resolve_first_name,
 )
-from integrations.email import send_template_email  # noqa: E402
 
 
 async def main():

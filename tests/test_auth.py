@@ -11,8 +11,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from database.models import Base, OAuthAuditLog, Project, ScanExecution, Tenant, User
-from server.auth_utils import ACCESS_TOKEN_EXPIRE_MINUTES, create_access_token, decode_access_token, get_current_user_from_token
+from database.models import Base, Project, ScanExecution, Tenant, User
+from server.auth_utils import (
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    create_access_token,
+    decode_access_token,
+    get_current_user_from_token,
+)
 
 # Set test database URL before importing app
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"

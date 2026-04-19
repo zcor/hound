@@ -2,9 +2,9 @@
 Unit tests for x402 configuration loading and validation.
 """
 
+import json
 import os
 import sys
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from server.x402_config import get_x402_config, x402_enabled, usd_to_atomic_usdc, reset_config
+from server.x402_config import get_x402_config, reset_config, usd_to_atomic_usdc, x402_enabled
 
 
 class TestX402Enabled(unittest.TestCase):

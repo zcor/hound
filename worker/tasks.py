@@ -2315,7 +2315,10 @@ def check_stripe_webhook_health_task():
     # Old shape (list-only) kept for backwards compat during rollout.
     beads_tasks: list[dict] | None = None
     beads_total: int | None = None
-    beads_summary_path = "/config/beads_summary.json"
+    # Path is under /config/state/ (directory mount), not /config/ directly.
+    # See docker-compose.yml worker volumes and gotcha #62 in CLAUDE.md
+    # for the single-file-bind-mount inode-pinning issue this avoids.
+    beads_summary_path = "/config/state/beads_summary.json"
     try:
         mtime = os.path.getmtime(beads_summary_path)
         age_hours = (time.time() - mtime) / 3600.0

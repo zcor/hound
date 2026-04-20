@@ -11,7 +11,11 @@
 set -euo pipefail
 
 BEADS_DIR="${BEADS_DIR:-/opt/hound/.beads}"
-OUTPUT="${1:-/opt/hound/beads_summary.json}"
+# OUTPUT lives under /opt/hound/state/ (directory bind-mount into the worker
+# container). DO NOT write to /opt/hound/beads_summary.json directly — that
+# was the old path and its bind mount pinned the host inode at container
+# start, so replaces were invisible to the worker forever.
+OUTPUT="${1:-/opt/hound/state/beads_summary.json}"
 
 export BEADS_DIR
 

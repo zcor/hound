@@ -175,7 +175,13 @@ services:
       API_BASE_URL: ${API_BASE_URL:-https://api.firepan.com}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
-      - ./beads_summary.json:/config/beads_summary.json:ro
+      # IMPORTANT: mount the DIRECTORY, not the file. Docker single-file
+      # bind mounts pin the host inode at container start; any replace
+      # (rsync, scp, cat >) creates a new inode on the host that the
+      # container never sees, so the reader saw stale data forever.
+      # Directory mounts don't have this problem — writes to files inside
+      # the mounted dir are visible immediately.
+      - ./state:/config/state:ro
     depends_on:
       db:
         condition: service_healthy

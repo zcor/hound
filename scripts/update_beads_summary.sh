@@ -61,6 +61,7 @@ def normalize(obj, status):
         "assignee": obj.get("assignee", "") or "",
         "status": obj.get("status", status) or status,
         "updated_at": obj.get("updated_at", "") or "",
+        "labels": obj.get("labels") or [],
     }
 
 rows = []
@@ -68,8 +69,8 @@ for status in STATUSES:
     for obj in fetch(status):
         rows.append(normalize(obj, status))
 
-# Drop P4 backlog
-rows = [r for r in rows if r["priority"] < 4]
+# Drop P4 backlog and anything already in review (claimed done, awaiting human)
+rows = [r for r in rows if r["priority"] < 4 and "needs-review" not in r["labels"]]
 
 # Sort: priority asc, then updated_at desc within priority (ISO-8601 sorts lexically)
 rows.sort(key=lambda r: r["updated_at"], reverse=True)

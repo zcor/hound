@@ -461,14 +461,22 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)) -> U
         token = get_token_from_header(request)
         payload = get_current_user_from_token(token)
         user_id = payload.get("user_id")
-        
+
+        # Admin-preview tokens are tenant-scoped with user_id=0 and carry an
+        # `admin_preview: true` claim.  They pass JWT verification (the token
+        # is genuinely issued by us) but there is no backing User row to
+        # return, so this endpoint responds 404.  We must NOT 401 here: the
+        # frontend treats 401 as "session expired" and silently drops the
+        # preview, kicking the admin out of their own preview mid-navigation.
         if not user_id:
+            if payload.get("admin_preview"):
+                raise HTTPException(status_code=404, detail="User not found (admin preview)")
             raise HTTPException(status_code=401, detail="Invalid token: missing user_id")
-        
+
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         return user
     except HTTPException:
         raise

@@ -4915,22 +4915,6 @@ async def triage_finding(
     db.commit()
     db.refresh(finding)
 
-    # Determine source for response
-    _deep_scan = db.query(ScanExecution).filter(
-        ScanExecution.project_id == finding.project_id,
-        ScanExecution.findings.isnot(None),
-    ).all()
-    _is_deep = False
-    for _ds in _deep_scan:
-        _cfg = _ds.scan_config or {}
-        if isinstance(_cfg, dict) and _cfg.get("scan_type") == "deep":
-            for _f in (_ds.findings or []):
-                if isinstance(_f, dict) and _f.get("pattern_id") == finding.hypothesis_id:
-                    _is_deep = True
-                    break
-        if _is_deep:
-            break
-
     return FindingResponse(
         id=finding.id,
         hypothesis_id=finding.hypothesis_id,
@@ -4947,7 +4931,7 @@ async def triage_finding(
         senior_model=finding.senior_model,
         project_id=finding.project_id,
         user_notes=finding.user_notes,
-        source="deep" if _is_deep else "surface",
+        source=_hypothesis_source(finding),
         created_at=finding.created_at,
         updated_at=finding.updated_at,
     )
@@ -5562,6 +5546,20 @@ async def get_current_month_usage(
             "total_tokens": input_tokens + output_tokens,
         }
     )
+
+
+def _hypothesis_source(h: "Hypothesis") -> str:
+    """Return the source tag ("deep" | "surface") for a Hypothesis row.
+
+    INVARIANT: every row in the hypotheses table originates from a deep audit
+    (pipeline-produced or manually inserted from a human review). Surface-scan
+    findings live in ScanExecution.findings JSONB and reach the API response
+    through a separate code path (see list_all_findings — the surface-findings
+    loop). If the hypotheses table ever starts storing non-deep content,
+    revisit this helper and classify per-row (e.g. by reported_by_model or a
+    new scan_execution_id FK — see firepan-dar).
+    """
+    return "deep"
 
 
 def _latest_scan_by_type(db: Session, project_id: int, scan_type: str):
@@ -6844,29 +6842,11 @@ async def list_all_findings(
 
     findings = query.order_by(Hypothesis.created_at.desc()).all()
 
-    # Build a set of hypothesis IDs that appear in deep audit JSONB findings.
-    # If a Hypothesis.hypothesis_id matches a deep ScanExecution finding's
-    # pattern_id, it originated from a deep audit.  Otherwise it was stored
-    # by the surface scan normalization pipeline → tag as "surface".
-    _project_ids = {h.project_id for h in findings}
-    _deep_hyp_ids: set[str] = set()
-    if _project_ids:
-        _deep_scans = db.query(ScanExecution).filter(
-            ScanExecution.project_id.in_(_project_ids),
-            ScanExecution.findings.isnot(None),
-        ).all()
-        for _ds in _deep_scans:
-            _cfg = _ds.scan_config or {}
-            if isinstance(_cfg, dict) and _cfg.get("scan_type") == "deep":
-                for _f in (_ds.findings or []):
-                    _pid = _f.get("pattern_id", "") if isinstance(_f, dict) else ""
-                    if _pid:
-                        _deep_hyp_ids.add(_pid)
-
-    # Build hypothesis findings
+    # Build hypothesis findings.  Source classification is centralised in
+    # _hypothesis_source() so that this endpoint and the triage endpoint
+    # always return the same tag for the same row.  See firepan-dar.
     hypothesis_findings = []
     for h in findings:
-        h_source = "deep" if h.hypothesis_id in _deep_hyp_ids else "surface"
         hypothesis_findings.append(FindingResponse(
             id=h.id,
             hypothesis_id=h.hypothesis_id,
@@ -6883,7 +6863,7 @@ async def list_all_findings(
             senior_model=h.senior_model,
             project_id=h.project_id,
             user_notes=h.user_notes,
-            source=h_source,
+            source=_hypothesis_source(h),
             created_at=h.created_at,
             updated_at=h.updated_at,
         ))

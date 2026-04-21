@@ -455,11 +455,16 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)) -> U
         HTTPException: If token is missing, invalid, expired, or user not found
     """
     from server.auth_routes import get_token_from_header
-    from server.auth_utils import get_current_user_from_token
-    
+    # NOTE: we use decode_access_token() rather than get_current_user_from_token()
+    # because the latter strips the payload down to {user_id, tenant_id} and
+    # drops custom claims like `admin_preview` — which we need to see here so
+    # we can distinguish "preview with no User row" (404) from "broken token" (401).
+    # CLAUDE.md gotcha #admin-preview memorialises this trap.
+    from server.auth_utils import decode_access_token
+
     try:
         token = get_token_from_header(request)
-        payload = get_current_user_from_token(token)
+        payload = decode_access_token(token)
         user_id = payload.get("user_id")
 
         # Admin-preview tokens are tenant-scoped with user_id=0 and carry an

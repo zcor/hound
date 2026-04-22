@@ -38,6 +38,9 @@ async def send_telegram_message(
     Returns:
         True if message was sent successfully, False otherwise
     """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+
     if not TELEGRAM_BOT_TOKEN:
         logger.warning("TELEGRAM_BOT_TOKEN not configured - skipping notification")
         return False

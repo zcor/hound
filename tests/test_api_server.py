@@ -452,8 +452,10 @@ def test_audit_start_worker_import(client, sample_tenant, monkeypatch):
     mock_task = MagicMock()
     mock_task.id = "mock_task_id_12345"
 
-    with patch("worker.tasks.execute_audit_task") as mock_execute:
+    with patch("worker.tasks.execute_audit_task") as mock_execute, \
+         patch("server.api.notify_deep_audit_started") as mock_notify:
         mock_execute.delay.return_value = mock_task
+        mock_notify.return_value = True
 
         response = client.post(
             "/audits/start",

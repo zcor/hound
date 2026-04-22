@@ -461,11 +461,13 @@ class TestLatestScanByTypeIncludesInReview:
 class TestPatchUsersMe:
 
     def test_update_contact_email(self, client, test_db, tenant, jwt_token):
-        resp = client.patch(
-            "/users/me",
-            json={"email": "test@example.com"},
-            headers={"Authorization": f"Bearer {jwt_token}"},
-        )
+        with patch("integrations.telegram.notify_contact_captured") as mock_notify:
+            mock_notify.return_value = True
+            resp = client.patch(
+                "/users/me",
+                json={"email": "test@example.com"},
+                headers={"Authorization": f"Bearer {jwt_token}"},
+            )
         assert resp.status_code == 200
         assert resp.json()["email"] == "test@example.com"
 

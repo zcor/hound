@@ -396,6 +396,47 @@ async def notify_deep_audit_completed(
     return await send_telegram_message(message)
 
 
+async def notify_deep_audit_flagged(
+    repo_url: str,
+    session_id: str,
+    tenant_id: int | None,
+    reason: str,
+    findings_count: int | None = None,
+    project_name: str | None = None,
+) -> bool:
+    """
+    Alert ops when a deep audit's confirmed findings look like a template-FP storm
+    (firepan-ygy). Pages to the standard ops Telegram so a human can intervene before
+    the scan gets casually verified.
+
+    Args:
+        repo_url: Repository URL that was audited
+        session_id: Audit session ID
+        tenant_id: Tenant ID (for dashboard lookup)
+        reason: Human-readable reason the scan was flagged
+        findings_count: Total confirmed findings (context, optional)
+        project_name: Human-readable project name (optional)
+    """
+    repo_display = (
+        f'<a href="{_escape_html(repo_url)}">{_escape_html(repo_url)}</a>'
+        if repo_url.startswith("http") else _escape_html(repo_url)
+    )
+    parts = [
+        "🚨 <b>Deep Audit Flagged for Manual Review</b>",
+        "",
+        f"📁 <b>Repo:</b> {repo_display}",
+    ]
+    if project_name:
+        parts.append(f"📋 <b>Project:</b> {_escape_html(project_name)}")
+    if findings_count is not None:
+        parts.append(f"🔍 <b>Confirmed findings:</b> {findings_count}")
+    parts.append(f"⚠️ <b>Reason:</b> {_escape_html(reason)}")
+    parts.append(f"🔑 <b>Session:</b> <code>{_escape_html(session_id)}</code>")
+    if tenant_id is not None:
+        parts.append(f"🆔 <b>Tenant ID:</b> {tenant_id}")
+    return await send_telegram_message("\n".join(parts))
+
+
 async def notify_funnel_digest(
     period_label: str,
     visitors_7d: int,

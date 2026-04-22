@@ -5222,6 +5222,11 @@ class ScanHistoryItem(BaseModel):
     # firepan-oi4: gates rendering of assessment_level/risk_score until a human
     # or stronger-model verifier signs off. Missing key on legacy rows = False.
     admin_verified: bool = False
+    # firepan-ygy: set by the finalize step when the confirmed findings look like a
+    # template-FP storm (e.g. yieldnest-style >10 access-control FPs). Surfaced so
+    # the dashboard/admin UI can render a louder "don't just verify this" banner.
+    needs_manual_review: bool = False
+    review_reason: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -6691,10 +6696,14 @@ async def list_repository_scans(
         assessment_level = None
         credible_findings_count = None
         admin_verified = False
+        needs_manual_review = False
+        review_reason = None
         if isinstance(overview, dict):
             assessment_level = overview.get("assessment_level")
             credible_findings_count = overview.get("credible_findings_count")
             admin_verified = bool(overview.get("admin_verified", False))
+            needs_manual_review = bool(overview.get("needs_manual_review", False))
+            review_reason = overview.get("review_reason")
         cfg = scan.scan_config or {}
         scan_branch = cfg.get("branch") or project.default_branch
         scan_items.append(ScanHistoryItem(
@@ -6711,6 +6720,8 @@ async def list_repository_scans(
             assessment_level=assessment_level,
             credible_findings_count=credible_findings_count,
             admin_verified=admin_verified,
+            needs_manual_review=needs_manual_review,
+            review_reason=review_reason,
         ))
     
     return ScanHistoryResponse(

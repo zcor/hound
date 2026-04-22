@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from markupsafe import Markup
+from markupsafe import Markup, escape
 from sqladmin import Admin, BaseView, ModelView, action, expose
 from sqladmin.authentication import AuthenticationBackend
 from starlette.requests import Request
@@ -737,9 +737,14 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
         # firepan-oi4: show admin_verified at-a-glance so an admin can spot which
         # deep audits are still pending review. Rendered by column_formatters below.
         "overview_verified",
+        # firepan-ygy: louder signal when the confabulation detector fires.
+        "overview_flagged",
         ScanExecution.created_at,
     ]
-    column_labels = {"overview_verified": "Overview Verified"}
+    column_labels = {
+        "overview_verified": "Overview Verified",
+        "overview_flagged": "Flagged",
+    }
     column_searchable_list = [ScanExecution.repo_name, ScanExecution.execution_id, ScanExecution.repo_url]
     column_sortable_list = [
         ScanExecution.id,
@@ -763,6 +768,17 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
             if isinstance(m.deep_audit_overview, dict) and m.deep_audit_overview.get("admin_verified")
             else Markup('<span class="badge bg-warning">pending</span>')
             if isinstance(m.deep_audit_overview, dict)
+            else Markup('<span class="text-muted">—</span>')
+        ),
+        # firepan-ygy: loud badge when the confabulation detector fired on this scan.
+        # Tooltip shows the review_reason so admins can see WHY at a glance.
+        "overview_flagged": lambda m, a: (
+            Markup(
+                '<span class="badge bg-danger" title="'
+                + str(escape(m.deep_audit_overview.get("review_reason") or ""))
+                + '">🚨 manual review</span>'
+            )
+            if isinstance(m.deep_audit_overview, dict) and m.deep_audit_overview.get("needs_manual_review")
             else Markup('<span class="text-muted">—</span>')
         ),
     }

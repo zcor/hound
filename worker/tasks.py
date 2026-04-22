@@ -23,7 +23,10 @@ if str(_app_root) not in sys.path:
 from celery import Task  # noqa: E402
 from celery.exceptions import SoftTimeLimitExceeded  # noqa: E402
 
-from integrations.telegram import notify_deep_audit_completed  # noqa: E402
+from integrations.telegram import (  # noqa: E402
+    notify_deep_audit_completed,
+    notify_deep_audit_flagged,
+)
 from llm.token_tracker import clear_token_context, set_token_context  # noqa: E402
 
 from .celery_app import celery_app  # noqa: E402
@@ -888,6 +891,21 @@ def execute_audit_task(
             print(f"[DEBUG] Failed to compute deep audit overview: {e}")
             traceback.print_exc()
 
+        # firepan-ygy: detect template-FP storm (yieldnest-style confabulation loop)
+        # and stamp the overview. Non-fatal — if detection fails, proceed without the flag.
+        flagged, flag_reason = False, None
+        if overview is not None:
+            try:
+                flagged, flag_reason = _detect_confabulation_pattern(hypotheses)
+                if flagged:
+                    overview["needs_manual_review"] = True
+                    overview["review_reason"] = flag_reason
+                    print(f"[DEBUG] Deep audit FLAGGED for manual review: {flag_reason}")
+                else:
+                    overview["needs_manual_review"] = False
+            except Exception as e:
+                print(f"[DEBUG] Confabulation detection failed (non-fatal): {e}")
+
         # Build summary
         if overview:
             summary_text = overview.get("headline", f"Deep audit found {len(hypotheses)} potential issues")
@@ -934,6 +952,23 @@ def execute_audit_task(
             ))
         except Exception:
             pass  # non-critical
+
+        # firepan-ygy: second, louder alert when the confabulation detector fires
+        if flagged:
+            try:
+                confirmed_total = sum(
+                    1 for h in hypotheses if h.get("status") == "confirmed"
+                )
+                asyncio.run(notify_deep_audit_flagged(
+                    repo_url=repo_url,
+                    session_id=scan_id,
+                    tenant_id=tenant_id,
+                    reason=flag_reason or "Confabulation pattern detected",
+                    findings_count=confirmed_total,
+                    project_name=project_name,
+                ))
+            except Exception:
+                pass  # non-critical
 
         # Lifecycle: stamp first_deep_audit_at + last_activity_at, send transactional email
         try:
@@ -1631,6 +1666,76 @@ def _compute_deep_audit_overview(raw_count: int, curated_hypotheses: list, confi
         # verifier flips this to True. Backfill treats missing key as False.
         "admin_verified": False,
     }
+
+
+# firepan-ygy: catches the "pipeline is in a confabulation loop" meta-pattern.
+# yieldnest scan 77 produced 11 of 13 FPs matching the "Missing access control on X.Y"
+# template because DeepSeek grepped for `function set*` without following the modifier
+# chain. Two thresholds catch the meta-pattern without requiring per-pattern filters:
+#
+#   1. >10 confirmed access-control findings — high absolute volume implies the model
+#      is generating the same FP repeatedly.
+#   2. >50% of confirmed findings matching a single regex template — high relative
+#      share implies the model is fixated on one pattern (would have caught yieldnest
+#      even if total was lower).
+#
+# Complement to the per-pattern template filter (firepan-8kv) which catches individual
+# FPs; this catches the systemic failure. When triggered, the finalize step stamps
+# `needs_manual_review=True` + `review_reason` into the overview JSONB and pages ops
+# on Telegram. The admin_verified gate (firepan-oi4) already hides the assessment card;
+# this adds a louder "don't just verify this one, investigate" signal.
+_ACCESS_CONTROL_TEMPLATE_RE = re.compile(
+    r"(missing|lack(?:s|ing)?|no|without|improper)\s+"
+    r"(access\s*control|role(?:-based)?\s+access\s+control|authorization)"
+    r"|unauthorized"
+    r"|missing\s+role",
+    re.IGNORECASE,
+)
+
+
+def _detect_confabulation_pattern(
+    curated_hypotheses: list,
+) -> tuple[bool, str | None]:
+    """Return (should_flag, reason) if confirmed findings look like a template-FP storm.
+
+    Signals drawn from the yieldnest postmortem (2026-04-21):
+      - Absolute volume: >10 confirmed access-control findings.
+      - Relative share: >50% of confirmed findings match the access-control template
+        AND at least 5 confirmed total (below that, the % is noise).
+    """
+    confirmed = [
+        h for h in curated_hypotheses
+        if h.get("status") == "confirmed"
+    ]
+    total_confirmed = len(confirmed)
+    if total_confirmed == 0:
+        return (False, None)
+
+    access_control_hits = sum(
+        1 for h in confirmed
+        if _ACCESS_CONTROL_TEMPLATE_RE.search(
+            (h.get("title") or "") + " " + (h.get("description") or "")
+        )
+    )
+
+    # Threshold 1: absolute volume of access-control confirms
+    if access_control_hits > 10:
+        return (
+            True,
+            f"{access_control_hits} confirmed access-control findings exceed threshold (>10). "
+            "yieldnest-style template-FP storm suspected; manual review required.",
+        )
+
+    # Threshold 2: relative share (need a minimum sample size to avoid noise)
+    if total_confirmed >= 5 and access_control_hits / total_confirmed > 0.5:
+        share_pct = int(round(100 * access_control_hits / total_confirmed))
+        return (
+            True,
+            f"{access_control_hits} of {total_confirmed} confirmed findings ({share_pct}%) "
+            "match the access-control template; fixated-on-one-pattern storm suspected.",
+        )
+
+    return (False, None)
 
 
 def _generate_surface_scan_headline(

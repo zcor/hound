@@ -832,6 +832,31 @@ def execute_audit_task(
 
         print(f"[DEBUG] Final curated: {len(hypotheses)} findings (from {raw_count} raw)")
 
+        # Step F (firepan-8kv): per-pattern template FP filter. Drops
+        # "Missing access control on X.Y" hypotheses whose cited function
+        # already has a modifier. Non-fatal — a failed verifier falls through
+        # with the hypothesis kept.
+        template_filter_stats = {
+            "candidates_checked": 0,
+            "rejected": [],
+            "kept": len(hypotheses),
+            "verifier_model": None,
+            "skipped_reason": "not_run",
+        }
+        try:
+            hypotheses, template_filter_stats = _filter_template_fps(
+                hypotheses, repo_path, audit_config
+            )
+            if template_filter_stats.get("rejected"):
+                publisher.publish_thought(
+                    f"Dropped {len(template_filter_stats['rejected'])} access-control "
+                    f"false positives after verifier check (firepan-8kv)",
+                    iteration=total_iterations,
+                )
+        except Exception as e:
+            print(f"[DEBUG] Template FP filter failed (non-fatal): {e}")
+            traceback.print_exc()
+
         # --- Persist curated hypotheses ---
         print(f"[DEBUG] Storing {len(hypotheses)} curated hypotheses to DB for project_id={project_id}")
         _store_hypotheses_in_db(
@@ -905,6 +930,32 @@ def execute_audit_task(
                     overview["needs_manual_review"] = False
             except Exception as e:
                 print(f"[DEBUG] Confabulation detection failed (non-fatal): {e}")
+
+        # firepan-8kv: stamp template FP filter stats on the overview for
+        # observability. Always attached so postmortem analysis can see when
+        # the filter was disabled / skipped.
+        if overview is not None:
+            try:
+                overview["template_fp_filter"] = template_filter_stats
+            except Exception as e:
+                print(f"[DEBUG] Failed to stamp template_filter_stats on overview: {e}")
+
+        # firepan-apn: stamp symbol-exists gate stats on the overview. The
+        # agent records rejections as it forms hypotheses; we pull the
+        # session-scoped counter here.
+        if overview is not None and hasattr(agent, "get_symbol_gate_stats"):
+            try:
+                overview["symbol_exists_gate"] = agent.get_symbol_gate_stats()
+                if overview["symbol_exists_gate"].get("rejected_count", 0) > 0:
+                    publisher.publish_thought(
+                        f"Symbol-exists gate rejected "
+                        f"{overview['symbol_exists_gate']['rejected_count']} "
+                        f"hypotheses that cited symbols not in the repo "
+                        f"(firepan-apn)",
+                        iteration=total_iterations,
+                    )
+            except Exception as e:
+                print(f"[DEBUG] Failed to stamp symbol_exists_gate stats: {e}")
 
         # Build summary
         if overview:
@@ -1691,6 +1742,249 @@ _ACCESS_CONTROL_TEMPLATE_RE = re.compile(
     r"|missing\s+role",
     re.IGNORECASE,
 )
+
+
+# firepan-8kv: per-pattern template FP filter. Complement to firepan-ygy.
+# Picks off individual access-control false positives before persistence; ygy
+# still catches systemic storms that slip past (e.g., template variants this
+# regex doesn't hit).
+_FUNCTION_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_CONTRACT_DOT_FN_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]*)\.([a-zA-Z_][A-Za-z0-9_]*)\b")
+_MODIFIER_HINTS = (
+    "onlyOwner", "onlyRole", "onlyAdmin", "onlyGovernance", "onlyGuardian",
+    "onlyOperator", "onlyManager", "onlyAuthorized", "onlyMinter", "onlyPauser",
+    "auth ", "auth\n", "restricted", "requiresAuth",
+)
+
+
+def _parse_contract_fn_from_hypothesis(h: dict) -> tuple[str | None, str | None]:
+    """Extract (contract_name, function_name) from a hypothesis.
+
+    Tries Title/description for "Contract.fn" shape first, then falls back to
+    bare function name. Returns (None, None) when nothing parseable.
+    """
+    text = " ".join([
+        (h.get("title") or ""),
+        (h.get("description") or "")[:500],
+    ])
+    m = _CONTRACT_DOT_FN_RE.search(text)
+    if m:
+        return m.group(1), m.group(2)
+    m2 = _FUNCTION_NAME_RE.search(text)
+    if m2:
+        return None, m2.group(1)
+    return None, None
+
+
+def _fetch_function_declaration(
+    repo_path: Path,
+    contract_name: str | None,
+    function_name: str,
+    max_lines_after: int = 5,
+) -> str | None:
+    """Return declaration line + up to `max_lines_after` trailing lines.
+
+    Scans .sol/.vy files under repo_path; excludes vendored libs. Returns None
+    if no candidate file is found or the function signature can't be located.
+    """
+    if not function_name or not repo_path or not repo_path.exists():
+        return None
+
+    excluded = ("node_modules", ".git", "lib/forge-std", "lib/openzeppelin-contracts",
+                "lib/solmate", "test/", "tests/", ".hound")
+    candidate_files: list[Path] = []
+    for ext in (".sol", ".vy"):
+        for p in repo_path.rglob(f"*{ext}"):
+            rel = str(p.relative_to(repo_path))
+            if any(ex in rel for ex in excluded):
+                continue
+            if contract_name:
+                # Prefer files whose name matches the contract
+                if contract_name.lower() in p.stem.lower():
+                    candidate_files.insert(0, p)
+                else:
+                    candidate_files.append(p)
+            else:
+                candidate_files.append(p)
+
+    sig_re = re.compile(
+        rf"(?:function|def)\s+{re.escape(function_name)}\s*\(",
+        re.IGNORECASE if function_name[0].isalpha() else 0,
+    )
+
+    for f in candidate_files[:200]:  # cap for cost
+        try:
+            lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            continue
+        for i, line in enumerate(lines):
+            if sig_re.search(line):
+                slice_end = min(len(lines), i + 1 + max_lines_after)
+                return "\n".join(lines[i:slice_end])
+    return None
+
+
+def _verifier_same_as_generator(config: dict | None) -> bool:
+    """Return True if template_verifier profile resolves to the same model as scout/strategist.
+
+    Invariant from firepan-jyo: don't self-verify — a DeepSeek verifier on
+    DeepSeek-generated findings can't catch DeepSeek's bias.
+    """
+    if not isinstance(config, dict):
+        return True
+    models = (config or {}).get("models") or {}
+    tv = models.get("template_verifier") or {}
+    scout = models.get("scout") or models.get("agent") or models.get("graph") or {}
+    strategist = models.get("strategist") or models.get("guidance") or {}
+    if not tv:
+        return True  # no profile → fall back → skip
+    tv_key = (tv.get("provider"), tv.get("model"))
+    for other in (scout, strategist):
+        if not other:
+            continue
+        if (other.get("provider"), other.get("model")) == tv_key:
+            return True
+    return False
+
+
+def _filter_template_fps(
+    hypotheses: list,
+    repo_path: Path | None,
+    config: dict | None,
+) -> tuple[list, dict]:
+    """Drop template-FP hypotheses that fail an adversarial-verifier check.
+
+    For every hypothesis matching _ACCESS_CONTROL_TEMPLATE_RE, parse the
+    "Contract.function" reference, grep the declaration, and ask a verifier
+    model (must be a different provider/model tier than the generator — see
+    firepan-jyo) whether the function already has an access-control modifier.
+    If yes, remove the hypothesis from the returned list. The hypothesis DB
+    status enum is never extended — rejected rows are dropped entirely, and
+    observability data is stamped into overview["template_fp_filter"].
+
+    Returns (kept_hypotheses, stats_dict). stats_dict is the exact shape to
+    stamp onto the overview JSONB.
+    """
+    stats = {
+        "candidates_checked": 0,
+        "rejected": [],
+        "kept": len(hypotheses),
+        "verifier_model": None,
+        "skipped_reason": None,
+    }
+
+    if not hypotheses:
+        return list(hypotheses), stats
+
+    audit_config = config or {}
+    if not audit_config.get("deep_audit_template_fp_filter", True):
+        stats["skipped_reason"] = "disabled_by_config"
+        return list(hypotheses), stats
+
+    if not repo_path or not Path(repo_path).exists():
+        stats["skipped_reason"] = "no_repo_path"
+        return list(hypotheses), stats
+
+    if _verifier_same_as_generator(audit_config):
+        stats["skipped_reason"] = "verifier_matches_generator"
+        print("[template_fp_filter] Skipped: verifier profile matches generator — "
+              "would be self-verification. See firepan-jyo.")
+        return list(hypotheses), stats
+
+    # Instantiate verifier client lazily; falling back to None if the profile
+    # can't be built (missing API key, etc.) is a safe no-op.
+    try:
+        from llm.unified_client import UnifiedLLMClient
+        verifier = UnifiedLLMClient(cfg=audit_config, profile="template_verifier")
+        stats["verifier_model"] = f"{verifier.provider_name}:{verifier.model}"
+    except Exception as e:
+        stats["skipped_reason"] = f"verifier_init_failed:{e}"
+        print(f"[template_fp_filter] Verifier init failed: {e}")
+        return list(hypotheses), stats
+
+    kept: list = []
+    for h in hypotheses:
+        text = (h.get("title") or "") + " " + (h.get("description") or "")
+        if not _ACCESS_CONTROL_TEMPLATE_RE.search(text):
+            kept.append(h)
+            continue
+
+        stats["candidates_checked"] += 1
+        contract_name, function_name = _parse_contract_fn_from_hypothesis(h)
+        if not function_name:
+            # Can't parse — pass through rather than drop a possibly-real finding
+            kept.append(h)
+            continue
+
+        decl = _fetch_function_declaration(Path(repo_path), contract_name, function_name)
+        if not decl:
+            kept.append(h)
+            continue
+
+        # Cheap lexical shortcut: if the declaration obviously has a modifier,
+        # we can reject without the LLM call.
+        if any(hint in decl for hint in _MODIFIER_HINTS):
+            stats["rejected"].append({
+                "title": h.get("title") or h.get("description", "")[:80],
+                "verifier_reason": "lexical_modifier_match",
+                "verifier_model": "lexical",
+                "node_refs": h.get("node_ids") or h.get("node_refs") or [],
+                "function": function_name,
+                "contract": contract_name,
+            })
+            continue
+
+        system = (
+            "You are a Solidity/Vyper access-control reviewer. "
+            "Return ONLY a single JSON object (no prose): "
+            '{"has_access_control": true|false, "reason": "<short>"}'
+        )
+        user = (
+            f"Function declaration (line 1 is the signature):\n"
+            f"```\n{decl}\n```\n\n"
+            "Does this function have an access-control modifier that restricts WHO can "
+            "call it (onlyOwner, onlyRole, onlyAdmin, auth, restricted, or an equivalent "
+            "require/if-revert check on msg.sender)?\n"
+            "Note: nonReentrant is NOT access control. Pure/view helpers that "
+            "return data need no access control. Answer only based on the snippet."
+        )
+
+        try:
+            response = verifier.raw(system=system, user=user)
+        except Exception as e:
+            print(f"[template_fp_filter] Verifier call failed for {function_name}: {e}")
+            kept.append(h)
+            continue
+
+        text_resp = response if isinstance(response, str) else str(response)
+        match = re.search(r'\{[^{}]*"has_access_control"[^{}]*\}', text_resp)
+        if not match:
+            kept.append(h)
+            continue
+        try:
+            import json as _json
+            parsed = _json.loads(match.group())
+        except Exception:
+            kept.append(h)
+            continue
+
+        if bool(parsed.get("has_access_control")):
+            stats["rejected"].append({
+                "title": h.get("title") or h.get("description", "")[:80],
+                "verifier_reason": str(parsed.get("reason", ""))[:500],
+                "verifier_model": stats["verifier_model"],
+                "node_refs": h.get("node_ids") or h.get("node_refs") or [],
+                "function": function_name,
+                "contract": contract_name,
+            })
+        else:
+            kept.append(h)
+
+    stats["kept"] = len(kept)
+    print(f"[template_fp_filter] checked={stats['candidates_checked']} "
+          f"rejected={len(stats['rejected'])} kept={stats['kept']} "
+          f"verifier={stats['verifier_model']}")
+    return kept, stats
 
 
 def _detect_confabulation_pattern(

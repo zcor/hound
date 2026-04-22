@@ -48,6 +48,16 @@ models:
   #   provider: rei
   #   model: math
   #   max_context: 256000
+  # Adversarial verifier for the per-pattern template FP filter (firepan-8kv).
+  # MUST differ from scout/strategist provider+model, else the gate skips itself.
+  template_verifier:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    max_context: 32000
+
+# Deep audit feature flags
+deep_audit_template_fp_filter: true  # firepan-8kv: drop template-FP access-control hypotheses
+deep_audit_symbol_exists_gate: true  # firepan-apn: reject hypotheses citing symbols not in repo
 
 context:
   max_tokens: 128000

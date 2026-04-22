@@ -4,6 +4,7 @@ No fuzzy parsing, no prescriptive flow, just autonomous decision-making.
 """
 
 import json
+import re
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -237,6 +238,11 @@ class AutonomousAgent:
         # Abort flag (set by runner on steering replan)
         self._abort_requested: bool = False
         self._abort_reason: str | None = None
+
+        # firepan-apn: symbol-exists gate counter. Tracks hypotheses rejected
+        # because their cited symbols don't appear in the scanned commit.
+        # Exposed via get_symbol_gate_stats() for worker post-run stamping.
+        self._symbol_gate_rejections: list[dict] = []
 
     def _publish_to_redis(self, msg_type: str, iteration: int = 0, data: dict | None = None):
         """Publish an update to Redis Pub/Sub for SaaS frontend.
@@ -2579,7 +2585,36 @@ DO NOT include any text before or after the JSON object."""
             'source_files': list(source_files),
             'affected_functions': affected_functions
         }
-        
+
+        # firepan-apn: symbol-exists gate. Reject hypotheses whose cited
+        # symbols don't appear in the scanned commit. Kills training-data
+        # drift hallucinations before they hit the hypothesis store. Skipped
+        # if flag disabled or _repo_root unavailable.
+        if (self.config or {}).get('deep_audit_symbol_exists_gate', True):
+            ok, unknown = self._validate_symbols_exist(hypothesis)
+            if not ok:
+                self._symbol_gate_rejections.append({
+                    'title': hypothesis.title,
+                    'unknown_symbols': unknown,
+                    'node_refs': list(hypothesis.node_refs),
+                    'vulnerability_type': hypothesis.vulnerability_type,
+                })
+                self._publish_to_redis('thought', iteration=0, data={
+                    'thought': (
+                        "Rejected hypothesis (symbol_exists_gate): cited symbols "
+                        f"not found in repo — {unknown}"
+                    ),
+                    'context': 'symbol_exists_gate',
+                })
+                return {
+                    'status': 'rejected',
+                    'reason': 'symbol_not_in_repo',
+                    'unknown_symbols': unknown,
+                    'summary': (
+                        f"Rejected: cited symbols not in repo: {', '.join(unknown)}"
+                    ),
+                }
+
         # Store in persistent hypothesis store
         success, hyp_id = self.hypothesis_store.propose(hypothesis)
         
@@ -2601,6 +2636,125 @@ DO NOT include any text before or after the JSON object."""
             'hypothesis_index': len(self.loaded_data['hypotheses']) - 1
         }
     
+    # firepan-apn: symbol-exists gate regexes.
+    # Matches "Contract.function" dotted references in free text. The leading
+    # capital letter filters out common English words like "this.something" in
+    # prose. Word-boundary grep against repo files catches training-data drift
+    # (Curve postmortem D1: gauge code, ADMIN_FEE, views_implementation, etc.).
+    _SYMBOL_CONTRACT_DOT_FN_RE = re.compile(
+        r"\b([A-Z][A-Za-z0-9_]*)\.([a-zA-Z_][A-Za-z0-9_]*)\b"
+    )
+    # Backticked identifiers — strong signal the model is citing code, not prose.
+    _SYMBOL_BACKTICK_RE = re.compile(r"`([A-Za-z_][A-Za-z0-9_]{2,})`")
+    # Bareword constants in SCREAMING_SNAKE_CASE — e.g., ADMIN_FEE, MAX_UINT.
+    _SYMBOL_CONSTANT_RE = re.compile(r"\b([A-Z][A-Z0-9_]{3,})\b")
+
+    # Common English words that sometimes slip through title-casing heuristics.
+    # Keep this tight; false-negatives here are safe (we only run gate when
+    # we're confident a token is a code identifier).
+    _SYMBOL_STOPWORDS = frozenset({
+        "TODO", "FIXME", "XXX", "NOTE", "WARNING", "README",
+        "TRUE", "FALSE", "NULL", "NONE",
+        "API", "URL", "HTTP", "HTTPS", "JSON", "YAML", "SQL",
+    })
+
+    def _extract_cited_symbols(self, hypothesis: Any) -> set[str]:
+        """Pull candidate code symbols from title + description.
+
+        Returns a set of tokens that look like code identifiers (not prose).
+        Conservative: only adds tokens strongly signalled as code (dotted pairs,
+        backticks, or SCREAMING_SNAKE constants).
+        """
+        title = getattr(hypothesis, 'title', '') or ''
+        desc = getattr(hypothesis, 'description', '') or ''
+        # Cap description length to keep regex work bounded.
+        text = f"{title}\n{desc[:2000]}"
+        symbols: set[str] = set()
+
+        # Contract.fn pairs — emit both halves so grep finds them individually.
+        for m in self._SYMBOL_CONTRACT_DOT_FN_RE.finditer(text):
+            contract, fn = m.group(1), m.group(2)
+            if contract not in self._SYMBOL_STOPWORDS:
+                symbols.add(contract)
+            if len(fn) >= 3:
+                symbols.add(fn)
+
+        for m in self._SYMBOL_BACKTICK_RE.finditer(text):
+            tok = m.group(1)
+            if tok not in self._SYMBOL_STOPWORDS:
+                symbols.add(tok)
+
+        for m in self._SYMBOL_CONSTANT_RE.finditer(text):
+            tok = m.group(1)
+            if tok not in self._SYMBOL_STOPWORDS:
+                symbols.add(tok)
+
+        return symbols
+
+    _SYMBOL_EXCLUDED_DIRS = (
+        "node_modules", ".git", ".hound",
+        "lib/forge-std", "lib/openzeppelin-contracts", "lib/solmate",
+    )
+    _SYMBOL_SCAN_EXTS = (".sol", ".vy", ".rs", ".ts", ".tsx", ".js", ".py", ".go")
+
+    def _validate_symbols_exist(self, hypothesis: Any) -> tuple[bool, list[str]]:
+        """Return (True, []) if all cited symbols exist in the scanned repo.
+
+        Returns (False, unknown_symbols) if any cited symbol is absent. Soft-
+        fails to (True, []) when _repo_root is unavailable or no candidate
+        symbols can be extracted — we never block hypothesis formation on
+        infrastructure failures.
+        """
+        if self._repo_root is None or not self._repo_root.exists():
+            return True, []
+
+        symbols = self._extract_cited_symbols(hypothesis)
+        if not symbols:
+            return True, []
+
+        # Walk code files once, build a presence set, then test each symbol.
+        # Capped to avoid O(n^2) grep across huge repos.
+        present: set[str] = set()
+        files_scanned = 0
+        for p in self._repo_root.rglob("*"):
+            if files_scanned >= 400:
+                break
+            if not p.is_file():
+                continue
+            rel = str(p.relative_to(self._repo_root))
+            if any(ex in rel for ex in self._SYMBOL_EXCLUDED_DIRS):
+                continue
+            if p.suffix not in self._SYMBOL_SCAN_EXTS:
+                continue
+            files_scanned += 1
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            # Test each symbol with a word-boundary search.
+            for sym in symbols - present:
+                # Use \b word boundary for bare identifiers.
+                if re.search(rf"\b{re.escape(sym)}\b", text):
+                    present.add(sym)
+            if len(present) == len(symbols):
+                break
+
+        unknown = sorted(symbols - present)
+        if unknown:
+            return False, unknown
+        return True, []
+
+    def get_symbol_gate_stats(self) -> dict:
+        """Return session-scoped stats from the firepan-apn symbol gate.
+
+        Safe to call any time during or after an audit run. Returns a
+        deterministic shape so callers can merge it into overview JSONB.
+        """
+        return {
+            "rejected_count": len(self._symbol_gate_rejections),
+            "rejected": list(self._symbol_gate_rejections),
+        }
+
     def _update_hypothesis(self, params: dict) -> dict:
         """Update an existing hypothesis."""
         from .concurrent_knowledge import Evidence

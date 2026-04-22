@@ -6,7 +6,7 @@ Access at /admin when mounted to the FastAPI app.
 """
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from markupsafe import Markup
@@ -734,8 +734,12 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
         ScanExecution.risk_level,
         ScanExecution.contracts_scanned,
         ScanExecution.project_id,
+        # firepan-oi4: show admin_verified at-a-glance so an admin can spot which
+        # deep audits are still pending review. Rendered by column_formatters below.
+        "overview_verified",
         ScanExecution.created_at,
     ]
+    column_labels = {"overview_verified": "Overview Verified"}
     column_searchable_list = [ScanExecution.repo_name, ScanExecution.execution_id, ScanExecution.repo_url]
     column_sortable_list = [
         ScanExecution.id,
@@ -752,6 +756,15 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
             f'<span class="badge bg-{"danger" if (m.risk_score or 0) >= 70 else "warning" if (m.risk_score or 0) >= 40 else "success"}">'
             f'{m.risk_score or 0}/100</span>'
         ) if m.risk_score is not None else "",
+        # firepan-oi4: three states — verified / pending / none (surface scans
+        # and legacy rows with no overview JSONB get the neutral dash).
+        "overview_verified": lambda m, a: (
+            Markup('<span class="badge bg-success">✓ verified</span>')
+            if isinstance(m.deep_audit_overview, dict) and m.deep_audit_overview.get("admin_verified")
+            else Markup('<span class="badge bg-warning">pending</span>')
+            if isinstance(m.deep_audit_overview, dict)
+            else Markup('<span class="text-muted">—</span>')
+        ),
     }
     column_details_formatters = {
         ScanExecution.findings: lambda m, a: ScanExecutionAdmin.format_findings(m, a),
@@ -1171,7 +1184,120 @@ class ScanExecutionAdmin(ModelView, model=ScanExecution):
             request.session["flash"] = f"Generated {len(generated_reports)} report(s) in {reports_dir}"
         else:
             request.session["flash"] = "No reports generated"
-        
+
+        return RedirectResponse(
+            request.url_for("admin:list", identity=self.identity),
+            status_code=302,
+        )
+
+    # firepan-oi4: admin actions to flip deep_audit_overview.admin_verified so
+    # the dashboard can render the model-written headline/assessment_level/risk_score.
+    # Defaults to False on every new audit — deep audits stay "Pending Review" until
+    # an admin explicitly signs off. The whole JSONB dict is reassigned because
+    # JSONType has no MutableDict hook (in-place mutation would not commit).
+    @action(
+        name="verify_overview",
+        label="✅ Verify Overview",
+        confirmation_message=(
+            "Mark the Deep Audit Assessment as verified? The dashboard will then "
+            "render the model-written headline, assessment level, and risk score "
+            "to paying users. Only confirm after reviewing the findings."
+        ),
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def verify_overview_action(self, request: Request) -> RedirectResponse:
+        """Flip deep_audit_overview.admin_verified = True on selected scans."""
+        pks = request.query_params.get("pks", "").split(",")
+        verified: list[str] = []
+        skipped: list[str] = []
+
+        from database import create_db_session
+        from server.api import get_engine
+        engine = get_engine()
+        db = create_db_session(engine)
+        try:
+            for pk in pks:
+                if not pk:
+                    continue
+                try:
+                    scan = db.query(ScanExecution).filter(ScanExecution.id == int(pk)).first()
+                    if not scan:
+                        continue
+                    overview = scan.deep_audit_overview
+                    if not isinstance(overview, dict):
+                        skipped.append(str(scan.execution_id or scan.id))
+                        continue
+                    updated = dict(overview)
+                    updated["admin_verified"] = True
+                    updated["verified_at"] = datetime.now(timezone.utc).isoformat()
+                    updated["verified_by"] = "admin"
+                    scan.deep_audit_overview = updated
+                    db.commit()
+                    verified.append(str(scan.execution_id or scan.id))
+                except Exception as e:
+                    print(f"Failed to verify overview on scan {pk}: {e}")
+                    db.rollback()
+        finally:
+            db.close()
+
+        parts = []
+        if verified:
+            parts.append(f"Verified: {', '.join(verified)}")
+        if skipped:
+            parts.append(f"Skipped (no overview): {', '.join(skipped)}")
+        request.session["flash"] = " · ".join(parts) or "No scans verified"
+        return RedirectResponse(
+            request.url_for("admin:list", identity=self.identity),
+            status_code=302,
+        )
+
+    @action(
+        name="unverify_overview",
+        label="↩ Unverify Overview",
+        confirmation_message=(
+            "Revert verification on the Deep Audit Assessment? The dashboard "
+            "will hide the headline / assessment level / risk score again."
+        ),
+        add_in_detail=True,
+        add_in_list=True,
+    )
+    async def unverify_overview_action(self, request: Request) -> RedirectResponse:
+        """Flip deep_audit_overview.admin_verified = False on selected scans."""
+        pks = request.query_params.get("pks", "").split(",")
+        unverified: list[str] = []
+
+        from database import create_db_session
+        from server.api import get_engine
+        engine = get_engine()
+        db = create_db_session(engine)
+        try:
+            for pk in pks:
+                if not pk:
+                    continue
+                try:
+                    scan = db.query(ScanExecution).filter(ScanExecution.id == int(pk)).first()
+                    if not scan:
+                        continue
+                    overview = scan.deep_audit_overview
+                    if not isinstance(overview, dict):
+                        continue
+                    updated = dict(overview)
+                    updated["admin_verified"] = False
+                    updated.pop("verified_at", None)
+                    updated.pop("verified_by", None)
+                    scan.deep_audit_overview = updated
+                    db.commit()
+                    unverified.append(str(scan.execution_id or scan.id))
+                except Exception as e:
+                    print(f"Failed to unverify overview on scan {pk}: {e}")
+                    db.rollback()
+        finally:
+            db.close()
+
+        request.session["flash"] = (
+            f"Unverified: {', '.join(unverified)}" if unverified else "No scans unverified"
+        )
         return RedirectResponse(
             request.url_for("admin:list", identity=self.identity),
             status_code=302,

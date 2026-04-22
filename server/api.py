@@ -454,12 +454,12 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)) -> U
     Raises:
         HTTPException: If token is missing, invalid, expired, or user not found
     """
-    from server.auth_routes import get_token_from_header
     # NOTE: we use decode_access_token() rather than get_current_user_from_token()
     # because the latter strips the payload down to {user_id, tenant_id} and
     # drops custom claims like `admin_preview` — which we need to see here so
     # we can distinguish "preview with no User row" (404) from "broken token" (401).
     # CLAUDE.md gotcha #admin-preview memorialises this trap.
+    from server.auth_routes import get_token_from_header
     from server.auth_utils import decode_access_token
 
     try:
@@ -5219,6 +5219,9 @@ class ScanHistoryItem(BaseModel):
     # Deep audit curated fields (None for surface scans)
     assessment_level: str | None = None
     credible_findings_count: int | None = None
+    # firepan-oi4: gates rendering of assessment_level/risk_score until a human
+    # or stronger-model verifier signs off. Missing key on legacy rows = False.
+    admin_verified: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -6687,9 +6690,11 @@ async def list_repository_scans(
         overview = scan.deep_audit_overview if hasattr(scan, 'deep_audit_overview') else None
         assessment_level = None
         credible_findings_count = None
+        admin_verified = False
         if isinstance(overview, dict):
             assessment_level = overview.get("assessment_level")
             credible_findings_count = overview.get("credible_findings_count")
+            admin_verified = bool(overview.get("admin_verified", False))
         cfg = scan.scan_config or {}
         scan_branch = cfg.get("branch") or project.default_branch
         scan_items.append(ScanHistoryItem(
@@ -6705,6 +6710,7 @@ async def list_repository_scans(
             branch=scan_branch,
             assessment_level=assessment_level,
             credible_findings_count=credible_findings_count,
+            admin_verified=admin_verified,
         ))
     
     return ScanHistoryResponse(
@@ -8560,6 +8566,73 @@ async def finalize_scan(
     except Exception:
         pass
     return {"status": "completed", "execution_id": execution_id}
+
+
+# firepan-oi4: admin-only flag flip for the model-written deep_audit_overview.
+# Defaults to unverified on every new deep audit; these endpoints let an admin
+# sign off after reviewing the findings. Stamps verified_at + verified_by into
+# the JSONB so there's a trail. Reassigns the whole dict because JSONType has
+# no MutableDict hook — in-place mutation would be invisible to SQLAlchemy.
+@app.post("/admin/scans/{execution_id}/verify-overview")
+async def verify_deep_audit_overview(
+    execution_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Flip deep_audit_overview.admin_verified = True. Admin only."""
+    if not _verify_explicit_admin_header(request):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    scan = db.query(ScanExecution).filter(
+        ScanExecution.execution_id == execution_id,
+    ).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    overview = scan.deep_audit_overview
+    if not isinstance(overview, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Scan has no deep_audit_overview to verify",
+        )
+    updated = dict(overview)
+    updated["admin_verified"] = True
+    updated["verified_at"] = datetime.now(timezone.utc).isoformat()
+    updated["verified_by"] = "admin"
+    scan.deep_audit_overview = updated
+    db.commit()
+    return {
+        "execution_id": execution_id,
+        "admin_verified": True,
+        "verified_at": updated["verified_at"],
+    }
+
+
+@app.post("/admin/scans/{execution_id}/unverify-overview")
+async def unverify_deep_audit_overview(
+    execution_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Flip deep_audit_overview.admin_verified = False. Admin only. Idempotent."""
+    if not _verify_explicit_admin_header(request):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    scan = db.query(ScanExecution).filter(
+        ScanExecution.execution_id == execution_id,
+    ).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    overview = scan.deep_audit_overview
+    if not isinstance(overview, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Scan has no deep_audit_overview to unverify",
+        )
+    updated = dict(overview)
+    updated["admin_verified"] = False
+    updated.pop("verified_at", None)
+    updated.pop("verified_by", None)
+    scan.deep_audit_overview = updated
+    db.commit()
+    return {"execution_id": execution_id, "admin_verified": False}
 
 
 @app.get("/surface/stats")

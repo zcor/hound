@@ -1626,6 +1626,10 @@ def _compute_deep_audit_overview(raw_count: int, curated_hypotheses: list, confi
         "raw_findings_count": raw_count,
         "assessment_level": assessment_level,
         "review_note": review_note,
+        # firepan-oi4: unverified by default — the assessment card hides
+        # headline/assessment_level/risk_score until a human or stronger-model
+        # verifier flips this to True. Backfill treats missing key as False.
+        "admin_verified": False,
     }
 
 

@@ -6,11 +6,11 @@
     },
     "POST /audits/start": {
       "price": "$5.00",
-      "description": "Deep autonomous security audit"
+      "description": "Deep autonomous security scan"
     },
     "POST /agent/audits": {
       "price": "$5.00",
-      "description": "Agent-native deep audit (pay-per-audit, no project setup required)"
+      "description": "Agent-native deep scan (pay-per-scan, no project setup required)"
     },
     "POST /agent/surface-scan": {
       "price": "$0.50",

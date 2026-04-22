@@ -1,6 +1,6 @@
 ---
 name: firepan-agent-api
-description: Use when an agent needs to use the FirePan production API end-to-end, including JWT auth, x402 payment, quick surface scans, deep audits, status polling, findings retrieval, report retrieval, and audit graph access. Supports both external agent usage and server-local testing from a FirePan host with the hound-api container.
+description: Use when an agent needs to use the FirePan production API end-to-end, including JWT auth, x402 payment, quick surface scans, deep scans, status polling, findings retrieval, report retrieval, and scan graph access. Supports both external agent usage and server-local testing from a FirePan host with the hound-api container.
 ---
 
 # FirePan Agent API
@@ -20,7 +20,7 @@ Read [references/agent_api.md](references/agent_api.md) when you need exact requ
 - Private repos require `installation_id`.
 - Preferred flow is:
   1. surface scan first
-  2. deep audit only if warranted
+  2. deep scan only if warranted
   3. poll status
   4. fetch findings, report, and graphs
 
@@ -59,7 +59,7 @@ JWT_TOKEN="$(bash scripts/generate_local_jwt.sh 49 24)" \
 bash scripts/firepan_surface_scan.sh ./.firepan-agent-wallet.json https://github.com/assune-hue/bad-solidity-contracts.git
 ```
 
-Start a deep audit:
+Start a deep scan:
 
 ```bash
 JWT_TOKEN="$(bash scripts/generate_local_jwt.sh 49 24)" \
@@ -107,7 +107,7 @@ bash scripts/firepan_paid_request.sh GET https://api.firepan.com/agent/audits/<s
 - Use a fresh `Idempotency-Key` for each distinct paid request.
 - Reuse the same `Idempotency-Key` only when retrying the exact same request.
 - Surface scan is synchronous and cheapest.
-- Deep audit is asynchronous and produces graphs plus findings.
+- Deep scan is asynchronous and produces graphs plus findings.
 - If a route unexpectedly returns `401`, verify the JWT tenant and expiration first.
 - If a private repo fails to clone, verify `installation_id`.
 

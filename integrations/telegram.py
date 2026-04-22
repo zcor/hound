@@ -306,7 +306,7 @@ async def notify_deep_audit_started(
     repo_display = f'<a href="{_escape_html(repo_url)}">{_escape_html(repo_url)}</a>' if repo_url.startswith("http") else _escape_html(repo_url)
 
     message_parts = [
-        "🔬 <b>Deep Audit Started</b>",
+        "🔬 <b>Deep Scan Started</b>",
         "",
         f"📁 <b>Repo:</b> {repo_display}",
     ]
@@ -359,9 +359,9 @@ async def notify_deep_audit_completed(
     repo_display = f'<a href="{_escape_html(repo_url)}">{_escape_html(repo_url)}</a>' if repo_url.startswith("http") else _escape_html(repo_url)
 
     if status in ("completed", "in_review"):
-        header = "✅ <b>Deep Audit Complete</b>"
+        header = "✅ <b>Deep Scan Complete</b>"
     else:
-        header = "❌ <b>Deep Audit Failed</b>"
+        header = "❌ <b>Deep Scan Failed</b>"
 
     message_parts = [
         header,
@@ -422,7 +422,7 @@ async def notify_deep_audit_flagged(
         if repo_url.startswith("http") else _escape_html(repo_url)
     )
     parts = [
-        "🚨 <b>Deep Audit Flagged for Manual Review</b>",
+        "🚨 <b>Deep Scan Flagged for Manual Review</b>",
         "",
         f"📁 <b>Repo:</b> {repo_display}",
     ]

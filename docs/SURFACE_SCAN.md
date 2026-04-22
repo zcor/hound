@@ -4,7 +4,7 @@ A lightweight, cost-effective security scanner for preliminary assessment of Sol
 
 ## Overview
 
-Surface Scan is designed for **lead generation** - quickly scanning hundreds of repos to identify potential prospects who might benefit from a full Firepan audit. It's NOT a replacement for deep auditing.
+Surface Scan is designed for **lead generation** - quickly scanning hundreds of repos to identify potential prospects who might benefit from a full Firepan audit. It's NOT a replacement for a deep scan.
 
 **Key Characteristics:**
 - Fast: ~2 seconds per repo (static analysis only)
@@ -169,7 +169,7 @@ Running against OpenZeppelin, Uniswap, etc. will produce findings. These are alm
 
 ### What Surface Scan is NOT Good For
 
-1. **Replacing deep audits** - It's a 2-second scan, not a week-long audit
+1. **Replacing deep scans** - It's a 2-second scan, not a week-long audit
 2. **Auditing production code** - False positives will embarrass you
 3. **Finding complex vulnerabilities** - Logic bugs, economic attacks, etc.
 

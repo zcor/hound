@@ -15,7 +15,7 @@ x402 behavior:
 | Route | Price | Notes |
 |-------|-------|-------|
 | `POST /agent/surface-scan` | `$0.50` | synchronous, immediate results |
-| `POST /agent/audits` | `$5.00` | async deep audit |
+| `POST /agent/audits` | `$5.00` | async deep scan |
 | `GET /agent/audits/{session_id}/report` | may be x402-protected | use paid helper if needed |
 
 ## Surface Scan
@@ -42,7 +42,7 @@ Key response fields:
 - `llm_calls_used`
 - `summary`
 
-## Deep Audit
+## Deep Scan
 
 Route:
 - `POST /agent/audits`
@@ -90,7 +90,7 @@ Typical status progression:
 ## Minimal Usage Pattern
 
 1. Run surface scan.
-2. If risk is meaningful, start deep audit.
+2. If risk is meaningful, start deep scan.
 3. Poll status.
 4. Retrieve findings and graphs.
 5. Retrieve report if needed.

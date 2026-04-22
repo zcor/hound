@@ -155,7 +155,7 @@ async def send_audit_complete_email(
 
     html_content = f"""
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-        <h2 style="color: #1a1a1a; margin-bottom: 4px;">Your Deep Audit is Ready</h2>
+        <h2 style="color: #1a1a1a; margin-bottom: 4px;">Your Deep Scan is Ready</h2>
         <p style="color: #666; margin-top: 0;">Results for <strong>{project_name}</strong></p>
 
         <div style="background: #f8f9fa; border-radius: 8px; padding: 16px; margin: 20px 0;">

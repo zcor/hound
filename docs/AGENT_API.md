@@ -161,7 +161,7 @@ GET /agent/audits/{session_id}/graphs
 ```
 
 Returns metadata for all knowledge graphs built during the audit.
-Graphs are built automatically as part of the deep audit (SystemArchitecture,
+Graphs are built automatically as part of the deep scan (SystemArchitecture,
 AssetFlow, PermissionChecks, etc.).
 
 **Response (200):**
@@ -246,7 +246,7 @@ POST /agent/surface-scan
 
 Fast, cheap ($0.50) surface-level scan. Runs synchronously — results are
 returned in the response. Ideal as a first pass before committing to a
-deep audit.
+deep scan.
 
 **Request body:**
 ```json
@@ -307,7 +307,7 @@ curl -X POST https://api.firepan.ai/agent/surface-scan \
 
 # Response: {"execution_id": "agent_surface_...", "risk_score": 65, "findings": [...]}
 
-# 1. Start deep audit ($5.00)
+# 1. Start deep scan ($5.00)
 curl -X POST https://api.firepan.ai/agent/audits \
   -H "Authorization: Bearer $JWT" \
   -H "Content-Type: application/json" \
@@ -361,12 +361,12 @@ surface = requests.post(f"{BASE}/agent/surface-scan", headers={
 print(f"Surface: {surface['risk_level']} ({surface['risk_score']}/100)")
 print(f"  {len(surface['findings'])} findings in {surface['scan_duration_seconds']:.1f}s")
 
-# Decide whether a deep audit is worthwhile
+# Decide whether a deep scan is worthwhile
 if surface["risk_score"] < 30:
-    print("Low risk — skipping deep audit")
+    print("Low risk — skipping deep scan")
     exit(0)
 
-# --- Step 2: Deep audit ($5.00) ---
+# --- Step 2: Deep scan ($5.00) ---
 resp = requests.post(f"{BASE}/agent/audits", headers={
     **HEADERS,
     "Idempotency-Key": str(uuid.uuid4()),

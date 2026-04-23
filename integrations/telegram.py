@@ -585,6 +585,32 @@ async def notify_contact_captured(
     return await send_telegram_message(message)
 
 
+async def notify_arena_sponsor_interest(
+    *,
+    email: str,
+    name: str | None,
+    protocol: str | None,
+    estimated_pool_usd: int | None,
+    message: str | None,
+) -> bool:
+    """Notify team when a sponsor submits interest via arena.firepan.com."""
+    pool_str = (
+        f"${estimated_pool_usd:,}" if estimated_pool_usd else "—"
+    )
+    message_parts = [
+        "🏟 <b>Arena Sponsor Interest</b>",
+        "",
+        f"📧 <b>Email:</b> {_escape_html(email)}",
+        f"🏛 <b>Protocol:</b> {_escape_html(protocol or '—')}",
+        f"👤 <b>Name:</b> {_escape_html(name or '—')}",
+        f"💰 <b>Est. pool:</b> {pool_str}",
+    ]
+    if message:
+        message_parts.append("")
+        message_parts.append(f"💬 {_escape_html(message[:400])}")
+    return await send_telegram_message("\n".join(message_parts))
+
+
 def _escape_html(text: str) -> str:
     """Escape HTML special characters for Telegram HTML parse mode."""
     return (

@@ -72,6 +72,7 @@ from starlette.middleware.sessions import SessionMiddleware  # noqa: E402
 
 from commands.project import ProjectManager  # noqa: E402
 from database.models import (  # noqa: E402
+    ArenaSponsorInterest,
     AuditSession,
     Base,
     Graph,
@@ -89,6 +90,7 @@ from database.models import (  # noqa: E402
 )
 from integrations.telegram import (  # noqa: E402
     notify_app_installed,
+    notify_arena_sponsor_interest,
     notify_deep_audit_started,
     notify_new_repo_synced,
     notify_repo_added,
@@ -578,6 +580,82 @@ async def email_unsubscribe(t: str = "", db: Session = Depends(get_db)):
         ),
         status_code=200,
     )
+
+
+# =============================================================================
+# ARENA SPONSOR INTEREST — public splash form at arena.firepan.com
+# =============================================================================
+# No auth. Honeypot + dwell-time check + rate limit. Writes to
+# arena_sponsor_interest table and pings Firepan ops Telegram.
+
+class ArenaInterestCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    email: str = Field(min_length=3, max_length=255)
+    name: str | None = Field(default=None, max_length=255)
+    protocol: str | None = Field(default=None, max_length=255)
+    estimated_pool_usd: int | None = Field(default=None, ge=0, le=1_000_000_000)
+    message: str | None = Field(default=None, max_length=2000)
+    source: str | None = Field(default="splash", max_length=32)
+    website: str | None = Field(default=None, max_length=255)  # honeypot
+    elapsed_ms: int | None = Field(default=None, ge=0)
+
+
+@app.post("/arena/interest")
+@limiter.limit("5/minute")
+async def arena_interest(
+    request: Request,
+    payload: ArenaInterestCreate,
+    db: Session = Depends(get_db),
+):
+    """Public sponsor interest capture from arena.firepan.com splash page.
+
+    Silently drops bot submissions (honeypot + dwell-time) with 200s so scrapers
+    don't learn the filters. Real submissions are stored and pinged to Telegram.
+    """
+    # Honeypot: any value in `website` = bot. Silent 200, no DB write.
+    if payload.website:
+        return {"ok": True}
+    # Dwell-time: form rendered and submitted in < 2s = bot. Silent 200.
+    if payload.elapsed_ms is not None and payload.elapsed_ms < 2000:
+        return {"ok": True}
+    # Email shape: reject obviously malformed
+    if "@" not in payload.email or "." not in payload.email.split("@")[-1]:
+        raise HTTPException(status_code=400, detail="Invalid email")
+
+    # Hash the submitter's IP for abuse review without storing raw PII.
+    client_ip = request.client.host if request.client else ""
+    salt = os.environ.get("HOUND_SECRET_KEY", "")
+    ip_hash = (
+        hashlib.sha256(f"{client_ip}:{salt}".encode()).hexdigest()
+        if client_ip else None
+    )
+    user_agent = (request.headers.get("user-agent") or "")[:500]
+
+    row = ArenaSponsorInterest(
+        email=payload.email,
+        name=payload.name,
+        protocol=payload.protocol,
+        estimated_pool_usd=payload.estimated_pool_usd,
+        message=payload.message,
+        source=payload.source or "splash",
+        ip_hash=ip_hash,
+        user_agent=user_agent,
+    )
+    db.add(row)
+    db.commit()
+
+    try:
+        await notify_arena_sponsor_interest(
+            email=payload.email,
+            name=payload.name,
+            protocol=payload.protocol,
+            estimated_pool_usd=payload.estimated_pool_usd,
+            message=payload.message,
+        )
+    except Exception as e:
+        logger.warning("Arena interest Telegram notify failed: %s", e)
+
+    return {"ok": True}
 
 
 # =============================================================================

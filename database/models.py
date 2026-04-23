@@ -751,6 +751,33 @@ MODEL_PRICING = {
 }
 
 
+class ArenaSponsorInterest(Base):
+    """Sponsor interest submissions from arena.firepan.com splash page.
+
+    No auth, public form. Written straight from the splash. Reviewed in SQLAdmin;
+    Ian replies to leads personally. Also fires a Telegram ping to the Firepan
+    ops channel on insert.
+    """
+
+    __tablename__ = "arena_sponsor_interest"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), nullable=False, index=True)
+    name = Column(String(255), nullable=True)
+    protocol = Column(String(255), nullable=True, index=True)
+    estimated_pool_usd = Column(Integer, nullable=True)  # whole USD, human-readable in admin
+    message = Column(Text, nullable=True)
+    source = Column(String(32), nullable=False, default="splash")  # splash | referral | other
+    ip_hash = Column(String(64), nullable=True)  # sha256(ip + HOUND_SECRET_KEY)
+    user_agent = Column(String(500), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+
+
 def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     """Calculate cost in USD for a given model and token counts."""
     # Normalize model name (handle variations)

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 from integrations.telegram import (
     _escape_html,
     notify_app_installed,
+    notify_arena_sponsor_interest,
     notify_deep_audit_completed,
     notify_deep_audit_started,
     notify_funnel_digest,
@@ -406,3 +407,58 @@ def test_notify_funnel_digest_zero_division():
     assert result is True
     msg = mock_send.call_args[0][0]
     assert "N/A" in msg
+
+
+def test_notify_arena_sponsor_interest_full():
+    with patch("integrations.telegram.send_telegram_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = True
+        result = _run(notify_arena_sponsor_interest(
+            email="alice@aave.com",
+            name="Alice Foundation",
+            protocol="Aave Labs",
+            estimated_pool_usd=150_000,
+            message="Launching V4 next quarter — want coverage on the new lending primitive.",
+        ))
+    assert result is True
+    msg = mock_send.call_args[0][0]
+    assert "Arena Sponsor Interest" in msg
+    assert "alice@aave.com" in msg
+    assert "Aave Labs" in msg
+    assert "Alice Foundation" in msg
+    assert "$150,000" in msg
+    assert "V4 next quarter" in msg
+
+
+def test_notify_arena_sponsor_interest_minimal():
+    with patch("integrations.telegram.send_telegram_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = True
+        result = _run(notify_arena_sponsor_interest(
+            email="solo@example.com",
+            name=None,
+            protocol=None,
+            estimated_pool_usd=None,
+            message=None,
+        ))
+    assert result is True
+    msg = mock_send.call_args[0][0]
+    assert "Arena Sponsor Interest" in msg
+    assert "solo@example.com" in msg
+    # Empty fields render as em-dash
+    assert "—" in msg
+
+
+def test_notify_arena_sponsor_interest_escapes_html():
+    with patch("integrations.telegram.send_telegram_message", new_callable=AsyncMock) as mock_send:
+        mock_send.return_value = True
+        _run(notify_arena_sponsor_interest(
+            email="x@y.com",
+            name="<script>alert(1)</script>",
+            protocol="Acme & Co",
+            estimated_pool_usd=None,
+            message="<b>bold</b> & bigger",
+        ))
+    msg = mock_send.call_args[0][0]
+    assert "<script>" not in msg
+    assert "&lt;script&gt;" in msg
+    assert "Acme &amp; Co" in msg
+    assert "&lt;b&gt;bold&lt;/b&gt;" in msg

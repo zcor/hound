@@ -16,6 +16,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
 
 from database.models import (
+    ArenaSponsorInterest,
     AuditSession,
     Graph,
     Hypothesis,
@@ -1864,6 +1865,38 @@ class TenantDiscountAdmin(ModelView, model=TenantDiscount):
     can_delete = True
 
 
+class ArenaSponsorInterestAdmin(ModelView, model=ArenaSponsorInterest):
+    """Admin view for ArenaSponsorInterest — sponsor leads from arena.firepan.com."""
+
+    page_size = 50
+    column_list = [
+        ArenaSponsorInterest.id,
+        ArenaSponsorInterest.email,
+        ArenaSponsorInterest.protocol,
+        ArenaSponsorInterest.name,
+        ArenaSponsorInterest.estimated_pool_usd,
+        ArenaSponsorInterest.source,
+        ArenaSponsorInterest.created_at,
+    ]
+    column_searchable_list = [
+        ArenaSponsorInterest.email,
+        ArenaSponsorInterest.protocol,
+        ArenaSponsorInterest.name,
+    ]
+    column_sortable_list = [
+        ArenaSponsorInterest.id,
+        ArenaSponsorInterest.estimated_pool_usd,
+        ArenaSponsorInterest.created_at,
+    ]
+    column_default_sort = [(ArenaSponsorInterest.created_at, True)]
+    icon = "fa-solid fa-trophy"
+    name = "Arena Sponsor Interest"
+    name_plural = "Arena Sponsor Interest"
+    can_create = False
+    can_edit = False
+    can_delete = True  # allow purging obvious spam
+
+
 class ReportsView(BaseView):
     """Custom view to browse and access generated audit reports."""
     
@@ -2235,6 +2268,7 @@ def setup_admin(app, engine):
     admin.add_view(PaymentLogAdmin)
     admin.add_view(X402DiscountAdmin)
     admin.add_view(TenantDiscountAdmin)
+    admin.add_view(ArenaSponsorInterestAdmin)
     admin.add_view(ReportsView)
     # Note: ScanFindingsView not added to navigation - accessible only via "View Findings" action
     

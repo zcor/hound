@@ -2619,6 +2619,8 @@ DO NOT include any text before or after the JSON object."""
         success, hyp_id = self.hypothesis_store.propose(hypothesis)
         
         # Also keep in memory for backward compatibility
+        # firepan-281: include model provenance so downstream serializers
+        # (and ultimately the DB row) can record which model generated this.
         self.loaded_data['hypotheses'].append({
             'id': hyp_id,
             'description': hypothesis.title,
@@ -2626,7 +2628,10 @@ DO NOT include any text before or after the JSON object."""
             'confidence': hypothesis.confidence,
             'status': hypothesis.status,
             'node_ids': hypothesis.node_refs,
-            'evidence': []
+            'evidence': [],
+            'reported_by_model': hypothesis.reported_by_model,
+            'junior_model': hypothesis.junior_model,
+            'senior_model': hypothesis.senior_model,
         })
         
         return {
@@ -2770,12 +2775,26 @@ DO NOT include any text before or after the JSON object."""
         # Update confidence if provided
         if 'new_confidence' in params and hyp_id:
             reason = params.get('reason', 'Agent analysis')
-            self.hypothesis_store.adjust_confidence(hyp_id, params['new_confidence'], reason)
-            
+            # firepan-281: stamp senior model when guidance/deep_think drove
+            # the confidence bump. Falls back to the current agent model so we
+            # at least know who promoted it. First-writer-wins on the store
+            # side — re-verifications by the same senior won't churn the row.
+            senior_model = params.get('guidance_model') or (
+                f"{self.llm.provider_name}:{self.llm.model}" if self.llm else None
+            )
+            self.hypothesis_store.adjust_confidence(
+                hyp_id,
+                params['new_confidence'],
+                reason,
+                senior_model=senior_model,
+            )
+
             # Update in memory too
             for h in self.loaded_data['hypotheses']:
                 if h.get('id') == hyp_id:
                     h['confidence'] = params['new_confidence']
+                    if senior_model and not h.get('senior_model'):
+                        h['senior_model'] = senior_model
         
         # Add evidence if provided
         if 'evidence' in params and hyp_id:
@@ -2826,12 +2845,17 @@ DO NOT include any text before or after the JSON object."""
                     'type': h['vulnerability_type'],  # Keep for compatibility
                     'confidence': h['confidence'],
                     'severity': h.get('severity', 'medium'),  # Include severity
-                    'status': 'confirmed' if h['confidence'] >= 0.8 
-                             else 'rejected' if h['confidence'] <= 0.2 
+                    'status': 'confirmed' if h['confidence'] >= 0.8
+                             else 'rejected' if h['confidence'] <= 0.2
                              else 'uncertain',
                     'evidence': h.get('evidence', []),
                     'evidence_summary': ', '.join(h.get('evidence', [])) if h.get('evidence') else '',  # String for DB
-                    'node_ids': h.get('node_ids', [])  # Include node IDs
+                    'node_ids': h.get('node_ids', []),
+                    # firepan-281: propagate model provenance so the DB row can
+                    # record which model generated/verified this hypothesis.
+                    'reported_by_model': h.get('reported_by_model'),
+                    'junior_model': h.get('junior_model'),
+                    'senior_model': h.get('senior_model'),
                 }
                 for i, h in enumerate(self.loaded_data['hypotheses'])
             ]

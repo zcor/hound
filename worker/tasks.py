@@ -1383,6 +1383,10 @@ def _store_hypotheses_in_db(
 
             for i, hyp in enumerate(hypotheses):
                 print(f"[DEBUG _store_hypotheses_in_db] Storing hypothesis {i}: {hyp.get('description', '')[:50]}...")
+                # firepan-281: persist model provenance so we can answer
+                # "which model generated/verified this finding?" after the fact.
+                # Without this, the yieldnest-shape postmortem ("DeepSeek
+                # verifying DeepSeek") can't be detected from the DB.
                 db_hyp = Hypothesis(
                     project_id=project_id,
                     scan_execution_id=scan_exec_id,
@@ -1395,6 +1399,13 @@ def _store_hypotheses_in_db(
                     severity=hyp.get("severity", "medium"),
                     node_refs=hyp.get("node_ids", []),
                     evidence={"items": hyp.get("evidence", [])},
+                    reported_by_model=(
+                        hyp.get("reported_by_model")
+                        or hyp.get("senior_model")
+                        or hyp.get("junior_model")
+                    ),
+                    junior_model=hyp.get("junior_model"),
+                    senior_model=hyp.get("senior_model"),
                 )
                 db.add(db_hyp)
 

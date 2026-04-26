@@ -288,26 +288,44 @@ class HypothesisStore(ConcurrentFileStore):
         
         return self.update_atomic(update)
     
-    def adjust_confidence(self, hypothesis_id: str, confidence: float, reason: str) -> bool:
-        """Adjust hypothesis confidence and optionally add QA comment."""
+    def adjust_confidence(
+        self,
+        hypothesis_id: str,
+        confidence: float,
+        reason: str,
+        senior_model: str | None = None,
+    ) -> bool:
+        """Adjust hypothesis confidence and optionally add QA comment.
+
+        firepan-281: callers may pass `senior_model` to attribute the verifier
+        that adjusted the score. Without this, every confidence bump from a
+        senior-tier verifier is invisible after the fact and we can't answer
+        "which model said this finding was 0.9?" — the yieldnest postmortem
+        gap.
+        """
         def update(data):
             if hypothesis_id not in data["hypotheses"]:
                 return data, False
-            
+
             hyp = data["hypotheses"][hypothesis_id]
             hyp["confidence"] = confidence
-            
+
             # Store QA comment/reasoning if provided (backwards compatible)
             if reason:
                 hyp["qa_comment"] = reason
-            
+
+            # Stamp senior model on the row when supplied. Don't overwrite a
+            # prior senior — the FIRST senior to verify owns provenance.
+            if senior_model and not hyp.get("senior_model"):
+                hyp["senior_model"] = senior_model
+
             # Auto-update status (analysis agent can only reject, not confirm)
             # Only the finalize agent can set status to "confirmed"
             if confidence <= 0.1:
                 hyp["status"] = "rejected"
-            
+
             return data, True
-        
+
         return self.update_atomic(update)
     
     def get_by_node(self, node_id: str) -> list[dict]:

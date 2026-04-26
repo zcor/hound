@@ -448,3 +448,86 @@ class TestNoSchemaLeak:
                 )
         finally:
             db.close()
+
+
+# ---------------------------------------------------------------------------
+# firepan-281: _store_hypotheses_in_db propagates model provenance
+# ---------------------------------------------------------------------------
+
+
+class TestProvenancePersistence:
+    """Verify junior_model / senior_model / reported_by_model survive the
+    in-memory-dict → DB row trip. Without this, the yieldnest postmortem
+    "DeepSeek verifying DeepSeek" case is invisible after audit completion.
+    """
+
+    def test_model_fields_persist_to_db(self, in_memory_db, project):
+        get_db, _engine, _ = in_memory_db
+        hypotheses = [{
+            "id": "h1",
+            "description": "Reentrancy in withdraw",
+            "vulnerability_type": "reentrancy",
+            "status": "confirmed",
+            "confidence": 0.9,
+            "severity": "critical",
+            "junior_model": "deepseek:deepseek-chat",
+            "senior_model": "anthropic:claude-sonnet-4-6",
+            "reported_by_model": "anthropic:claude-sonnet-4-6",
+        }]
+        _store_hypotheses_in_db(get_db, project, hypotheses, "session-prov-1")
+
+        db = get_db()
+        try:
+            persisted = db.query(Hypothesis).all()
+            assert len(persisted) == 1
+            row = persisted[0]
+            assert row.junior_model == "deepseek:deepseek-chat"
+            assert row.senior_model == "anthropic:claude-sonnet-4-6"
+            assert row.reported_by_model == "anthropic:claude-sonnet-4-6"
+        finally:
+            db.close()
+
+    def test_reported_by_model_falls_back_to_senior_then_junior(
+        self, in_memory_db, project
+    ):
+        """When reported_by_model is missing, senior wins; if no senior, junior."""
+        get_db, _engine, _ = in_memory_db
+        hypotheses = [
+            {
+                "id": "senior_only",
+                "description": "Has senior, no explicit reported_by",
+                "vulnerability_type": "x",
+                "status": "confirmed",
+                "confidence": 0.9,
+                "junior_model": "deepseek:deepseek-chat",
+                "senior_model": "anthropic:claude-sonnet-4-6",
+            },
+            {
+                "id": "junior_only",
+                "description": "Junior only — never promoted",
+                "vulnerability_type": "x",
+                "status": "proposed",
+                "confidence": 0.6,
+                "junior_model": "deepseek:deepseek-chat",
+            },
+            {
+                "id": "no_models",
+                "description": "Legacy hypothesis with no model attribution",
+                "vulnerability_type": "x",
+                "status": "proposed",
+                "confidence": 0.5,
+            },
+        ]
+        _store_hypotheses_in_db(get_db, project, hypotheses, "session-prov-2")
+
+        db = get_db()
+        try:
+            rows = {h.hypothesis_id: h for h in db.query(Hypothesis).all()}
+            assert (
+                rows["senior_only"].reported_by_model
+                == "anthropic:claude-sonnet-4-6"
+            )
+            assert rows["junior_only"].reported_by_model == "deepseek:deepseek-chat"
+            assert rows["no_models"].reported_by_model is None
+        finally:
+            db.close()

@@ -328,10 +328,74 @@ class TestHypothesisStore(unittest.TestCase):
         # Test auto-rejection at low confidence
         success = self.store.adjust_confidence(hyp_id, 0.05, "Evidence refuted")
         self.assertTrue(success)
-        
+
         data = self.store._load_data()
         self.assertEqual(data["hypotheses"][hyp_id]["status"], "rejected")
-    
+
+    def test_adjust_confidence_stamps_senior_model_first_writer_wins(self):
+        """firepan-281: adjust_confidence(senior_model=...) records the verifier
+        on the row, and the FIRST senior to verify owns provenance.
+        """
+        from analysis.concurrent_knowledge import Hypothesis
+
+        hyp = Hypothesis(
+            title="Provenance Test",
+            description="Senior verifier attribution",
+            vulnerability_type="reentrancy",
+            severity="high",
+            confidence=0.5,
+            node_refs=["node1"],
+            junior_model="deepseek:deepseek-chat",
+        )
+        success, hyp_id = self.store.propose(hyp)
+        self.assertTrue(success)
+
+        # First verifier promotes to confirmed-tier confidence
+        self.store.adjust_confidence(
+            hyp_id, 0.9, "Strong evidence",
+            senior_model="anthropic:claude-sonnet-4-6",
+        )
+        data = self.store._load_data()
+        self.assertEqual(
+            data["hypotheses"][hyp_id]["senior_model"],
+            "anthropic:claude-sonnet-4-6",
+        )
+
+        # Second verifier (different model, e.g. re-promotion path) MUST NOT
+        # overwrite — first-writer-wins so we can answer "who first promoted
+        # this finding?" without losing the original attribution.
+        self.store.adjust_confidence(
+            hyp_id, 0.95, "Re-confirmation",
+            senior_model="anthropic:claude-opus-4-7",
+        )
+        data = self.store._load_data()
+        self.assertEqual(
+            data["hypotheses"][hyp_id]["senior_model"],
+            "anthropic:claude-sonnet-4-6",
+        )
+        self.assertEqual(data["hypotheses"][hyp_id]["confidence"], 0.95)
+
+    def test_adjust_confidence_without_senior_model_is_legacy_compatible(self):
+        """firepan-281: existing callers that don't pass senior_model still work."""
+        from analysis.concurrent_knowledge import Hypothesis
+
+        hyp = Hypothesis(
+            title="Legacy Compatibility",
+            description="No senior provided",
+            vulnerability_type="overflow",
+            severity="medium",
+            confidence=0.5,
+            node_refs=["node1"],
+        )
+        success, hyp_id = self.store.propose(hyp)
+        self.assertTrue(success)
+
+        # No senior_model kwarg — should work and leave the field None.
+        success = self.store.adjust_confidence(hyp_id, 0.7, "Evidence found")
+        self.assertTrue(success)
+        data = self.store._load_data()
+        self.assertIsNone(data["hypotheses"][hyp_id].get("senior_model"))
+
     def test_get_by_node(self):
         """Test retrieving hypotheses by node ID."""
         from analysis.concurrent_knowledge import Hypothesis

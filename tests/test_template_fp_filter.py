@@ -392,6 +392,193 @@ contract FeeHooks {
 
 
 # ---------------------------------------------------------------------------
+# firepan-7nu: extra template shapes (view/pure, constructor, rounding)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def repo_with_extra_shapes(tmp_path):
+    """Repo containing view, pure, constructor, and a Vyper @view function."""
+    sol = tmp_path / "contracts" / "Shapes.sol"
+    sol.parent.mkdir(parents=True)
+    sol.write_text("""\
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract Shapes {
+    address public owner;
+
+    constructor(address _owner) {
+        owner = _owner;
+    }
+
+    function getRate() external view returns (uint256) {
+        return rate;
+    }
+
+    function quote(uint256 x) external pure returns (uint256) {
+        return x * 2;
+    }
+
+    function setFee(uint256 fee) external {
+        // unmodified — keep as a control case
+        _fee = fee;
+    }
+}
+""")
+    vy = tmp_path / "contracts" / "Math.vy"
+    vy.write_text("""\
+@external
+@view
+def get_price() -> uint256:
+    return self.price
+
+@external
+@pure
+def round_down(x: uint256) -> uint256:
+    return x / 100
+""")
+    return tmp_path
+
+
+class TestViewPureTemplate:
+    def test_solidity_view_function_rejected_lexical(self, repo_with_extra_shapes):
+        """`view` on the signature line → reject without LLM call."""
+        hypotheses = [{
+            "id": "v1",
+            "title": "Missing access control on Shapes.getRate",
+            "description": "",
+            "node_ids": ["Shapes.getRate"],
+        }]
+        cfg = _base_config()
+        called = {"raw": 0}
+        class _NoCall:
+            provider_name = "anthropic"
+            model = "claude-sonnet-4-6"
+            def raw(self, **_):
+                called["raw"] += 1
+                return '{"has_access_control": false, "reason": ""}'
+        with patch("llm.unified_client.UnifiedLLMClient", return_value=_NoCall()):
+            kept, stats = _filter_template_fps(hypotheses, repo_with_extra_shapes, cfg)
+        assert kept == []
+        assert len(stats["rejected"]) == 1
+        assert stats["rejected"][0]["verifier_reason"] == "view_or_pure_function"
+        assert stats["rejected"][0]["verifier_model"] == "lexical"
+        assert called["raw"] == 0  # never hit the LLM
+
+    def test_solidity_pure_function_rejected_lexical(self, repo_with_extra_shapes):
+        hypotheses = [{
+            "id": "p1",
+            "title": "Missing access control on Shapes.quote",
+            "description": "",
+            "node_ids": ["Shapes.quote"],
+        }]
+        cfg = _base_config()
+        with patch("llm.unified_client.UnifiedLLMClient",
+                   return_value=_MockVerifier({})):
+            kept, stats = _filter_template_fps(hypotheses, repo_with_extra_shapes, cfg)
+        assert kept == []
+        assert stats["rejected"][0]["verifier_reason"] == "view_or_pure_function"
+
+    def test_vyper_view_decorator_rejected_lexical(self, repo_with_extra_shapes):
+        """Vyper `@view` decorator above the def line should be detected."""
+        hypotheses = [{
+            "id": "vv1",
+            "title": "Missing access control on get_price()",
+            "description": "",
+            "node_ids": ["Math.get_price"],
+        }]
+        cfg = _base_config()
+        with patch("llm.unified_client.UnifiedLLMClient",
+                   return_value=_MockVerifier({})):
+            kept, stats = _filter_template_fps(hypotheses, repo_with_extra_shapes, cfg)
+        assert kept == []
+        assert stats["rejected"][0]["verifier_reason"] == "view_or_pure_function"
+
+
+class TestConstructorTemplate:
+    def test_constructor_rejected_lexical(self, repo_with_extra_shapes):
+        """Bare 'constructor' keyword in title → reject; never fetch source."""
+        hypotheses = [{
+            "id": "c1",
+            "title": "Missing access control on Shapes.constructor",
+            "description": "Anyone can call the constructor",
+            "node_ids": ["Shapes.constructor"],
+        }]
+        cfg = _base_config()
+        with patch("llm.unified_client.UnifiedLLMClient",
+                   return_value=_MockVerifier({})):
+            kept, stats = _filter_template_fps(hypotheses, repo_with_extra_shapes, cfg)
+        assert kept == []
+        assert stats["rejected"][0]["verifier_reason"] == "constructor_function"
+        assert stats["rejected"][0]["function"] == "constructor"
+
+    def test_vyper_init_rejected_lexical(self, repo_with_extra_shapes):
+        hypotheses = [{
+            "id": "c2",
+            "title": "Missing access control on __init__",
+            "description": "",
+        }]
+        cfg = _base_config()
+        with patch("llm.unified_client.UnifiedLLMClient",
+                   return_value=_MockVerifier({})):
+            kept, stats = _filter_template_fps(hypotheses, repo_with_extra_shapes, cfg)
+        assert kept == []
+        assert stats["rejected"][0]["verifier_reason"] == "constructor_function"
+
+
+class TestRoundingTemplate:
+    def test_rounding_pure_helper_no_numeric_gap_rejected(self, repo_with_extra_shapes):
+        """Rounding claim on a pure helper without numeric markers → reject."""
+        hypotheses = [{
+            "id": "r1",
+            "title": "Rounding error in Shapes.quote",
+            "description": "Truncation in the multiplication may cause precision loss.",
+            "node_ids": ["Shapes.quote"],
+        }]
+        cfg = _base_config()
+        with patch("llm.unified_client.UnifiedLLMClient",
+                   return_value=_MockVerifier({})):
+            kept, stats = _filter_template_fps(hypotheses, repo_with_extra_shapes, cfg)
+        assert kept == []
+        assert stats["rejected"][0]["verifier_reason"] == "rounding_no_numeric_gap"
+
+    def test_rounding_pure_helper_with_numeric_gap_kept(self, repo_with_extra_shapes):
+        """Real rounding finding cites a wei-level gap — never drop it."""
+        hypotheses = [{
+            "id": "r2",
+            "title": "Rounding error in Shapes.quote",
+            "description": "Expected 100 wei but received 99 wei due to truncation.",
+            "node_ids": ["Shapes.quote"],
+        }]
+        cfg = _base_config()
+        with patch("llm.unified_client.UnifiedLLMClient",
+                   return_value=_MockVerifier({})):
+            kept, stats = _filter_template_fps(hypotheses, repo_with_extra_shapes, cfg)
+        assert len(kept) == 1
+        assert kept[0]["id"] == "r2"
+        assert len(stats["rejected"]) == 0
+
+    def test_rounding_on_state_mutating_function_kept(self, repo_with_extra_shapes):
+        """Rounding claim on a non-pure function — outside the template; keep."""
+        hypotheses = [{
+            "id": "r3",
+            "title": "Rounding error in Shapes.setFee",
+            "description": "Truncation when computing the fee.",
+            "node_ids": ["Shapes.setFee"],
+        }]
+        cfg = _base_config()
+        with patch("llm.unified_client.UnifiedLLMClient",
+                   return_value=_MockVerifier({})):
+            kept, stats = _filter_template_fps(hypotheses, repo_with_extra_shapes, cfg)
+        # setFee is not view/pure → rounding template doesn't fire → kept.
+        # (Access-control regex doesn't match either, so we shouldn't even
+        # mark it as a candidate.)
+        assert len(kept) == 1
+        assert kept[0]["id"] == "r3"
+
+
+# ---------------------------------------------------------------------------
 # Full-pipeline: no unknown status values leak to DB
 # ---------------------------------------------------------------------------
 

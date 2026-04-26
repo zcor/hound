@@ -1782,6 +1782,32 @@ _MODIFIER_HINTS = (
     "auth ", "auth\n", "restricted", "requiresAuth",
 )
 
+# firepan-7nu: view/pure functions can't mutate state, so "missing access control"
+# on them is a category error. Lexical match on the declaration line.
+_VIEW_PURE_HINTS = (
+    " view ", " view\n", " view{", " view returns",
+    " pure ", " pure\n", " pure{", " pure returns",
+    " constant ", " constant\n",
+    "@view", "@pure",
+)
+
+# firepan-7nu: constructors/__init__ run once at deploy by msg.sender=deployer —
+# AC modifiers on them are nonsense.
+_CONSTRUCTOR_NAMES = ("constructor", "__init__")
+
+# firepan-7nu: rounding/overcharge/precision-loss claims on pure helpers are
+# only meaningful with a numeric gap (per firepan-vff "no finding without a
+# numeric gap in its PoC"). When a hypothesis fits this template AND lacks
+# numeric-gap markers, drop it.
+_ROUNDING_TEMPLATE_RE = re.compile(
+    r"(rounding|truncation|precision\s+loss|overcharge|undercharge|off-by-one)",
+    re.IGNORECASE,
+)
+_NUMERIC_GAP_RE = re.compile(
+    r"\d+\s*wei|\d+e\d+|expected\s+\d+|actual\s+\d+|\d+\s+vs\s+\d+|gap\s+of\s+\d+",
+    re.IGNORECASE,
+)
+
 
 def _parse_contract_fn_from_hypothesis(h: dict) -> tuple[str | None, str | None]:
     """Extract (contract_name, function_name) from a hypothesis.
@@ -1799,6 +1825,11 @@ def _parse_contract_fn_from_hypothesis(h: dict) -> tuple[str | None, str | None]
     m2 = _FUNCTION_NAME_RE.search(text)
     if m2:
         return None, m2.group(1)
+    # firepan-7nu: bare keyword forms — "constructor" / "__init__" rarely appear
+    # with a paren in hypothesis prose ("Missing access control on constructor").
+    for kw in _CONSTRUCTOR_NAMES:
+        if re.search(rf"\b{kw}\b", text):
+            return None, kw
     return None, None
 
 
@@ -1845,8 +1876,19 @@ def _fetch_function_declaration(
             continue
         for i, line in enumerate(lines):
             if sig_re.search(line):
+                # firepan-7nu: include up to 3 preceding decorator lines so Vyper
+                # `@view` / `@pure` modifiers are visible to template checks.
+                start = i
+                for j in range(1, 4):
+                    if i - j < 0:
+                        break
+                    prev = lines[i - j].lstrip()
+                    if prev.startswith("@"):
+                        start = i - j
+                    else:
+                        break
                 slice_end = min(len(lines), i + 1 + max_lines_after)
-                return "\n".join(lines[i:slice_end])
+                return "\n".join(lines[start:slice_end])
     return None
 
 
@@ -1928,10 +1970,24 @@ def _filter_template_fps(
         print(f"[template_fp_filter] Verifier init failed: {e}")
         return list(hypotheses), stats
 
+    def _record_reject(h: dict, reason: str, function_name: str | None,
+                       contract_name: str | None, model: str = "lexical") -> None:
+        stats["rejected"].append({
+            "title": h.get("title") or h.get("description", "")[:80],
+            "verifier_reason": reason,
+            "verifier_model": model,
+            "node_refs": h.get("node_ids") or h.get("node_refs") or [],
+            "function": function_name,
+            "contract": contract_name,
+        })
+
     kept: list = []
     for h in hypotheses:
         text = (h.get("title") or "") + " " + (h.get("description") or "")
-        if not _ACCESS_CONTROL_TEMPLATE_RE.search(text):
+        is_access_control = bool(_ACCESS_CONTROL_TEMPLATE_RE.search(text))
+        is_rounding = bool(_ROUNDING_TEMPLATE_RE.search(text))
+
+        if not (is_access_control or is_rounding):
             kept.append(h)
             continue
 
@@ -1942,22 +1998,53 @@ def _filter_template_fps(
             kept.append(h)
             continue
 
+        # firepan-7nu: constructor/__init__ AC claims are category errors, drop
+        # without even fetching the declaration.
+        if is_access_control and function_name in _CONSTRUCTOR_NAMES:
+            _record_reject(h, "constructor_function", function_name, contract_name)
+            continue
+
         decl = _fetch_function_declaration(Path(repo_path), contract_name, function_name)
         if not decl:
             kept.append(h)
             continue
 
-        # Cheap lexical shortcut: if the declaration obviously has a modifier,
-        # we can reject without the LLM call.
-        if any(hint in decl for hint in _MODIFIER_HINTS):
-            stats["rejected"].append({
-                "title": h.get("title") or h.get("description", "")[:80],
-                "verifier_reason": "lexical_modifier_match",
-                "verifier_model": "lexical",
-                "node_refs": h.get("node_ids") or h.get("node_refs") or [],
-                "function": function_name,
-                "contract": contract_name,
-            })
+        # firepan-7nu: view/pure helpers don't mutate state — "missing access
+        # control" doesn't apply. Scan only the signature + any preceding
+        # decorator lines; the trailing body slice may bleed into the next
+        # function (e.g. ` view ` from getBalance() right below setFee()).
+        decl_lines = decl.split("\n")
+        sig_idx = next(
+            (idx for idx, ln in enumerate(decl_lines)
+             if re.search(r"\b(?:function|def)\b", ln)),
+            0,
+        )
+        header_slice = "\n".join(decl_lines[: sig_idx + 1])
+        is_view_or_pure = any(hint in header_slice for hint in _VIEW_PURE_HINTS)
+        if is_access_control and is_view_or_pure:
+            _record_reject(h, "view_or_pure_function", function_name, contract_name)
+            continue
+
+        # firepan-7nu: rounding/overcharge claims on pure helpers without a
+        # concrete numeric gap are template noise. Real findings cite expected
+        # vs actual wei. Conservative: only fire when the function is pure/view
+        # AND the hypothesis text shows no numeric markers.
+        if is_rounding and is_view_or_pure and not _NUMERIC_GAP_RE.search(text):
+            _record_reject(h, "rounding_no_numeric_gap", function_name, contract_name)
+            continue
+
+        # If the hypothesis matched _only_ the rounding regex (not access-control)
+        # and we got past the pure/view + numeric-gap gate, no further checks apply.
+        if not is_access_control:
+            kept.append(h)
+            continue
+
+        # Cheap lexical shortcut: if the signature obviously has a modifier,
+        # we can reject without the LLM call. Use the header slice — checking
+        # the full body slice can spill into the next function and falsely
+        # reject (firepan-7nu fix).
+        if any(hint in header_slice for hint in _MODIFIER_HINTS):
+            _record_reject(h, "lexical_modifier_match", function_name, contract_name)
             continue
 
         system = (
@@ -1995,14 +2082,13 @@ def _filter_template_fps(
             continue
 
         if bool(parsed.get("has_access_control")):
-            stats["rejected"].append({
-                "title": h.get("title") or h.get("description", "")[:80],
-                "verifier_reason": str(parsed.get("reason", ""))[:500],
-                "verifier_model": stats["verifier_model"],
-                "node_refs": h.get("node_ids") or h.get("node_refs") or [],
-                "function": function_name,
-                "contract": contract_name,
-            })
+            _record_reject(
+                h,
+                str(parsed.get("reason", ""))[:500],
+                function_name,
+                contract_name,
+                model=stats["verifier_model"] or "unknown",
+            )
         else:
             kept.append(h)
 

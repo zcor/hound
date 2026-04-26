@@ -112,11 +112,25 @@ def require_plan_allowance(operation: str):
     return _check_with_di
 
 
-def _check_sync(tenant_id: int, operation: str, db: Session) -> dict:
-    """Synchronous plan check with atomic credit reservation."""
+def _check_sync(
+    tenant_id: int,
+    operation: str,
+    db: Session,
+    *,
+    bypass_quota: bool = False,
+) -> dict:
+    """Synchronous plan check with atomic credit reservation.
+
+    bypass_quota=True skips both monthly-limit and scan-credit enforcement.
+    Reserved for admin-authenticated callers (firepan-1bg) — never reachable
+    from tenant-facing paths.
+    """
     tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
     if not tenant:
         raise HTTPException(404, "Tenant not found")
+
+    if bypass_quota:
+        return {"uses_credit": False, "admin_bypass": True}
 
     plans = _load_plans()
     effective_plan = get_effective_plan(tenant)

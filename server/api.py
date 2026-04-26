@@ -8724,6 +8724,203 @@ async def unverify_deep_audit_overview(
     return {"execution_id": execution_id, "admin_verified": False}
 
 
+# firepan-1bg: admin-only deep-audit force-run + refund helpers.
+# Mirrors the verify-overview pattern above: X-Admin-Key header ONLY, no JWT,
+# no session cookies, no query-param auth. Bypasses tenant quota
+# (tier_enforcement._check_sync bypass_quota=True) and x402 gates entirely —
+# admin is authoritative. Motivated by Egorov 2026-04-23 FeeDistributor thread:
+# running repeat deep audits on behalf of paying-but-curious customers should
+# not burn the admin's own monthly quota, and the manual-refund workflow for
+# failed audits (CLAUDE.md #46) should be a single call, not SQLAdmin clicks.
+
+
+class AdminAuditForceRunRequest(BaseModel):
+    """Request body for POST /admin/audits/force-run.
+
+    Admin callers specify tenant_id explicitly because there's no JWT.
+    project_id is required — whole-tenant sweeps are not this endpoint's job.
+    """
+
+    project_id: int = Field(..., description="Project to audit (admin confirms ownership)")
+    tenant_id: int | None = Field(
+        None,
+        description="Tenant to attribute the audit to. If omitted, derives from project.",
+    )
+    repo_url: str | None = Field(
+        None,
+        description="Override repo URL. If omitted, uses project.git_url or project.source_path.",
+    )
+    max_iterations: int = Field(default=30, ge=1, le=200)
+    investigation_prompt: str | None = None
+    time_limit_minutes: int = Field(default=120, ge=1, le=600)
+    mode: str = Field(default="sweep", description="'sweep' or 'intuition'")
+    plan_n: int = Field(default=5, ge=1, le=20)
+    audit_branch: str | None = Field(default=None, max_length=255)
+
+
+@app.post("/admin/audits/force-run", response_model=AuditStartResponse)
+async def admin_force_run_audit(
+    payload: AdminAuditForceRunRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Dispatch a deep audit as admin, bypassing tenant quota and x402 gates.
+
+    Admin only. Creates the same AuditSession + ScanExecution rows as
+    /audits/start so the dashboard/websocket progress path is unchanged;
+    the only difference is the quota/payment check is skipped.
+    """
+    if not _verify_explicit_admin_header(request):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    project = db.query(Project).filter(Project.id == payload.project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    tenant_id = payload.tenant_id or project.tenant_id
+    if not tenant_id:
+        raise HTTPException(
+            status_code=400,
+            detail="tenant_id required (project has no tenant_id set)",
+        )
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # Explicit bypass marker — call _check_sync with bypass_quota=True so the
+    # side-effects (tenant lookup) still run but no limit is enforced. This
+    # lets us keep the single code path for tenant resolution.
+    from server.tier_enforcement import _check_sync as _tier_check
+    _tier_check(tenant_id, "audit", db, bypass_quota=True)
+
+    try:
+        from worker.tasks import execute_audit_task
+    except ImportError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Worker module not available: {e}. Is Celery configured?",
+        )
+
+    requested_audit_branch = _validate_ref(payload.audit_branch)
+    resolved_audit_branch = (
+        requested_audit_branch
+        or (project.default_branch if project else None)
+        or "main"
+    )
+    resolved_repo_url = (
+        payload.repo_url
+        or getattr(project, "git_url", None)
+        or getattr(project, "source_path", None)
+        or ""
+    )
+    if not resolved_repo_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot resolve repo_url (pass explicitly or set project.git_url)",
+        )
+
+    session_id = f"audit_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
+
+    audit_session = AuditSession(
+        session_id=session_id,
+        project_id=project.id,
+        status="queued",
+        start_time=datetime.now(timezone.utc),
+        models={"max_iterations": payload.max_iterations, "admin_forced": True},
+    )
+    db.add(audit_session)
+    db.commit()
+
+    from database.models import ScanExecution as ScanExecutionModel
+    deep_scan = ScanExecutionModel(
+        execution_id=session_id,
+        project_id=project.id,
+        tenant_id=tenant_id,
+        repo_url=resolved_repo_url,
+        repo_name=project.name,
+        status="queued",
+        started_at=datetime.now(timezone.utc),
+        scan_config={
+            "scan_type": "deep",
+            "mode": payload.mode,
+            "branch": resolved_audit_branch,
+            "admin_forced": True,
+        },
+    )
+    db.add(deep_scan)
+    db.commit()
+
+    resolved_installation_id = getattr(project, "installation_id", None)
+
+    task = execute_audit_task.delay(
+        repo_url=resolved_repo_url,
+        scan_id=session_id,
+        tenant_id=tenant_id,
+        project_id=project.id,
+        max_iterations=payload.max_iterations,
+        investigation_prompt=payload.investigation_prompt,
+        installation_id=resolved_installation_id,
+        pr_number=None,
+        repo_full_name=None,
+        time_limit_minutes=payload.time_limit_minutes,
+        mode=payload.mode,
+        plan_n=payload.plan_n,
+        branch=resolved_audit_branch,
+    )
+
+    logger.info(
+        "Admin force-run deep audit session=%s project=%s tenant=%s task=%s",
+        session_id, project.id, tenant_id, task.id,
+    )
+
+    return AuditStartResponse(
+        session_id=session_id,
+        status="queued",
+        message=f"Admin-forced deep audit queued. Task ID: {task.id}",
+        websocket_url=f"/ws/sessions/{session_id}",
+    )
+
+
+@app.post("/admin/audits/{session_id}/refund")
+async def admin_refund_audit(
+    session_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Delete AuditSession + matching ScanExecution so the tenant's monthly
+    quota releases the slot. Admin only.
+
+    Replaces the manual SQLAdmin workflow called out in CLAUDE.md #46: failed
+    or stalled deep audits still count against quota until the row is gone,
+    and there was no helper endpoint. Idempotent — returns 404 only if neither
+    row exists; if just one exists the other is a no-op.
+    """
+    if not _verify_explicit_admin_header(request):
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    audit_session = db.query(AuditSession).filter(
+        AuditSession.session_id == session_id,
+    ).first()
+    scan = db.query(ScanExecution).filter(
+        ScanExecution.execution_id == session_id,
+    ).first()
+
+    if not audit_session and not scan:
+        raise HTTPException(status_code=404, detail="No audit session or scan with that id")
+
+    deleted = {"audit_session": False, "scan_execution": False}
+    if audit_session:
+        db.delete(audit_session)
+        deleted["audit_session"] = True
+    if scan:
+        db.delete(scan)
+        deleted["scan_execution"] = True
+    db.commit()
+
+    logger.info("Admin refunded audit session=%s deleted=%s", session_id, deleted)
+    return {"session_id": session_id, "deleted": deleted}
+
+
 @app.get("/surface/stats")
 async def get_surface_scan_stats(
     db: Session = Depends(get_db),

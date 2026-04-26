@@ -830,6 +830,24 @@ def execute_audit_task(
                     if h.get("confidence", 0.5) < 0.5:
                         h["severity"] = "low"
 
+        # Step E2 (firepan-e5x): quality-aware dedup. If >30% of survivors
+        # match a known-noisy template (today: access-control), the meta-
+        # pattern itself is negative evidence that the model is fixated. Cap
+        # confidence on the matching rows so they can't reach "confirmed"
+        # status without per-row 8kv vouching them through.
+        template_demote_stats = {"checked": 0, "demoted": [], "skipped_reason": None}
+        try:
+            hypotheses, template_demote_stats = _quality_aware_demote(hypotheses)
+            if template_demote_stats.get("demoted"):
+                publisher.publish_thought(
+                    f"Demoted {len(template_demote_stats['demoted'])} hypotheses "
+                    f"as noisy-template spam (firepan-e5x)",
+                    iteration=total_iterations,
+                )
+        except Exception as e:
+            print(f"[DEBUG] Quality-aware demote failed (non-fatal): {e}")
+            traceback.print_exc()
+
         print(f"[DEBUG] Final curated: {len(hypotheses)} findings (from {raw_count} raw)")
 
         # Step F (firepan-8kv): per-pattern template FP filter. Drops
@@ -939,6 +957,13 @@ def execute_audit_task(
                 overview["template_fp_filter"] = template_filter_stats
             except Exception as e:
                 print(f"[DEBUG] Failed to stamp template_filter_stats on overview: {e}")
+
+        # firepan-e5x: stamp quality-aware demote stats on the overview.
+        if overview is not None:
+            try:
+                overview["template_demote"] = template_demote_stats
+            except Exception as e:
+                print(f"[DEBUG] Failed to stamp template_demote_stats on overview: {e}")
 
         # firepan-apn: stamp symbol-exists gate stats on the overview. The
         # agent records rejections as it forms hypotheses; we pull the
@@ -1913,6 +1938,86 @@ def _verifier_same_as_generator(config: dict | None) -> bool:
         if (other.get("provider"), other.get("model")) == tv_key:
             return True
     return False
+
+
+# firepan-e5x: quality-aware dedup. The semantic-dedup step (Step C) keeps
+# one representative per cluster but doesn't punish the meta-pattern of "this
+# model produced 14 'missing access control' findings." When >30% of survivors
+# match a known-noisy template, that's negative evidence the model is fixated
+# on one pattern — cap their confidence so they can't reach 'confirmed' status
+# without per-row 8kv vouching.
+_E5X_TEMPLATE_SHARE_THRESHOLD = 0.30
+_E5X_DEMOTED_CONFIDENCE_CEILING = 0.4  # below the 0.8 confirmed threshold
+_E5X_MIN_SAMPLE = 5  # noise floor: don't demote on tiny audits
+_E5X_TEMPLATES = {
+    # name -> compiled regex applied to title + description
+    "access_control": _ACCESS_CONTROL_TEMPLATE_RE,
+}
+
+
+def _quality_aware_demote(hypotheses: list) -> tuple[list, dict]:
+    """Demote noisy-template-spam hypotheses before promotion.
+
+    Computes the share of survivors matching each known-noisy template. For
+    any template above _E5X_TEMPLATE_SHARE_THRESHOLD on a sample of at least
+    _E5X_MIN_SAMPLE survivors, caps the confidence of the matching rows at
+    _E5X_DEMOTED_CONFIDENCE_CEILING. Returns the (possibly mutated) list and
+    a stats dict shaped for stamping onto deep_audit_overview.
+
+    Operates in-place on the hypothesis dicts (matches the upstream pipeline's
+    convention; see Step E severity fallback). Original confidence values are
+    captured in the stats dict for postmortem analysis.
+    """
+    stats: dict = {
+        "checked": len(hypotheses),
+        "demoted": [],
+        "skipped_reason": None,
+        "templates_triggered": [],
+    }
+
+    if not hypotheses or len(hypotheses) < _E5X_MIN_SAMPLE:
+        stats["skipped_reason"] = "below_min_sample"
+        return list(hypotheses), stats
+
+    total = len(hypotheses)
+    for template_name, regex in _E5X_TEMPLATES.items():
+        matching_idx = [
+            i for i, h in enumerate(hypotheses)
+            if regex.search(
+                (h.get("title") or "") + " " + (h.get("description") or "")
+            )
+        ]
+        share = len(matching_idx) / total
+        if share <= _E5X_TEMPLATE_SHARE_THRESHOLD:
+            continue
+
+        stats["templates_triggered"].append({
+            "template": template_name,
+            "matching": len(matching_idx),
+            "total": total,
+            "share": round(share, 3),
+        })
+
+        for i in matching_idx:
+            h = hypotheses[i]
+            original = h.get("confidence", 0.5)
+            if original <= _E5X_DEMOTED_CONFIDENCE_CEILING:
+                continue  # already at or below the cap; nothing to do
+            h["confidence"] = _E5X_DEMOTED_CONFIDENCE_CEILING
+            stats["demoted"].append({
+                "hypothesis_id": h.get("id"),
+                "title": (h.get("title") or h.get("description", ""))[:120],
+                "template": template_name,
+                "original_confidence": original,
+                "new_confidence": _E5X_DEMOTED_CONFIDENCE_CEILING,
+            })
+
+    print(
+        f"[quality_aware_demote] checked={stats['checked']} "
+        f"templates_triggered={len(stats['templates_triggered'])} "
+        f"demoted={len(stats['demoted'])}"
+    )
+    return list(hypotheses), stats
 
 
 def _filter_template_fps(

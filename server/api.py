@@ -3077,6 +3077,15 @@ class AuditStartRequest(BaseModel):
     auto_create_fix_pr: bool = Field(default=False, description="Automatically create a PR with fixes for detected issues")
     base_branch: str = Field(default="main", description="Base branch for fix PR (default: main)")
     audit_branch: str | None = Field(default=None, description="Git ref (branch/tag/SHA) to audit; defaults to project default_branch", max_length=255)
+    target_files: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional list of repo-relative file paths to scope the deep audit to. "
+            "Max 50 entries. Paid plans only — silently ignored for free-tier tenants. "
+            "Leave unset to audit the whole repo."
+        ),
+        max_length=50,
+    )
 
 
 class AuditStartResponse(BaseModel):
@@ -3178,6 +3187,39 @@ async def start_audit(
                 websocket_url=f"/ws/sessions/{gate.job_id}",
             )
 
+    # firepan-nxf: scope handling. Paid plans (SaaS + active trial) honor
+    # target_files; free-tier tenants silently drop it so the UX doesn't 403
+    # unexpectedly from a form that may render the field for all users.
+    scoped_target_files = None
+    if request_body.target_files is not None:
+        validated = _validate_target_files(request_body.target_files)
+        if not has_saas_sub:
+            if validated:
+                logger.info(
+                    "target_files ignored: tier=free tenant=%s count=%d",
+                    tenant_id, len(validated),
+                )
+        else:
+            scoped_target_files = validated
+            if scoped_target_files and project is not None:
+                resolved, missing = _check_target_files_exist_on_disk(
+                    getattr(project, "source_path", None),
+                    scoped_target_files,
+                )
+                if resolved or missing:  # check actually ran
+                    if not resolved:
+                        raise HTTPException(
+                            status_code=422,
+                            detail={
+                                "error": "scoped_audit_no_files_match",
+                                "missing": missing,
+                                "message": (
+                                    "None of the requested target_files exist in "
+                                    "the cached clone. Check paths and branch."
+                                ),
+                            },
+                        )
+
     # Import worker tasks (done here to avoid circular imports)
     try:
         from worker.tasks import execute_audit_task
@@ -3199,6 +3241,11 @@ async def start_audit(
     # Generate unique session ID
     session_id = f"audit_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
 
+    # Build session_metadata for scoped audits (firepan-nxf).
+    session_metadata_dict: dict = {}
+    if scoped_target_files:
+        session_metadata_dict["target_files"] = scoped_target_files
+
     # Create AuditSession record with status "queued"
     audit_session = AuditSession(
         session_id=session_id,
@@ -3206,6 +3253,7 @@ async def start_audit(
         status="queued",
         start_time=datetime.now(timezone.utc),
         models={"max_iterations": request_body.max_iterations},
+        session_metadata=session_metadata_dict or None,
     )
     db.add(audit_session)
     db.commit()
@@ -3213,6 +3261,14 @@ async def start_audit(
     # Create ScanExecution so deep audit appears in scan history (dashboard path only)
     if project:
         from database.models import ScanExecution as ScanExecutionModel
+
+        scan_config_dict: dict = {
+            "scan_type": "deep",
+            "mode": request_body.mode,
+            "branch": resolved_audit_branch,
+        }
+        if scoped_target_files:
+            scan_config_dict["target_files"] = scoped_target_files
 
         deep_scan = ScanExecutionModel(
             execution_id=session_id,
@@ -3222,11 +3278,7 @@ async def start_audit(
             repo_name=project.name,
             status="queued",
             started_at=datetime.now(timezone.utc),
-            scan_config={
-                "scan_type": "deep",
-                "mode": request_body.mode,
-                "branch": resolved_audit_branch,
-            },
+            scan_config=scan_config_dict,
         )
         db.add(deep_scan)
         db.commit()
@@ -3261,6 +3313,7 @@ async def start_audit(
         mode=request_body.mode,
         plan_n=request_body.plan_n,
         branch=resolved_audit_branch,
+        target_files=scoped_target_files,
     )
 
     logger.info(f"Dispatched audit task {task.id} for session {session_id}")
@@ -5305,6 +5358,10 @@ class ScanHistoryItem(BaseModel):
     # the dashboard/admin UI can render a louder "don't just verify this" banner.
     needs_manual_review: bool = False
     review_reason: str | None = None
+    # firepan-nxf: repo-relative paths the deep audit was scoped to, if any.
+    # None = whole-repo run. Legacy rows without the key also surface as None.
+    # Sourced from scan_config["target_files"].
+    target_files: list[str] | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -6637,6 +6694,106 @@ def _validate_ref(value: str | None) -> str | None:
     return cleaned
 
 
+# firepan-nxf: syntactic + on-disk validation for file-scoped deep audits.
+# Two helpers because the checks have different failure modes: bad syntax is
+# always rejected at the API boundary; on-disk existence is best-effort at
+# the API (clone may not be present on the API host) and authoritative at
+# the worker (where the clone definitely exists).
+
+_TARGET_FILES_MAX = 50
+# Shell/control chars that must never reach RepositoryManifest / git invocations.
+# Intentionally stricter than _validate_ref — these are file paths, not refs,
+# so glob characters also get rejected to keep the whitelist unambiguous.
+_TARGET_FILE_FORBIDDEN = set("\x00\n\r\t;|&`$<>\"'\\*?[]")
+
+
+def _validate_target_files(value: list[str] | None) -> list[str] | None:
+    """Sanitize a user-supplied file whitelist for a scoped deep audit.
+
+    Returns a cleaned list of repo-relative paths, or None when the input is
+    effectively empty (None, [], or all-blank). Pure syntactic check — does
+    NOT touch the filesystem. Callers may additionally run
+    _check_target_files_exist_on_disk() when a clone is available.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise HTTPException(status_code=422, detail="target_files must be a list of strings")
+    if len(value) > _TARGET_FILES_MAX:
+        raise HTTPException(
+            status_code=422,
+            detail=f"target_files exceeds max of {_TARGET_FILES_MAX} entries",
+        )
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, str):
+            raise HTTPException(status_code=422, detail="target_files entries must be strings")
+        trimmed = entry.strip()
+        if not trimmed:
+            continue
+        if trimmed.startswith("/"):
+            raise HTTPException(
+                status_code=422,
+                detail=f"target_files entry must be repo-relative (no leading slash): {entry!r}",
+            )
+        # Reject traversal anywhere in the path — leading, middle, or bare ".."
+        parts = trimmed.replace("\\", "/").split("/")
+        if any(p == ".." for p in parts):
+            raise HTTPException(
+                status_code=422,
+                detail=f"target_files entry contains path traversal: {entry!r}",
+            )
+        if any(ch in _TARGET_FILE_FORBIDDEN for ch in trimmed):
+            raise HTTPException(
+                status_code=422,
+                detail=f"target_files entry contains forbidden character: {entry!r}",
+            )
+        if trimmed in seen:
+            continue
+        seen.add(trimmed)
+        cleaned.append(trimmed)
+    return cleaned or None
+
+
+def _check_target_files_exist_on_disk(
+    source_path: str | None,
+    target_files: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    """Best-effort existence check against a cached clone.
+
+    Returns (resolved, missing). When source_path is missing/empty or the
+    directory does not exist on this host (typical in containerized prod
+    where only the worker has the clone), returns ([], []) so the caller
+    knows to defer to worker-time validation.
+    """
+    if not target_files:
+        return ([], [])
+    if not source_path:
+        return ([], [])
+    from pathlib import Path
+    root = Path(source_path)
+    if not root.is_dir():
+        return ([], [])
+    resolved: list[str] = []
+    missing: list[str] = []
+    for rel in target_files:
+        full = root / rel
+        try:
+            # Resolve symlinks but keep the comparison under `root` — defence
+            # against a symlinked `contracts/x.vy → /etc/passwd` in a repo.
+            full_resolved = full.resolve()
+            full_resolved.relative_to(root.resolve())
+        except (ValueError, OSError):
+            missing.append(rel)
+            continue
+        if full_resolved.is_file():
+            resolved.append(rel)
+        else:
+            missing.append(rel)
+    return (resolved, missing)
+
+
 @app.post("/repositories/{repository_id}/scan")
 async def trigger_repository_scan(
     repository_id: int,
@@ -6784,6 +6941,12 @@ async def list_repository_scans(
             review_reason = overview.get("review_reason")
         cfg = scan.scan_config or {}
         scan_branch = cfg.get("branch") or project.default_branch
+        # firepan-nxf: surface scope. Defensive coercion — scan_config is JSONB,
+        # malformed values (dicts, strings) should not break history rendering.
+        raw_target_files = cfg.get("target_files") if isinstance(cfg, dict) else None
+        scoped_target_files: list[str] | None = None
+        if isinstance(raw_target_files, list) and all(isinstance(t, str) for t in raw_target_files):
+            scoped_target_files = raw_target_files or None
         scan_items.append(ScanHistoryItem(
             execution_id=scan.execution_id,
             status=scan.status,
@@ -6800,6 +6963,7 @@ async def list_repository_scans(
             admin_verified=admin_verified,
             needs_manual_review=needs_manual_review,
             review_reason=review_reason,
+            target_files=scoped_target_files,
         ))
     
     return ScanHistoryResponse(
@@ -8113,6 +8277,8 @@ class SurfaceScanResponse(BaseModel):
     branch: str | None = None
     # Deep audit curated assessment (None for surface scans)
     deep_audit_overview: dict | None = None
+    # firepan-nxf: scope (deep scans only). None for whole-repo or legacy rows.
+    target_files: list[str] | None = None
 
 
 class SurfaceScanListItem(BaseModel):
@@ -8581,6 +8747,11 @@ async def get_surface_scan(
     cfg = scan.scan_config or {}
     project_for_branch = db.query(Project).filter(Project.id == scan.project_id).first()
     scan_branch = cfg.get("branch") or (project_for_branch.default_branch if project_for_branch else None)
+    # firepan-nxf: scope readback, defensive against malformed JSONB.
+    raw_tf = cfg.get("target_files") if isinstance(cfg, dict) else None
+    scoped_tf: list[str] | None = None
+    if isinstance(raw_tf, list) and all(isinstance(t, str) for t in raw_tf):
+        scoped_tf = raw_tf or None
     return SurfaceScanResponse(
         execution_id=scan.execution_id,
         repo_url=scan.repo_url,
@@ -8598,6 +8769,7 @@ async def get_surface_scan(
         scan_type=cfg.get("scan_type", "surface"),
         branch=scan_branch,
         deep_audit_overview=overview if isinstance(overview, dict) else None,
+        target_files=scoped_tf,
     )
 
 
@@ -8756,6 +8928,14 @@ class AdminAuditForceRunRequest(BaseModel):
     mode: str = Field(default="sweep", description="'sweep' or 'intuition'")
     plan_n: int = Field(default=5, ge=1, le=20)
     audit_branch: str | None = Field(default=None, max_length=255)
+    target_files: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional list of repo-relative file paths to scope the deep audit to. "
+            "Max 50 entries. Admin bypasses tier gating but NOT existence validation."
+        ),
+        max_length=50,
+    )
 
 
 @app.post("/admin/audits/force-run", response_model=AuditStartResponse)
@@ -8793,6 +8973,28 @@ async def admin_force_run_audit(
     from server.tier_enforcement import _check_sync as _tier_check
     _tier_check(tenant_id, "audit", db, bypass_quota=True)
 
+    # firepan-nxf: scope validation. Admin bypasses the tier gate but NOT the
+    # existence check — the on-disk check is best-effort (worker is authoritative).
+    scoped_target_files = _validate_target_files(payload.target_files)
+    if scoped_target_files:
+        resolved, missing = _check_target_files_exist_on_disk(
+            getattr(project, "source_path", None),
+            scoped_target_files,
+        )
+        if resolved or missing:  # check actually ran (clone was available)
+            if not resolved:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "scoped_audit_no_files_match",
+                        "missing": missing,
+                        "message": (
+                            "None of the requested target_files exist in the cached clone. "
+                            "Check paths and branch."
+                        ),
+                    },
+                )
+
     try:
         from worker.tasks import execute_audit_task
     except ImportError as e:
@@ -8821,17 +9023,35 @@ async def admin_force_run_audit(
 
     session_id = f"audit_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
 
+    session_models: dict = {
+        "max_iterations": payload.max_iterations,
+        "admin_forced": True,
+    }
+    session_metadata: dict = {}
+    if scoped_target_files:
+        session_metadata["target_files"] = scoped_target_files
+
     audit_session = AuditSession(
         session_id=session_id,
         project_id=project.id,
         status="queued",
         start_time=datetime.now(timezone.utc),
-        models={"max_iterations": payload.max_iterations, "admin_forced": True},
+        models=session_models,
+        session_metadata=session_metadata or None,
     )
     db.add(audit_session)
     db.commit()
 
     from database.models import ScanExecution as ScanExecutionModel
+    scan_config_dict: dict = {
+        "scan_type": "deep",
+        "mode": payload.mode,
+        "branch": resolved_audit_branch,
+        "admin_forced": True,
+    }
+    if scoped_target_files:
+        scan_config_dict["target_files"] = scoped_target_files
+
     deep_scan = ScanExecutionModel(
         execution_id=session_id,
         project_id=project.id,
@@ -8840,12 +9060,7 @@ async def admin_force_run_audit(
         repo_name=project.name,
         status="queued",
         started_at=datetime.now(timezone.utc),
-        scan_config={
-            "scan_type": "deep",
-            "mode": payload.mode,
-            "branch": resolved_audit_branch,
-            "admin_forced": True,
-        },
+        scan_config=scan_config_dict,
     )
     db.add(deep_scan)
     db.commit()
@@ -8866,11 +9081,12 @@ async def admin_force_run_audit(
         mode=payload.mode,
         plan_n=payload.plan_n,
         branch=resolved_audit_branch,
+        target_files=scoped_target_files,
     )
 
     logger.info(
-        "Admin force-run deep audit session=%s project=%s tenant=%s task=%s",
-        session_id, project.id, tenant_id, task.id,
+        "Admin force-run deep audit session=%s project=%s tenant=%s task=%s scoped=%s",
+        session_id, project.id, tenant_id, task.id, bool(scoped_target_files),
     )
 
     return AuditStartResponse(

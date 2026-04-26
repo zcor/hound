@@ -224,6 +224,7 @@ def execute_audit_task(
     mode: str = "sweep",
     plan_n: int = 5,
     branch: str | None = None,
+    target_files: list[str] | None = None,
 ) -> dict:
     """
     Execute a full autonomous security audit with planning loop.
@@ -282,6 +283,21 @@ def execute_audit_task(
         if scan and scan.status in ("completed", "in_review"):
             print(f"[IDEMPOTENCY] Scan {scan_id} already {scan.status}, skipping redelivered task")
             return {"status": "already_done", "scan_id": scan_id}
+
+        # firepan-nxf: fallback read — if target_files kwarg wasn't passed but
+        # scan_config has it (future dispatchers, redelivered tasks, admin
+        # re-queue), pick it up here. Kwarg always wins when present.
+        if target_files is None and scan is not None:
+            try:
+                sc = scan.scan_config or {}
+                if isinstance(sc, dict) and sc.get("target_files"):
+                    tfs = sc["target_files"]
+                    if isinstance(tfs, list) and all(isinstance(t, str) for t in tfs):
+                        target_files = tfs
+            except Exception:
+                # Defensive: scan_config is user-shaped JSONB, never block the
+                # task on a weird value here — worst case is whole-repo run.
+                pass
 
         # Detect partial persistence from a crashed prior run.
         # Crash window: hypotheses written to DB, but ScanExecution.findings/status
@@ -407,11 +423,60 @@ def execute_audit_task(
         # Always create manifest first - we need it for code access
         from ingest.bundles import AdaptiveBundler
         from ingest.manifest import RepositoryManifest
-        
-        publisher.publish_thought("Creating repository manifest...", iteration=0)
-        manifest = RepositoryManifest(repo_path, config)
+
+        if target_files:
+            scope_preview = ", ".join(target_files[:5]) + ("…" if len(target_files) > 5 else "")
+            publisher.publish_thought(
+                f"Creating repository manifest (scoped to {len(target_files)} file(s): {scope_preview})...",
+                iteration=0,
+            )
+        else:
+            publisher.publish_thought("Creating repository manifest...", iteration=0)
+        manifest = RepositoryManifest(repo_path, config, file_filter=target_files)
         manifest.walk_repository()
         manifest.save_manifest(manifest_dir)
+
+        # firepan-nxf: zero-hit gate — authoritative existence check. The
+        # manifest silently drops non-existent paths (ingest/manifest.py:101-109),
+        # so a typo or stale branch would otherwise produce a "scoped" audit
+        # that analyzed nothing. Fail loudly and release quota.
+        if target_files is not None:
+            resolved_relpaths = [f.relpath for f in manifest.files]
+            # Normalize both sides for comparison — manifest stores paths
+            # relative to repo_path, which matches what we asked for.
+            resolved_set = set(resolved_relpaths)
+            missing = [t for t in target_files if t not in resolved_set]
+            if not resolved_set:
+                error_msg = (
+                    f"Scoped audit: none of the requested files exist on branch "
+                    f"{branch or 'default'}. Requested: {target_files}"
+                )
+                publisher.publish_thought(error_msg, iteration=0)
+                publisher.publish_status("failed", error_msg)
+                self._update_scan_status(scan_id, "failed", error_message=error_msg)
+                # Release quota: delete AuditSession row so it stops counting
+                # against monthly limit. Mirror of admin_refund_audit (api.py)
+                # but inline here since we're outside the HTTP layer.
+                try:
+                    from database.models import AuditSession
+                    _db = self.get_db_session()
+                    try:
+                        _sess = _db.query(AuditSession).filter_by(session_id=scan_id).first()
+                        if _sess:
+                            _db.delete(_sess)
+                            _db.commit()
+                    finally:
+                        _db.close()
+                except Exception as _e:
+                    print(f"[scoped-audit] Failed to release quota for {scan_id}: {_e}")
+                publisher.close()
+                return {"status": "failed", "scan_id": scan_id, "error": "scoped_zero_hit"}
+            if missing:
+                publisher.publish_thought(
+                    f"Scoped audit: {len(resolved_relpaths)} of {len(target_files)} "
+                    f"requested files resolved. Missing: {missing}",
+                    iteration=0,
+                )
         
         if existing_graphs and len(existing_graphs) >= 2:
             # Graphs already exist - load from database instead of rebuilding

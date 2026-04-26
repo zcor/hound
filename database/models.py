@@ -902,6 +902,12 @@ def ensure_schema(engine):
             # GitHub OAuth scope tracking
             conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS github_token_scopes VARCHAR(500)"))
 
+            # firepan-nxf: file-scoped deep audits store resolved scope here.
+            # Model has session_metadata as a JSONType column since at least the
+            # firepan-5o8 team-management ship, but older prod DBs may have been
+            # created before it; belt-and-braces so scope writes don't error.
+            conn.execute(text("ALTER TABLE audit_sessions ADD COLUMN IF NOT EXISTS session_metadata JSONB"))
+
             # Lifecycle email funnel columns on tenants
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS first_repo_connected_at TIMESTAMP WITH TIME ZONE"))
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS first_scan_at TIMESTAMP WITH TIME ZONE"))

@@ -417,6 +417,12 @@ class Hypothesis(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=False)
+    # firepan-dar: nullable FK to scan_executions.id so hypotheses can be
+    # filtered/archived per-scan rather than only per-project. Nullable
+    # because legacy rows pre-date the column; new writes always set it.
+    scan_execution_id = Column(
+        Integer, ForeignKey("scan_executions.id"), nullable=True, index=True
+    )
     hypothesis_id = Column(String(255), nullable=False, unique=True, index=True)
     title = Column(String(512), nullable=False)
     description = Column(Text, nullable=False)
@@ -432,9 +438,10 @@ class Hypothesis(Base):
     user_notes = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
+
     # Relationships
     project = relationship("Project", back_populates="hypotheses")
+    scan_execution = relationship("ScanExecution", foreign_keys=[scan_execution_id])
     
     def __repr__(self):
         return f"<Hypothesis(id={self.id}, hypothesis_id='{self.hypothesis_id}', title='{self.title}', status='{self.status}')>"
@@ -875,6 +882,16 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS pr_comments_enabled BOOLEAN NOT NULL DEFAULT TRUE"))
             # User triage notes on findings
             conn.execute(text("ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS user_notes TEXT"))
+            # firepan-dar: scan_execution_id FK so hypotheses are queryable
+            # per-scan rather than just per-project. Nullable for legacy rows.
+            conn.execute(text(
+                "ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS "
+                "scan_execution_id INTEGER REFERENCES scan_executions(id)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_hypotheses_scan_execution_id "
+                "ON hypotheses(scan_execution_id)"
+            ))
             # Deep audit curated assessment
             conn.execute(text("ALTER TABLE scan_executions ADD COLUMN IF NOT EXISTS deep_audit_overview JSONB"))
             # Funnel analytics: first paid conversion timestamp

@@ -1363,14 +1363,29 @@ def _store_hypotheses_in_db(
         return
     
     try:
-        from database.models import Hypothesis
-        
+        from database.models import Hypothesis, ScanExecution
+
         db = get_db_session()
         try:
+            # firepan-dar: resolve session_id (= ScanExecution.execution_id) to
+            # the integer PK so we can write the new scan_execution_id FK.
+            # Falls back to None on lookup failure — the column is nullable
+            # for exactly this reason (legacy rows + race-y AuditSession path).
+            scan_exec_id: int | None = None
+            if session_id:
+                scan_row = (
+                    db.query(ScanExecution.id)
+                    .filter(ScanExecution.execution_id == session_id)
+                    .first()
+                )
+                if scan_row:
+                    scan_exec_id = scan_row[0]
+
             for i, hyp in enumerate(hypotheses):
                 print(f"[DEBUG _store_hypotheses_in_db] Storing hypothesis {i}: {hyp.get('description', '')[:50]}...")
                 db_hyp = Hypothesis(
                     project_id=project_id,
+                    scan_execution_id=scan_exec_id,
                     hypothesis_id=hyp.get("id") or f"{session_id}_hyp_{i}",
                     title=hyp.get("description", "Unknown")[:512],
                     description=hyp.get("description", ""),
@@ -1382,7 +1397,7 @@ def _store_hypotheses_in_db(
                     evidence={"items": hyp.get("evidence", [])},
                 )
                 db.add(db_hyp)
-            
+
             db.commit()
             print(f"[DEBUG _store_hypotheses_in_db] Successfully committed {len(hypotheses)} hypotheses to DB")
         finally:

@@ -545,7 +545,9 @@ async def notify_daily_digest(
             title = _escape_html(task.get("title", "untitled"))
             assignee = task.get("assignee", "")
             status = task.get("status", "open")
+            bead_id = task.get("id", "")
             p_label = f"P{priority}" if priority != "" else ""
+            id_label = f" <code>{_escape_html(bead_id)}</code>" if bead_id else ""
             assignee_label = f" \u2022 {_escape_html(assignee)}" if assignee else ""
             if status == "in_progress":
                 marker = "\u25b6"  # ▶
@@ -553,7 +555,7 @@ async def notify_daily_digest(
                 marker = "\u26d4"  # ⛔
             else:
                 marker = "  "
-            parts.append(f"  {marker} {p_label} {title}{assignee_label}")
+            parts.append(f"  {marker} {p_label}{id_label} {title}{assignee_label}")
         remaining = total - shown
         if remaining > 0:
             parts.append(f"  <i>... and {remaining} more</i>")

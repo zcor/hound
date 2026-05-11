@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Write",
+      "Edit",
+      "Bash(slither *)",
+      "Bash(forge *)",
+      "Bash(cast *)",
+      "Bash(semgrep *)",
+      "Bash(solc-select *)",
+      "Bash(solc *)",
+      "Bash(cat *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(ls *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(diff *)",
+      "Bash(sha256sum *)",
+      "Bash(python3 *)",
+      "Bash(node *)",
+      "Glob",
+      "Grep"
+    ],
+    "deny": [
+      "Bash(rm -rf /)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(ssh *)"
+    ]
+  }
+}

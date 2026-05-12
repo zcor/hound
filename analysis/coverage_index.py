@@ -25,6 +25,8 @@ class InvestigationRecord:
 class CoverageIndex(ConcurrentFileStore):
     """Per-project coverage index with atomic updates."""
 
+    _session_filename_stem = "coverage"
+
     def _get_empty_data(self) -> dict:
         return {
             "nodes": {},  # node_id -> {last_seen, seen_count, evidence_count}

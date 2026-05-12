@@ -38,7 +38,7 @@ import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -3072,7 +3072,7 @@ class AuditStartRequest(BaseModel):
     pr_number: int | None = Field(None, description="PR number to post findings to")
     repo_full_name: str | None = Field(None, description="Repository full name (owner/repo)")
     time_limit_minutes: int = Field(default=120, description="Time limit for the entire audit in minutes")
-    mode: str = Field(default="sweep", description="Audit mode: 'sweep' (Phase 1 - broad coverage) or 'intuition' (Phase 2 - deep exploration)")
+    mode: Literal["sweep", "intuition", "auditor"] = Field(default="sweep", description="Audit mode: 'sweep' (Phase 1, broad coverage), 'intuition' (Phase 2, deep exploration), or 'auditor' (single-auditor + fp-check, opt-in; requires claude CLI in image — firepan-vff)")
     plan_n: int = Field(default=5, description="Number of investigations to plan per batch")
     auto_create_fix_pr: bool = Field(default=False, description="Automatically create a PR with fixes for detected issues")
     base_branch: str = Field(default="main", description="Base branch for fix PR (default: main)")
@@ -8925,7 +8925,7 @@ class AdminAuditForceRunRequest(BaseModel):
     max_iterations: int = Field(default=30, ge=1, le=200)
     investigation_prompt: str | None = None
     time_limit_minutes: int = Field(default=120, ge=1, le=600)
-    mode: str = Field(default="sweep", description="'sweep' or 'intuition'")
+    mode: Literal["sweep", "intuition", "auditor"] = Field(default="sweep", description="Audit mode: 'sweep', 'intuition', or 'auditor' (single-auditor + fp-check, opt-in — firepan-vff)")
     plan_n: int = Field(default=5, ge=1, le=20)
     audit_branch: str | None = Field(default=None, max_length=255)
     target_files: list[str] | None = Field(

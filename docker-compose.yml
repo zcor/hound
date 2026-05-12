@@ -182,6 +182,12 @@ services:
       # Directory mounts don't have this problem — writes to files inside
       # the mounted dir are visible immediately.
       - ./state:/config/state:ro
+      # firepan-vff: writable hypotheses volume so SingleAuditor's on-disk
+      # HypothesisStore JSON survives the container lifecycle. Auditor-only
+      # properties (numeric_gap_measurement, fp_check_verdict, negative_poc,
+      # etc.) don't survive DB persist (no `properties` column on Hypothesis),
+      # so eval / postmortem must read them from this volume.
+      - ./hypotheses:/app/hypotheses
     depends_on:
       db:
         condition: service_healthy

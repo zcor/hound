@@ -57,6 +57,7 @@ class UnifiedLLMClient:
                 "finalize": ["qa", "graph"],
                 "graph": ["scout", "agent", "strategist"],  # Graph can fall back to other models
                 "discovery": ["graph"],  # Discovery falls back to graph if not in hybrid mode
+                "auditor": ["finalize", "strategist", "graph"],  # Single-auditor pipeline
             }
             for alt in fallbacks.get(profile_key, []):
                 if alt in models_cfg:
@@ -159,12 +160,13 @@ class UnifiedLLMClient:
         response = None
         
         try:
-            try:
-                response = self.provider.parse(system=system, user=user, schema=schema, reasoning_effort=reasoning_effort)
-            except TypeError:
-                # Provider may not support per-call overrides
-                response = self.provider.parse(system=system, user=user, schema=schema)
-            
+            response = self.provider.parse(
+                system=system,
+                user=user,
+                schema=schema,
+                reasoning_effort=reasoning_effort,
+            )
+
             # Track token usage if provider supports it
             if hasattr(self.provider, 'get_last_token_usage'):
                 token_usage = self.provider.get_last_token_usage()

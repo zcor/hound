@@ -43,6 +43,12 @@ models:
   reporting:
     provider: openai
     model: gpt-4o
+  # Single-auditor pipeline (mode=auditor): strong reasoning model + fp-check gates
+  auditor:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_context: 200000
+    temperature: 0.1
   # Optional: Math reasoning (requires REI API)
   # math:
   #   provider: rei
@@ -70,3 +76,29 @@ retries:
   max_attempts: 3
   backoff_min_seconds: 1
   backoff_max_seconds: 2
+
+# Claude Code CLI orchestration — used when mode=auditor and `claude` is on $PATH.
+# When available, the auditor spawns autonomous Claude CLI sessions with full
+# tool access (file ops, bash, Slither, Foundry, Trail of Bits plugins, Pashov skills).
+# Required for mode=auditor — SingleAuditor hard-fails if `claude` is missing
+# (use mode=sweep/intuition or install via scripts/setup-server.sh).
+claude_cli:
+  # path: claude                       # Path to the `claude` executable
+  max_turns: 50                        # Max tool-use turns per audit session
+  timeout: 900                         # Per-session timeout in seconds (15 min)
+  skip_permissions: true               # Use --dangerously-skip-permissions for automation
+  fp_check_max_turns: 30               # Max turns for fp-check verification sessions
+  fp_check_timeout: 600                # Timeout for fp-check sessions (10 min)
+  # model: claude-sonnet-4-20250514    # Override model (defaults to auditor profile model)
+  # allowed_tools:                     # Restrict to specific tools (default: all)
+  #   - Read
+  #   - Write
+  #   - Bash
+  #   - Glob
+  #   - Grep
+  # mcp_config: /path/to/mcp-servers.json  # MCP server config file (optional)
+
+# Use fp-check CLI + Trail of Bits plugin cross-check when available.
+# When true, fp-check runs natively first, then cross-checks with
+# `claude plugin run fp-check` for secondary validation.
+fp_check_cli_fallback: true

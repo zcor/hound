@@ -55,6 +55,24 @@ models:
   reporting:
     provider: openai
     model: gpt-4o-mini
+  # Single-auditor pipeline (mode=auditor): strong reasoning model + fp-check gates
+  auditor:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_context: 200000
+    temperature: 0.1
+
+# Claude Code CLI — hybrid config uses moderate budgets.
+# Falls back to UnifiedLLMClient.parse() when the CLI is unavailable.
+claude_cli:
+  max_turns: 50
+  timeout: 900
+  skip_permissions: true
+  fp_check_max_turns: 30
+  fp_check_timeout: 600
+
+# Use fp-check CLI + ToB plugin cross-check when available
+fp_check_cli_fallback: true
 
 logging:
   llm_verbose: false

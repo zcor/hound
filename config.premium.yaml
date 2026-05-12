@@ -70,6 +70,13 @@ models:
     max_context: 128000
     temperature: 0.3
 
+  # Single-auditor pipeline (mode=auditor): Opus-class for audit-grade findings
+  auditor:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_context: 200000
+    temperature: 0.1
+
 # Global context settings
 context:
   max_tokens: 128000
@@ -93,3 +100,15 @@ bundling:
 # Logging
 logging:
   llm_verbose: false
+
+# Claude Code CLI — premium config uses higher turn/timeout budgets
+claude_cli:
+  max_turns: 75
+  timeout: 1200
+  skip_permissions: true
+  fp_check_max_turns: 40
+  fp_check_timeout: 900
+  # mcp_config: /path/to/mcp-servers.json  # MCP server config file (optional)
+
+# Use fp-check CLI + Trail of Bits plugin cross-check when available.
+fp_check_cli_fallback: true

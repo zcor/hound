@@ -103,3 +103,113 @@ class CrossBundleStitch(BaseModel):
     new_relationships: list[SStatement]
     elevated_aspects: list[SAspect]
     refined_issues: list[SIssue]
+
+
+# ---------------------------------------------------------------------------
+# Single-auditor pipeline schemas
+# ---------------------------------------------------------------------------
+
+
+class FileLineEvidence(BaseModel):
+    """A single piece of file:line evidence for a finding."""
+    model_config = {"extra": "forbid"}
+    relpath: str = Field(description="Relative path to the file")
+    line_start: int = Field(ge=1, description="1-based start line number")
+    line_end: int = Field(ge=1, description="1-based end line number")
+    snippet: str = Field(description="Relevant code snippet")
+
+
+class CandidateFinding(BaseModel):
+    """A candidate vulnerability finding produced by the auditor before fp-check."""
+    model_config = {"extra": "forbid"}
+    title: str = Field(description="Concise finding title, max 120 chars")
+    description: str = Field(description="Detailed vulnerability description with root cause")
+    vulnerability_type: str = Field(
+        description="Category: reentrancy, precision_loss, access_control, logic_error, etc."
+    )
+    severity: Severity = Field(description="Finding severity")
+    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score 0-1")
+    file_line_evidence: list[FileLineEvidence] = Field(
+        min_length=1, description="File:line evidence supporting this finding"
+    )
+    reasoning: str = Field(description="Step-by-step reasoning chain")
+    numeric_gap_measurement: str = Field(
+        description="REQUIRED quantitative impact measurement, e.g. '4.9% fee undercharge'"
+    )
+
+
+class CandidateFindingBatch(BaseModel):
+    """Batch of candidate findings from a single scope analysis pass."""
+    model_config = {"extra": "forbid"}
+    candidates: list[CandidateFinding] = Field(default_factory=list)
+    scope_summary: str = Field(description="Brief description of the scope analyzed")
+    surfaces_examined: list[str] = Field(
+        default_factory=list, description="Code surfaces/functions reviewed"
+    )
+
+
+class FPCheckPhaseResult(BaseModel):
+    """Result of a single fp-check verification phase."""
+    model_config = {"extra": "forbid"}
+    phase_name: str = Field(description="Name of this verification phase")
+    passed: bool = Field(description="Whether this phase passed")
+    confidence: float = Field(ge=0.0, le=1.0, description="Phase confidence")
+    reasoning: str = Field(description="Detailed reasoning for this phase's verdict")
+    evidence: str = Field(default="", description="Supporting or counter-evidence found")
+
+
+class FPCheckVerdict(BaseModel):
+    """Final verdict from the 7-phase fp-check verification pipeline."""
+    model_config = {"extra": "forbid"}
+    verdict: Literal["confirmed", "rejected", "uncertain"] = Field(
+        description="Final verdict"
+    )
+    confidence: float = Field(ge=0.0, le=1.0, description="Overall confidence")
+    phase_results: list[FPCheckPhaseResult] = Field(
+        description="Results from each verification phase"
+    )
+    devil_advocate_notes: str = Field(
+        default="", description="Adversarial counter-arguments"
+    )
+    poc_stub: str = Field(default="", description="Executable PoC code stub")
+    negative_poc: str = Field(
+        default="", description="Test demonstrating the fix/guard"
+    )
+    reasoning: str = Field(description="Overall verdict reasoning synthesizing all phases")
+    numeric_gap_verified: bool = Field(
+        default=False, description="Whether the claimed numeric gap was independently verified"
+    )
+    verified_gap_value: str = Field(
+        default="", description="Independently measured gap value"
+    )
+
+
+class CoverageDeclaration(BaseModel):
+    """Auditor's declaration of coverage for a code surface — subject to pipeline verification."""
+    model_config = {"extra": "forbid"}
+    surface_name: str = Field(description="Code surface/component being declared covered")
+    claimed_bounds: list[str] = Field(
+        description="Specific claims about what was checked, with measured bounds"
+    )
+    expected_absent_findings: list[str] = Field(
+        description="Findings that would invalidate this claim if they existed"
+    )
+    unchecked_surfaces: list[str] = Field(
+        default_factory=list, description="Surfaces explicitly not yet covered"
+    )
+    status: Literal["covered", "partial", "needs_more_investigation"] = Field(
+        description="Coverage status for this surface"
+    )
+
+
+class AuditorDecision(BaseModel):
+    """Decision from the single-auditor driver's main loop."""
+    model_config = {"extra": "forbid"}
+    action: Literal[
+        "read_scope", "write_candidate", "validate_candidate",
+        "advance_scope", "declare_coverage", "complete"
+    ] = Field(description="Next action for the auditor to take")
+    reasoning: str = Field(description="Reasoning for this action")
+    parameters: dict[str, Any] = Field(
+        default_factory=dict, description="Action-specific parameters"
+    )

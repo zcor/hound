@@ -24,10 +24,34 @@ import portalocker
 
 class ConcurrentFileStore(ABC):
     """Base class for file-based storage with process-safe locking."""
-    
-    def __init__(self, file_path: Path, agent_id: str | None = None, storage_backend: Any | None = None):
-        self.file_path = Path(file_path)
-        self.agent_id = agent_id or "anonymous"
+
+    # Subclasses may override to control the session-scoped filename stem.
+    _session_filename_stem: str = "store"
+
+    def __init__(
+        self,
+        file_path: Path,
+        agent_id: str | None = None,
+        storage_backend: Any | None = None,
+        session_id: str | None = None,
+    ):
+        # Session-scoped mode: callers pass a directory + session_id and we
+        # derive a per-session JSON filename inside it. This lets multiple
+        # concurrent audit sessions share a project folder without colliding.
+        # Also tolerate a bare directory without session_id (used by
+        # CoverageIndex) by writing to "<dir>/<stem>.json".
+        path = Path(file_path)
+        is_dir_like = path.suffix == "" or (path.exists() and path.is_dir())
+        if is_dir_like:
+            path.mkdir(parents=True, exist_ok=True)
+            filename = (
+                f"{self._session_filename_stem}_{session_id}.json"
+                if session_id else f"{self._session_filename_stem}.json"
+            )
+            path = path / filename
+        self.file_path = path
+        self.agent_id = agent_id or session_id or "anonymous"
+        self.session_id = session_id
         self.lock_path = self.file_path.with_suffix('.lock')
         
         # Storage backend support (optional)
@@ -134,6 +158,20 @@ class ConcurrentFileStore(ABC):
             finally:
                 self._release_lock(lock)
 
+    def snapshot(self) -> dict:
+        """Return a consistent snapshot of the underlying data.
+
+        Acquires the cross-process lock for the read so the snapshot
+        observes a fully written file. Callers must treat the result as
+        read-only; use ``update_atomic`` for mutations.
+        """
+        with self._thread_lock:
+            lock = self._acquire_lock()
+            try:
+                return self._load_data()
+            finally:
+                self._release_lock(lock)
+
     # ---------- Internal: per-file thread lock registry ----------
     _locks_registry: dict[str, threading.RLock] = {}
     _locks_registry_guard = threading.Lock()
@@ -209,6 +247,8 @@ class Hypothesis:
 
 class HypothesisStore(ConcurrentFileStore):
     """Manages vulnerability hypotheses with concurrent access."""
+
+    _session_filename_stem = "hypotheses"
     
     def _get_empty_data(self) -> dict:
         return {
@@ -325,7 +365,7 @@ class HypothesisStore(ConcurrentFileStore):
                 hyp["status"] = "rejected"
 
             return data, True
-
+        
         return self.update_atomic(update)
     
     def get_by_node(self, node_id: str) -> list[dict]:

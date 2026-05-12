@@ -293,7 +293,7 @@ class GeminiProvider(BaseLLMProvider):
                                 break
         raise ValueError("No valid JSON object found in response text")
     
-    def parse(self, *, system: str, user: str, schema: type[T]) -> T:
+    def parse(self, *, system: str, user: str, schema: type[T], **_kwargs) -> T:
         """Make a structured call returning parsed JSON matching `schema`."""
         # Get schema definition from centralized source
         schema_info = get_schema_definition(schema)

@@ -1800,6 +1800,101 @@ class AgentRunner:
         
         console.print("="*80 + "\n")
 
+    def run_auditor(self):
+        """Run the single-auditor pipeline (mode=auditor)."""
+        from analysis.auditor import SingleAuditor
+        from analysis.concurrent_knowledge import HypothesisStore
+        from analysis.coverage_index import CoverageIndex
+
+        if '/' in self.project_id or Path(self.project_id).exists():
+            project_dir = Path(self.project_id).resolve()
+        else:
+            project_dir = get_project_dir(self.project_id)
+
+        graphs_dir = project_dir / "graphs"
+        manifest_dir = project_dir / "manifest"
+        repo_root = project_dir  # CLI projects use project_dir as repo root
+
+        # Reuse hypothesis store and coverage index from legacy paths
+        hyp_dir = project_dir / "hypotheses"
+        hyp_dir.mkdir(exist_ok=True, parents=True)
+        cov_dir = project_dir / "coverage"
+        cov_dir.mkdir(exist_ok=True, parents=True)
+
+        session_id = f"auditor_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        hyp_store = HypothesisStore(hyp_dir, session_id=session_id)
+        cov_index = CoverageIndex(cov_dir)
+
+        auditor_cfg = self.config.get("models", {}).get("auditor", {})
+        model_info = f"{auditor_cfg.get('provider', '?')}/{auditor_cfg.get('model', '?')}"
+
+        console.print(Panel.fit(
+            f"[bold cyan]SINGLE-AUDITOR PIPELINE[/bold cyan]\n"
+            f"Project: [yellow]{self.project_id}[/yellow]\n"
+            f"Model: [magenta]{model_info}[/magenta]\n"
+            f"Time Limit: [red]{self.time_limit_minutes or 120} minutes[/red]",
+            border_style="cyan",
+        ))
+
+        # Set up debug logger if --debug is active
+        dbg = None
+        if self.debug:
+            try:
+                from analysis.debug_logger import DebugLogger as _Dbg
+                dbg_dir = project_dir / '.debug'
+                dbg = _Dbg(session_id, output_dir=dbg_dir)
+            except Exception:
+                pass
+
+        def _cli_progress(event: dict) -> None:
+            """Minimal progress callback for local CLI runs."""
+            status = event.get("status", "")
+            msg = event.get("message", "")
+            if status and msg:
+                console.print(f"  [dim]{status}[/dim]: {msg}")
+
+        auditor = SingleAuditor(
+            config=self.config,
+            graphs_dir=graphs_dir,
+            manifest_dir=manifest_dir,
+            repo_root=repo_root,
+            session_id=session_id,
+            hypothesis_store=hyp_store,
+            coverage_index=cov_index,
+            debug_logger=dbg,
+            progress_callback=_cli_progress,
+        )
+
+        result = auditor.audit(time_limit_minutes=self.time_limit_minutes or 120)
+
+        # Display results
+        console.print("\n[bold green]Audit complete[/bold green]")
+        console.print(
+            f"  Confirmed: [green]{len(result.findings)}[/green]  "
+            f"Rejected: [red]{len(result.rejected)}[/red]  "
+            f"Uncertain: [yellow]{len(result.uncertain)}[/yellow]  "
+            f"Chunks: {result.chunks_processed}/{result.chunks_total}  "
+            f"Elapsed: {result.elapsed_seconds:.0f}s"
+        )
+
+        if result.findings:
+            from rich.table import Table
+            table = Table(show_header=True, header_style="bold magenta", box=None, padding=(0, 1))
+            table.add_column("#", style="dim", width=3)
+            table.add_column("Title", style="cyan", overflow="fold")
+            table.add_column("Severity", style="red")
+            table.add_column("Gap", style="yellow")
+            table.add_column("FP-Check", style="green")
+            for i, gf in enumerate(result.findings, 1):
+                table.add_row(
+                    str(i),
+                    gf.candidate.title[:80],
+                    gf.candidate.severity,
+                    gf.candidate.numeric_gap_measurement[:40],
+                    f"{gf.verdict.confidence:.0%}",
+                )
+            console.print(table)
+
     def run(self, plan_n: int = 5):
         """Run the agent using the unified autonomous flow."""
         # Initialize session tracker
@@ -3034,7 +3129,7 @@ class AgentRunner:
 @click.option('--time-limit', type=int, help='Time limit in minutes')
 @click.option('--config', type=click.Path(exists=True), help='Configuration file')
 @click.option('--debug', is_flag=True, help='Enable debug logging of prompts and responses')
-@click.option('--mode', type=click.Choice(['sweep', 'intuition'], case_sensitive=False), default=None, help='Analysis mode: sweep (Phase 1) or intuition (Phase 2)')
+@click.option('--mode', type=click.Choice(['sweep', 'intuition', 'auditor'], case_sensitive=False), default=None, help='Analysis mode: sweep (Phase 1), intuition (Phase 2), or auditor (single-auditor + fp-check; firepan-vff)')
 @click.option('--platform', default=None, help='Override scout platform (e.g., openai, anthropic, mock)')
 @click.option('--model', default=None, help='Override scout model (e.g., gpt-5, gpt-4o-mini, mock)')
 @click.option('--strategist-platform', default=None, help='Override strategist platform (e.g., openai, anthropic, mock)')
@@ -3134,7 +3229,10 @@ def agent(project_id: str, iterations: int | None, plan_n: int, time_limit: int 
                     runner.agent.investigate = _wrapped_investigate  # type: ignore[attr-defined]
             except Exception:
                 pass
-        runner.run(plan_n=plan_n)
+        if runner.mode == 'auditor':
+            runner.run_auditor()
+        else:
+            runner.run(plan_n=plan_n)
     except KeyboardInterrupt:
         console.print("\n[yellow]Agent interrupted by user[/yellow]")
         # Try to save partial results

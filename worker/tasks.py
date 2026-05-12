@@ -603,252 +603,317 @@ def execute_audit_task(
                 except Exception as e:
                     publisher.publish_thought(f"Warning: Failed to store graphs in DB: {e}", iteration=0)
         
-        # Step 4: Initialize and run autonomous agent with planning loop
-        # This mirrors the CLI's AgentRunner behavior with Strategist planning
-        publisher.publish_status("running", f"Starting autonomous investigation (mode={mode})")
-        
-        from analysis.agent_core import AutonomousAgent
-        from analysis.strategist import Strategist
-        
-        agent = AutonomousAgent(
-            graphs_metadata_path=knowledge_graphs_path,
-            manifest_path=manifest_dir,
-            agent_id=f"worker_{scan_id}",
-            config=config,
-            debug=False,
-            session_id=scan_id,
-            redis_publisher=publisher,
-        )
-        
-        # Initialize strategist for planning investigations
-        strategist = Strategist(config=config, debug=False, session_id=scan_id)
-        
-        # Set up progress callback that publishes to Redis
-        def progress_callback(update: dict):
-            """Forward agent progress to Redis."""
-            status = update.get("status", "")
-            iteration = update.get("iteration", 0)
-            message = update.get("message", "")
-            
-            print(f"[ProgressCallback] status={status}, iteration={iteration}, msg={message[:50] if message else ''}")
-            
-            if status == "decision":
-                publisher.publish_decision(
-                    action=update.get("action", ""),
-                    reasoning=update.get("reasoning", ""),
-                    parameters=update.get("parameters", {}),
-                    iteration=iteration,
-                )
-            elif status == "result":
-                publisher.publish_action_result(
-                    action=update.get("action", ""),
-                    result=update.get("result", {}),
-                    iteration=iteration,
-                )
-            elif status == "hypothesis_formed":
-                publisher.publish_thought(message, iteration=iteration)
-            elif status == "usage":
-                publisher.publish_thought(f"Context: {message}", iteration=iteration)
-            elif status == "analyzing":
-                publisher.publish_thought(message, iteration=iteration)
-            elif status == "executing":
-                publisher.publish_action_start(update.get("action", ""), iteration=iteration)
-            elif status == "complete":
-                publisher.publish_status("completing", message)
-            else:
-                publisher.publish_thought(message, iteration=iteration)
-        
-        # Planning loop - mirrors CLI's AgentRunner.run() behavior
-        import time as time_module
-        start_overall = time_module.time()
-        completed_investigations = []
-        all_hypotheses = []
-        planned_round = 0
+        # Step 4: Initialize and run audit (legacy AutonomousAgent or new SingleAuditor).
+        # firepan-vff: mode=auditor short-circuits the legacy planning loop and uses
+        # SingleAuditor + fp-check. All other modes (sweep, intuition) run the legacy
+        # AutonomousAgent. Both paths converge at the dedup loop (~line 857) which
+        # operates on `all_hypotheses` and uses `agent` for symbol-gate stats.
+        publisher.publish_status("running", f"Starting investigation (mode={mode})")
+        agent = None
+        symbol_gate_provider = None
+        all_hypotheses: list = []
         total_iterations = 0
-        consecutive_empty_rounds = 0
-        last_round_goals = set()
-        
-        # Default investigation prompt for strategist context
-        if not investigation_prompt:
-            investigation_prompt = """
-            Perform a comprehensive security audit of this codebase.
-            Focus on: access control, input validation, state management,
-            economic/financial exploits, and logic errors.
-            """
-        
-        publisher.publish_thought(f"Starting {mode} mode audit with {time_limit_minutes} minute time limit", iteration=0)
-        
-        while True:
-            # Time limit check
-            elapsed_minutes = (time_module.time() - start_overall) / 60.0
-            if elapsed_minutes >= time_limit_minutes:
-                publisher.publish_thought(f"Time limit reached ({time_limit_minutes} minutes) — stopping audit", iteration=total_iterations)
-                break
-            
-            planned_round += 1
-            publisher.publish_thought(f"Planning round {planned_round} ({mode} mode, {elapsed_minutes:.1f}/{time_limit_minutes} min)", iteration=total_iterations)
-            
-            # Get coverage stats for strategist context
+
+        if mode == "auditor":
+            from analysis.auditor import SingleAuditor
+            from analysis.concurrent_knowledge import (
+                HypothesisStore as _AuditorHypothesisStore,
+            )
+            from analysis.coverage_index import CoverageIndex as _AuditorCoverageIndex
+
+            hyp_dir = project_dir / "hypotheses"
+            hyp_dir.mkdir(exist_ok=True, parents=True)
+            cov_dir = project_dir / "coverage"
+            cov_dir.mkdir(exist_ok=True, parents=True)
+
+            hyp_store = _AuditorHypothesisStore(hyp_dir, session_id=scan_id)
+            cov_index = _AuditorCoverageIndex(cov_dir)
+
+            publisher.publish_thought(
+                f"Starting SingleAuditor (mode=auditor) with {time_limit_minutes} minute time limit",
+                iteration=0,
+            )
+
+            auditor = SingleAuditor(
+                config=config,
+                graphs_dir=graphs_dir,
+                manifest_dir=manifest_dir,
+                repo_root=repo_path,
+                session_id=scan_id,
+                hypothesis_store=hyp_store,
+                coverage_index=cov_index,
+                redis_publisher=publisher,
+            )
+            audit_result = auditor.audit(time_limit_minutes=time_limit_minutes)
+
+            all_hypotheses = hyp_store.list_all()
+            total_iterations = audit_result.chunks_processed
+            agent = auditor  # firepan-apn: provides get_symbol_gate_stats()
+            symbol_gate_provider = auditor
+
+            # Persist on-disk HypothesisStore JSON under a stable path so eval
+            # can read auditor-only properties (numeric_gap_measurement et al)
+            # that don't survive DB persist. Soft-fails when the volume isn't
+            # mounted (dev runs without docker-compose).
+            persistent_hyp_root = Path("/app/hypotheses")
             try:
-                coverage = agent.get_coverage_stats() if hasattr(agent, 'get_coverage_stats') else {}
-            except Exception:
-                coverage = {}
+                persistent_hyp_root.mkdir(parents=True, exist_ok=True)
+                persistent_hyp_dir = persistent_hyp_root / scan_id
+                shutil.copytree(hyp_dir, persistent_hyp_dir, dirs_exist_ok=True)
+                print(f"[DEBUG] Persisted HypothesisStore JSON → {persistent_hyp_dir}")
+            except (OSError, PermissionError) as e:
+                print(f"[DEBUG] Could not persist HypothesisStore (non-fatal): {e}")
+
+        # Legacy AutonomousAgent + Strategist planning loop (sweep / intuition modes).
+        # Skipped entirely when mode=auditor; flag-gated rather than indented to
+        # keep the merge surface small.
+        if mode != "auditor":
+            from analysis.agent_core import AutonomousAgent
+            from analysis.strategist import Strategist
+            agent = AutonomousAgent(
+                graphs_metadata_path=knowledge_graphs_path,
+                manifest_path=manifest_dir,
+                agent_id=f"worker_{scan_id}",
+                config=config,
+                debug=False,
+                session_id=scan_id,
+                redis_publisher=publisher,
+            )
             
-            # Determine phase based on mode
-            phase = 'Coverage' if mode == 'sweep' else 'Saliency'
+            # Initialize strategist for planning investigations
+            strategist = Strategist(config=config, debug=False, session_id=scan_id)
             
-            # Build context for strategist - use available_graphs for complete list
-            graphs_summary = []
-            try:
-                # First add the auto-loaded system graph
-                if agent.loaded_data.get('system_graph'):
-                    sys_graph = agent.loaded_data['system_graph']
-                    data = sys_graph.get('data', {})
-                    nodes = data.get('nodes', []) or []
-                    edges = data.get('edges', []) or []
-                    graphs_summary.append(f"{sys_graph['name']}: {len(nodes)} nodes, {len(edges)} edges")
+            # Set up progress callback that publishes to Redis
+            def progress_callback(update: dict):
+                """Forward agent progress to Redis."""
+                status = update.get("status", "")
+                iteration = update.get("iteration", 0)
+                message = update.get("message", "")
                 
-                # Then add any other available graphs
-                for graph_name, graph_meta in (agent.available_graphs or {}).items():
-                    # Skip if already added as system graph
-                    if agent.loaded_data.get('system_graph') and graph_name == agent.loaded_data['system_graph']['name']:
-                        continue
-                    # Load graph data to get node/edge counts
-                    try:
-                        graph_path = Path(graph_meta['path'])
-                        if graph_path.exists():
-                            with open(graph_path) as f:
-                                gdata = json.load(f)
-                            nodes = gdata.get('nodes', []) or []
-                            edges = gdata.get('edges', []) or []
-                            graphs_summary.append(f"{graph_name}: {len(nodes)} nodes, {len(edges)} edges")
-                    except Exception:
-                        graphs_summary.append(f"{graph_name}: (available)")
-            except Exception as e:
-                print(f"[DEBUG] Error building graphs_summary: {e}")
-            
-            print(f"[DEBUG] Graphs summary for strategist: {graphs_summary}")
-            
-            # Get planning from strategist
-            try:
-                # Build graphs summary string
-                graphs_summary_str = "\n".join(graphs_summary) if graphs_summary else "(no graphs loaded)"
+                print(f"[ProgressCallback] status={status}, iteration={iteration}, msg={message[:50] if message else ''}")
                 
-                # Get hypotheses summary
-                hyp_summary = f"{len(all_hypotheses)} hypotheses found so far"
-                if all_hypotheses:
-                    recent = [h.get('title', '') for h in all_hypotheses[-3:] if isinstance(h, dict)]
-                    if recent:
-                        hyp_summary += f" (recent: {', '.join(recent)})"
-                
-                # Coverage summary
-                cov_summary = ""
-                try:
-                    nodes_cov = coverage.get('nodes', {})
-                    cov_summary = f"Nodes: {nodes_cov.get('visited', 0)}/{nodes_cov.get('total', 0)} ({nodes_cov.get('percent', 0):.0f}%)"
-                except Exception:
-                    cov_summary = "(no coverage data)"
-                
-                items = strategist.plan_next(
-                    graphs_summary=graphs_summary_str,
-                    completed=completed_investigations,
-                    n=plan_n,
-                    hypotheses_summary=hyp_summary,
-                    coverage_summary=cov_summary,
-                    phase_hint=phase,
-                )
-                
-                if not items:
-                    publisher.publish_thought("No further investigations suggested — checking completion", iteration=total_iterations)
-                    consecutive_empty_rounds += 1
-                    if consecutive_empty_rounds >= 2:
-                        publisher.publish_thought(f"{mode.capitalize()} mode complete - no new targets", iteration=total_iterations)
-                        break
+                if status == "decision":
+                    publisher.publish_decision(
+                        action=update.get("action", ""),
+                        reasoning=update.get("reasoning", ""),
+                        parameters=update.get("parameters", {}),
+                        iteration=iteration,
+                    )
+                elif status == "result":
+                    publisher.publish_action_result(
+                        action=update.get("action", ""),
+                        result=update.get("result", {}),
+                        iteration=iteration,
+                    )
+                elif status == "hypothesis_formed":
+                    publisher.publish_thought(message, iteration=iteration)
+                elif status == "usage":
+                    publisher.publish_thought(f"Context: {message}", iteration=iteration)
+                elif status == "analyzing":
+                    publisher.publish_thought(message, iteration=iteration)
+                elif status == "executing":
+                    publisher.publish_action_start(update.get("action", ""), iteration=iteration)
+                elif status == "complete":
+                    publisher.publish_status("completing", message)
                 else:
-                    consecutive_empty_rounds = 0
-                    publisher.publish_thought(f"Strategist planned {len(items)} investigations", iteration=total_iterations)
-                    
-            except Exception as e:
-                publisher.publish_thought(f"Strategist planning failed: {e}, falling back to default", iteration=total_iterations)
-                traceback.print_exc()
-                # Fallback: create a default investigation
-                items = [{'goal': investigation_prompt, 'priority': 1}]
+                    publisher.publish_thought(message, iteration=iteration)
             
-            # Check for planning loop (same goals repeated)
-            current_round_goals = set(it.get('goal', '') if isinstance(it, dict) else getattr(it, 'goal', '') for it in items)
-            if current_round_goals == last_round_goals and last_round_goals:
-                consecutive_empty_rounds += 1
-                if consecutive_empty_rounds >= 2:
-                    publisher.publish_thought(f"Detected planning loop - {mode} mode complete", iteration=total_iterations)
-                    break
-            else:
-                last_round_goals = current_round_goals
+            # Planning loop - mirrors CLI's AgentRunner.run() behavior
+            import time as time_module
+            start_overall = time_module.time()
+            completed_investigations = []
+            all_hypotheses = []
+            planned_round = 0
+            total_iterations = 0
+            consecutive_empty_rounds = 0
+            last_round_goals = set()
             
-            # Execute each planned investigation
-            for i, item in enumerate(items):
-                # Time check before each investigation
+            # Default investigation prompt for strategist context
+            if not investigation_prompt:
+                investigation_prompt = """
+                Perform a comprehensive security audit of this codebase.
+                Focus on: access control, input validation, state management,
+                economic/financial exploits, and logic errors.
+                """
+            
+            publisher.publish_thought(f"Starting {mode} mode audit with {time_limit_minutes} minute time limit", iteration=0)
+            
+            while True:
+                # Time limit check
                 elapsed_minutes = (time_module.time() - start_overall) / 60.0
                 if elapsed_minutes >= time_limit_minutes:
-                    publisher.publish_thought("Time limit reached during investigation", iteration=total_iterations)
+                    publisher.publish_thought(f"Time limit reached ({time_limit_minutes} minutes) — stopping audit", iteration=total_iterations)
                     break
                 
-                goal = item.get('goal', '') if isinstance(item, dict) else getattr(item, 'goal', '')
-                item.get('priority', 0) if isinstance(item, dict) else getattr(item, 'priority', 0)
+                planned_round += 1
+                publisher.publish_thought(f"Planning round {planned_round} ({mode} mode, {elapsed_minutes:.1f}/{time_limit_minutes} min)", iteration=total_iterations)
                 
-                if goal in completed_investigations:
-                    continue  # Skip already completed
-                
-                publisher.publish_thought(f"Investigation {i+1}/{len(items)}: {goal[:100]}", iteration=total_iterations)
-                
+                # Get coverage stats for strategist context
                 try:
-                    # Reset agent state for new investigation
-                    agent.reset_for_new_investigation()
+                    coverage = agent.get_coverage_stats() if hasattr(agent, 'get_coverage_stats') else {}
+                except Exception:
+                    coverage = {}
+                
+                # Determine phase based on mode
+                phase = 'Coverage' if mode == 'sweep' else 'Saliency'
+                
+                # Build context for strategist - use available_graphs for complete list
+                graphs_summary = []
+                try:
+                    # First add the auto-loaded system graph
+                    if agent.loaded_data.get('system_graph'):
+                        sys_graph = agent.loaded_data['system_graph']
+                        data = sys_graph.get('data', {})
+                        nodes = data.get('nodes', []) or []
+                        edges = data.get('edges', []) or []
+                        graphs_summary.append(f"{sys_graph['name']}: {len(nodes)} nodes, {len(edges)} edges")
                     
-                    # Run investigation
-                    result = agent.investigate(
-                        prompt=goal,
-                        max_iterations=max_iterations,
-                        progress_callback=progress_callback,
+                    # Then add any other available graphs
+                    for graph_name, graph_meta in (agent.available_graphs or {}).items():
+                        # Skip if already added as system graph
+                        if agent.loaded_data.get('system_graph') and graph_name == agent.loaded_data['system_graph']['name']:
+                            continue
+                        # Load graph data to get node/edge counts
+                        try:
+                            graph_path = Path(graph_meta['path'])
+                            if graph_path.exists():
+                                with open(graph_path) as f:
+                                    gdata = json.load(f)
+                                nodes = gdata.get('nodes', []) or []
+                                edges = gdata.get('edges', []) or []
+                                graphs_summary.append(f"{graph_name}: {len(nodes)} nodes, {len(edges)} edges")
+                        except Exception:
+                            graphs_summary.append(f"{graph_name}: (available)")
+                except Exception as e:
+                    print(f"[DEBUG] Error building graphs_summary: {e}")
+                
+                print(f"[DEBUG] Graphs summary for strategist: {graphs_summary}")
+                
+                # Get planning from strategist
+                try:
+                    # Build graphs summary string
+                    graphs_summary_str = "\n".join(graphs_summary) if graphs_summary else "(no graphs loaded)"
+                    
+                    # Get hypotheses summary
+                    hyp_summary = f"{len(all_hypotheses)} hypotheses found so far"
+                    if all_hypotheses:
+                        recent = [h.get('title', '') for h in all_hypotheses[-3:] if isinstance(h, dict)]
+                        if recent:
+                            hyp_summary += f" (recent: {', '.join(recent)})"
+                    
+                    # Coverage summary
+                    cov_summary = ""
+                    try:
+                        nodes_cov = coverage.get('nodes', {})
+                        cov_summary = f"Nodes: {nodes_cov.get('visited', 0)}/{nodes_cov.get('total', 0)} ({nodes_cov.get('percent', 0):.0f}%)"
+                    except Exception:
+                        cov_summary = "(no coverage data)"
+                    
+                    items = strategist.plan_next(
+                        graphs_summary=graphs_summary_str,
+                        completed=completed_investigations,
+                        n=plan_n,
+                        hypotheses_summary=hyp_summary,
+                        coverage_summary=cov_summary,
+                        phase_hint=phase,
                     )
                     
-                    total_iterations += result.get("iterations_completed", 0)
-                    
-                    # Collect hypotheses
-                    hyps = result.get("detailed_hypotheses", [])
-                    all_hypotheses.extend(hyps)
-                    
-                    completed_investigations.append(goal)
-                    publisher.publish_thought(f"Investigation complete: {len(hyps)} hypotheses found", iteration=total_iterations)
-                    
+                    if not items:
+                        publisher.publish_thought("No further investigations suggested — checking completion", iteration=total_iterations)
+                        consecutive_empty_rounds += 1
+                        if consecutive_empty_rounds >= 2:
+                            publisher.publish_thought(f"{mode.capitalize()} mode complete - no new targets", iteration=total_iterations)
+                            break
+                    else:
+                        consecutive_empty_rounds = 0
+                        publisher.publish_thought(f"Strategist planned {len(items)} investigations", iteration=total_iterations)
+                        
                 except Exception as e:
-                    publisher.publish_thought(f"Investigation failed: {e}", iteration=total_iterations)
-                    completed_investigations.append(goal)  # Mark as done to avoid retry
-            
-            # Sweep mode completion check
-            if mode == 'sweep' and planned_round > 1:
-                # Check if we've covered all major components
-                try:
-                    sys_graph = agent.loaded_data.get('graphs', {}).get('SystemArchitecture', {})
-                    gdata = sys_graph.get('data', {}) if isinstance(sys_graph, dict) else {}
-                    nodes = gdata.get('nodes', []) or []
-                    # Count high-level components
-                    comp_types = {'contract', 'component', 'module', 'class', 'service'}
-                    components = [n for n in nodes if n.get('type', '').lower() in comp_types]
-                    
-                    if components and len(completed_investigations) >= len(components):
-                        publisher.publish_thought(f"Sweep mode: all {len(components)} components analyzed", iteration=total_iterations)
+                    publisher.publish_thought(f"Strategist planning failed: {e}, falling back to default", iteration=total_iterations)
+                    traceback.print_exc()
+                    # Fallback: create a default investigation
+                    items = [{'goal': investigation_prompt, 'priority': 1}]
+                
+                # Check for planning loop (same goals repeated)
+                current_round_goals = set(it.get('goal', '') if isinstance(it, dict) else getattr(it, 'goal', '') for it in items)
+                if current_round_goals == last_round_goals and last_round_goals:
+                    consecutive_empty_rounds += 1
+                    if consecutive_empty_rounds >= 2:
+                        publisher.publish_thought(f"Detected planning loop - {mode} mode complete", iteration=total_iterations)
                         break
-                except Exception:
-                    pass
+                else:
+                    last_round_goals = current_round_goals
+                
+                # Execute each planned investigation
+                for i, item in enumerate(items):
+                    # Time check before each investigation
+                    elapsed_minutes = (time_module.time() - start_overall) / 60.0
+                    if elapsed_minutes >= time_limit_minutes:
+                        publisher.publish_thought("Time limit reached during investigation", iteration=total_iterations)
+                        break
+                    
+                    goal = item.get('goal', '') if isinstance(item, dict) else getattr(item, 'goal', '')
+                    item.get('priority', 0) if isinstance(item, dict) else getattr(item, 'priority', 0)
+                    
+                    if goal in completed_investigations:
+                        continue  # Skip already completed
+                    
+                    publisher.publish_thought(f"Investigation {i+1}/{len(items)}: {goal[:100]}", iteration=total_iterations)
+                    
+                    try:
+                        # Reset agent state for new investigation
+                        agent.reset_for_new_investigation()
+                        
+                        # Run investigation
+                        result = agent.investigate(
+                            prompt=goal,
+                            max_iterations=max_iterations,
+                            progress_callback=progress_callback,
+                        )
+                        
+                        total_iterations += result.get("iterations_completed", 0)
+                        
+                        # Collect hypotheses
+                        hyps = result.get("detailed_hypotheses", [])
+                        all_hypotheses.extend(hyps)
+                        
+                        completed_investigations.append(goal)
+                        publisher.publish_thought(f"Investigation complete: {len(hyps)} hypotheses found", iteration=total_iterations)
+                        
+                    except Exception as e:
+                        publisher.publish_thought(f"Investigation failed: {e}", iteration=total_iterations)
+                        completed_investigations.append(goal)  # Mark as done to avoid retry
+                
+                # Sweep mode completion check
+                if mode == 'sweep' and planned_round > 1:
+                    # Check if we've covered all major components
+                    try:
+                        sys_graph = agent.loaded_data.get('graphs', {}).get('SystemArchitecture', {})
+                        gdata = sys_graph.get('data', {}) if isinstance(sys_graph, dict) else {}
+                        nodes = gdata.get('nodes', []) or []
+                        # Count high-level components
+                        comp_types = {'contract', 'component', 'module', 'class', 'service'}
+                        components = [n for n in nodes if n.get('type', '').lower() in comp_types]
+                        
+                        if components and len(completed_investigations) >= len(components):
+                            publisher.publish_thought(f"Sweep mode: all {len(components)} components analyzed", iteration=total_iterations)
+                            break
+                    except Exception:
+                        pass
+                
+                # Debug: log why we're continuing or breaking
+                elapsed_minutes = (time_module.time() - start_overall) / 60.0
+                print(f"[DEBUG] End of round {planned_round}: elapsed={elapsed_minutes:.1f}min, limit={time_limit_minutes}min, completed={len(completed_investigations)}, continuing to next round...")
             
-            # Debug: log why we're continuing or breaking
-            elapsed_minutes = (time_module.time() - start_overall) / 60.0
-            print(f"[DEBUG] End of round {planned_round}: elapsed={elapsed_minutes:.1f}min, limit={time_limit_minutes}min, completed={len(completed_investigations)}, continuing to next round...")
-        
-        # Log investigation result for debugging
-        print(f"[DEBUG] Full audit completed after {total_iterations} total iterations, {planned_round} rounds")
-        print(f"[DEBUG] Investigations completed: {len(completed_investigations)}")
-        print(f"[DEBUG] Total hypotheses: {len(all_hypotheses)}")
+            # Log investigation result for debugging
+            print(f"[DEBUG] Full audit completed after {total_iterations} total iterations, {planned_round} rounds")
+            print(f"[DEBUG] Investigations completed: {len(completed_investigations)}")
+            print(f"[DEBUG] Total hypotheses: {len(all_hypotheses)}")
+
+            # firepan-apn: legacy AutonomousAgent provides the symbol-gate counter
+            # used by the downstream overview stamping. (Auditor branch set this
+            # to `auditor` above.)
+            symbol_gate_provider = agent
 
         # --- Curation pipeline: filter → dedup → rerank BEFORE persistence ---
         raw_count = len(all_hypotheses)
@@ -1030,12 +1095,17 @@ def execute_audit_task(
             except Exception as e:
                 print(f"[DEBUG] Failed to stamp template_demote_stats on overview: {e}")
 
-        # firepan-apn: stamp symbol-exists gate stats on the overview. The
-        # agent records rejections as it forms hypotheses; we pull the
-        # session-scoped counter here.
-        if overview is not None and hasattr(agent, "get_symbol_gate_stats"):
+        # firepan-apn: stamp symbol-exists gate stats on the overview. Both
+        # legacy AutonomousAgent and SingleAuditor record rejections as they
+        # form hypotheses; we pull the session-scoped counter via the
+        # symbol_gate_provider variable (set above to whichever ran).
+        if (
+            overview is not None
+            and symbol_gate_provider is not None
+            and hasattr(symbol_gate_provider, "get_symbol_gate_stats")
+        ):
             try:
-                overview["symbol_exists_gate"] = agent.get_symbol_gate_stats()
+                overview["symbol_exists_gate"] = symbol_gate_provider.get_symbol_gate_stats()
                 if overview["symbol_exists_gate"].get("rejected_count", 0) > 0:
                     publisher.publish_thought(
                         f"Symbol-exists gate rejected "

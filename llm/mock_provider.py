@@ -31,7 +31,7 @@ class MockProvider(BaseLLMProvider):
         self.responses = responses
         self.response_index = 0
         
-    def parse(self, *, system: str, user: str, schema: type[T]) -> T:
+    def parse(self, *, system: str, user: str, schema: type[T], **_kwargs) -> T:
         """Return structured response based on mock configuration."""
         self.call_count += 1
         

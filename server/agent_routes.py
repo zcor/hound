@@ -21,7 +21,7 @@ avoid circular imports.
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -57,7 +57,7 @@ class AgentAuditRequest(BaseModel):
     investigation_prompt: str | None = Field(None, description="Custom investigation focus prompt")
     max_iterations: int = Field(default=30, ge=1, le=200, description="Max agent iterations per investigation")
     time_limit_minutes: int = Field(default=120, ge=5, le=480, description="Overall time budget in minutes")
-    mode: str = Field(default="sweep", description="Audit mode: 'sweep' or 'intuition'")
+    mode: Literal["sweep", "intuition", "auditor"] = Field(default="sweep", description="Audit mode: 'sweep', 'intuition', or 'auditor' (single-auditor + fp-check, opt-in — firepan-vff)")
     plan_n: int = Field(default=5, ge=1, le=20, description="Investigations to plan per batch")
 
 

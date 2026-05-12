@@ -75,6 +75,71 @@ Return exactly the number of investigations requested; if none apply, return an 
   - For complete: {} or omit entirely
 
 IMPORTANT: Only include the parameters required for your chosen action.""",
+
+        "AuditorDecision": """Return JSON with these fields:
+- action: string (one of: read_scope, write_candidate, validate_candidate, advance_scope, declare_coverage, complete)
+- reasoning: string (your reasoning for this action)
+- parameters: object with action-specific fields:
+  - For read_scope: {"node_ids": ["array"], "card_ids": ["array"]}
+  - For write_candidate: {"title": "string", "description": "string", "vulnerability_type": "string", "severity": "critical"|"high"|"medium"|"low", "confidence": number 0-1, "file_line_evidence": [{"relpath": "string", "line_start": int, "line_end": int, "snippet": "string"}], "reasoning": "string", "numeric_gap_measurement": "string"}
+  - For validate_candidate: {"candidate_index": int}
+  - For advance_scope: {}
+  - For declare_coverage: {"surface_name": "string", "claimed_bounds": ["string"], "expected_absent_findings": ["string"]}
+  - For complete: {}
+
+IMPORTANT: Only include the parameters required for your chosen action.
+CRITICAL: write_candidate MUST include numeric_gap_measurement — a quantitative measurement of the vulnerability's impact (e.g. "4.9% fee undercharge", "116 bps divergence", "0 wei — no gap found"). No finding is accepted without a measured gap.""",
+
+        "CandidateFinding": """Return JSON with these fields:
+- title: string (concise finding title, max 120 chars)
+- description: string (detailed vulnerability description with root cause)
+- vulnerability_type: string (e.g. "reentrancy", "precision_loss", "access_control", "logic_error")
+- severity: string ("critical", "high", "medium", or "low")
+- confidence: number (0.0 to 1.0)
+- file_line_evidence: array of evidence objects, each with:
+  - relpath: string (relative file path)
+  - line_start: integer (1-based line number)
+  - line_end: integer (1-based line number)
+  - snippet: string (relevant code snippet)
+- reasoning: string (step-by-step reasoning chain leading to this finding)
+- numeric_gap_measurement: string (REQUIRED — quantitative impact measurement, e.g. "4.9% fee undercharge per swap", "116 bps divergence in calc_withdraw_one_coin", "overflow headroom: ~1.6e17x before trigger")
+
+CRITICAL: Every candidate MUST include a numeric_gap_measurement. Findings without quantitative evidence are rejected.""",
+
+        "CandidateFindingBatch": """Return JSON with these fields:
+- candidates: array of candidate finding objects (see CandidateFinding schema)
+- scope_summary: string (brief description of the scope analyzed)
+- surfaces_examined: array of strings (list of code surfaces/functions reviewed)""",
+
+        "FPCheckPhaseResult": """Return JSON with these fields:
+- phase_name: string (name of this verification phase)
+- passed: boolean (whether this phase passed)
+- confidence: number (0.0 to 1.0)
+- reasoning: string (detailed reasoning for this phase's verdict)
+- evidence: string (supporting evidence or counter-evidence found)""",
+
+        "FPCheckVerdict": """Return JSON with these fields:
+- verdict: string ("confirmed", "rejected", or "uncertain")
+- confidence: number (0.0 to 1.0)
+- phase_results: array of phase result objects, each with:
+  - phase_name: string
+  - passed: boolean
+  - confidence: number (0.0-1.0)
+  - reasoning: string
+  - evidence: string
+- devil_advocate_notes: string (adversarial counter-arguments to the finding)
+- poc_stub: string (executable proof-of-concept code stub)
+- negative_poc: string (test demonstrating the fix or guard that prevents exploitation)
+- reasoning: string (overall verdict reasoning synthesizing all phases)
+- numeric_gap_verified: boolean (whether the claimed numeric gap was independently verified)
+- verified_gap_value: string (independently measured gap value, may differ from candidate's claim)""",
+
+        "CoverageDeclaration": """Return JSON with these fields:
+- surface_name: string (name of the code surface/component being declared covered)
+- claimed_bounds: array of strings (specific claims about what was checked, with measured bounds)
+- expected_absent_findings: array of strings (findings that, if they existed, would invalidate this coverage claim — the "what would prove this wrong" gate)
+- unchecked_surfaces: array of strings (surfaces explicitly acknowledged as not yet covered)
+- status: string ("covered", "partial", or "needs_more_investigation")""",
     }
     
     # Return predefined schema if available

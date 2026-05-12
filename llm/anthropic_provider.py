@@ -68,8 +68,13 @@ class AnthropicProvider(BaseLLMProvider):
         
         self.client = Anthropic(api_key=self.api_key)
     
-    def parse(self, *, system: str, user: str, schema: type[T]) -> T:
-        """Make a structured call using Claude's structured output."""
+    def parse(self, *, system: str, user: str, schema: type[T], **_kwargs) -> T:
+        """Make a structured call using Claude's structured output.
+
+        Extra keyword arguments (e.g. ``reasoning_effort``) are accepted for
+        signature parity with OpenAI/DeepSeek but ignored — Anthropic models
+        do not expose a per-call reasoning effort knob today.
+        """
         # Get schema definition from centralized source
         schema_info = get_schema_definition(schema)
         

@@ -102,7 +102,7 @@ class DeepSeekProvider(BaseLLMProvider):
         
         return text  # Return as-is if no valid JSON found
     
-    def parse(self, *, system: str, user: str, schema: type[T]) -> T:
+    def parse(self, *, system: str, user: str, schema: type[T], **_kwargs) -> T:
         """Make a structured call using DeepSeek's chat completions."""
         # Log request details
         request_chars = len(system) + len(user)

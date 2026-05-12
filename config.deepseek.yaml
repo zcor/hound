@@ -66,6 +66,13 @@ models:
     max_context: 64000
     temperature: 0.3
 
+  # Single-auditor pipeline (mode=auditor): requires Anthropic API key
+  auditor:
+    provider: anthropic
+    model: claude-sonnet-4-20250514
+    max_context: 200000
+    temperature: 0.1
+
 # Global context settings
 context:
   max_tokens: 64000
@@ -85,6 +92,17 @@ retries:
 bundling:
   target_chars: 20000
   max_bundle_chars: 30000
+
+# Claude Code CLI — moderate budgets for auditor pipeline
+claude_cli:
+  max_turns: 50
+  timeout: 900
+  skip_permissions: true
+  fp_check_max_turns: 30
+  fp_check_timeout: 600
+
+# Use fp-check CLI + Trail of Bits plugin cross-check when available
+fp_check_cli_fallback: true
 
 # Logging
 logging:

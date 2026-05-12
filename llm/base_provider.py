@@ -18,15 +18,18 @@ class BaseLLMProvider(ABC):
         pass
     
     @abstractmethod
-    def parse(self, *, system: str, user: str, schema: type[T]) -> T:
+    def parse(self, *, system: str, user: str, schema: type[T], **kwargs: Any) -> T:
         """
         Make a structured call returning an instance of the schema.
-        
+
         Args:
             system: System prompt
             user: User prompt
             schema: Pydantic model class for structured output
-            
+            **kwargs: Optional per-call hints (e.g. ``reasoning_effort``).
+                Providers that do not support a hint must silently ignore it
+                so the unified client can pass uniform kwargs.
+
         Returns:
             Instance of the schema with parsed data
         """

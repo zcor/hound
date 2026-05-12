@@ -53,7 +53,7 @@ class XAIProvider(BaseLLMProvider):
             base_url="https://api.x.ai/v1"
         )
     
-    def parse(self, *, system: str, user: str, schema: type[T]) -> T:
+    def parse(self, *, system: str, user: str, schema: type[T], **_kwargs) -> T:
         """Make a structured call using XAI's API."""
         messages = [
             {"role": "system", "content": system},

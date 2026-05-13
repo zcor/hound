@@ -162,21 +162,21 @@ _FIRST_SCAN_CELEBRATION_BODY = f"""
 <div style="{_BLOCK_STYLE}">That's a good start, but here's the truth:</div>
 <div style="{_BLOCK_STYLE}"><strong style="color:#FFFFFF;">You haven't actually used Firepan yet.</strong></div>
 <div style="{_BLOCK_STYLE}">Surface scans are fast — they catch obvious issues.</div>
-<div style="{_BLOCK_STYLE}"><strong style="color:#FFFFFF;">Deep Scans are where things break.</strong></div>
-<div style="{_BLOCK_STYLE}">Deep Scans are where Firepan:</div>
+<div style="{_BLOCK_STYLE}"><strong style="color:#FFFFFF;">Deep Audits are where things break.</strong></div>
+<div style="{_BLOCK_STYLE}">Deep Audits are where Firepan:</div>
 <ul style="{_UL_STYLE}">
   <li>Traces reentrancy paths across contracts</li>
   <li>Maps access control chains end-to-end</li>
   <li>Identifies edge cases that look safe in isolation but fail in composition</li>
 </ul>
-<div style="{_BLOCK_STYLE}">It's not a scan. It's a full system analysis powered by multiple AI agents running in parallel.</div>
-<div style="{_BLOCK_STYLE}">Most teams that convert run a Deep Scan within their first 24 hours — because it's the first time they actually <em style="color:#FFFFFF;">see</em> their risk. Your trial includes one.</div>
+<div style="{_BLOCK_STYLE}">It's not a scan. It's a full system analysis powered by frontier-model AI with verification gates — the same audit that produced the Yield Basis case study.</div>
+<div style="{_BLOCK_STYLE}">Most teams that convert run a Deep Audit within their first 24 hours — because it's the first time they actually <em style="color:#FFFFFF;">see</em> their risk. Your trial includes one.</div>
 <div style="{_BLOCK_STYLE}">If you want help interpreting results, just reply. Happy to take a look.</div>
 <div style="{_MUTED_STYLE}">— The Firepan Team</div>
 """
 
 _DEEP_AUDIT_DONE_BODY = f"""
-<div style="{_BLOCK_STYLE}">Your deep scan for <strong style="color:#FFFFFF;">{{project_name}}</strong> is complete.</div>
+<div style="{_BLOCK_STYLE}">Your Deep Audit for <strong style="color:#FFFFFF;">{{project_name}}</strong> is complete.</div>
 <div style="{_BLOCK_STYLE}"><strong style="color:#FFFFFF;">Assessment:</strong> {{assessment_level}}<br/><strong style="color:#FFFFFF;">Findings:</strong> {{findings_count}}</div>
 <div style="{_BLOCK_STYLE}">Open the full report in your dashboard to review findings, severity breakdowns, and proof-of-concept details for each.</div>
 <div style="{_MUTED_STYLE}">— The Firepan Team</div>
@@ -223,7 +223,7 @@ LIFECYCLE_CONFIG: dict[EmailCode, EmailSpec] = {
         hero_subtitle="Surface scans are just the preview",
         category="activation",
         body_content_html=_FIRST_SCAN_CELEBRATION_BODY,
-        cta_label="Run a Deep Scan →",
+        cta_label="Run a Deep Audit →",
         cta_url_template="{app_base}/audits",
         require_verified=True,
     ),

@@ -3158,6 +3158,29 @@ async def start_audit(
         db.add(tenant)
         db.commit()
 
+    # firepan-bv21: pre-flight auth check for private repos. Without this the
+    # worker falls through to an unauthenticated `git clone` and the user sees
+    # a raw `terminal prompts disabled` error (mezher-profi / GneralyFulldestroyer
+    # 2026-05-14). Run before quota burn / session row insertion so a 403
+    # doesn't leave orphan AuditSession + ScanExecution rows.
+    if project and project.is_private:
+        has_install = bool(getattr(project, "installation_id", None)) or bool(
+            getattr(tenant, "installation_id", None)
+        )
+        if not has_install:
+            try:
+                audit_user = await _get_current_user_with_token(request, db)
+            except HTTPException:
+                # No user context (agent x402 path) — refuse cleanly.
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "insufficient_github_scope",
+                        "message": "Private repo audit requires GitHub App installation or repo-scoped OAuth.",
+                    },
+                )
+            _check_private_repo_access(project, audit_user)
+
     from server.tier_enforcement import has_paid_subscription
     has_saas_sub = has_paid_subscription(tenant)
 
@@ -3293,10 +3316,16 @@ async def start_audit(
             logger.error(f"Failed to link payment to audit job: {e}")
             mark_job_failed(db, gate.payment_log_id)
 
-    # Resolve installation_id: prefer request, fall back to project
+    # Resolve installation_id: prefer request, fall back to project, then tenant.
+    # firepan-bv21: include tenant.installation_id as a final fallback so that
+    # repos added before the webhook bridge fix (project.installation_id NULL)
+    # can still authenticate via the tenant's install. Without this, every
+    # pre-fix orphan would need a manual project-row backfill before scans work.
     resolved_installation_id = request_body.installation_id
     if not resolved_installation_id and project and getattr(project, "installation_id", None):
         resolved_installation_id = project.installation_id
+    if not resolved_installation_id and tenant and getattr(tenant, "installation_id", None):
+        resolved_installation_id = tenant.installation_id
 
     # Dispatch to Celery worker queue (async - returns immediately!)
     task = execute_audit_task.delay(
@@ -4369,11 +4398,43 @@ async def handle_github_webhook(request: Request, db: Session = Depends(get_db))
         account = installation.get("account", {})
         account_login = account.get("login", "")
         account_type = account.get("type", "User")
-        logger.info(f"Installation event: {action} for {installation_id} ({account_login})")
+        sender = payload.get("sender", {}) or {}
+        sender_github_id = sender.get("id")
+        sender_login = sender.get("login", "")
+        logger.info(
+            f"Installation event: {action} for {installation_id} ({account_login}) by sender={sender_login}({sender_github_id})"
+        )
 
         if action == "created" and installation_id:
-            # Idempotent tenant creation: check by installation_id first, then by name
+            # firepan-bv21: the user who clicked Install may already exist in our
+            # DB (they signed in via OAuth before installing the App). If so,
+            # attach the installation to THEIR tenant rather than minting a
+            # parallel orphan tenant. This is the root cause of the mezher-profi
+            # / GneralyFulldestroyer split on 2026-05-14: webhook minted tenant
+            # 78 for the org while user mezher-profi sat on tenant 77 with no
+            # installation_id, so their private-repo scans failed without auth.
             tenant = db.query(Tenant).filter(Tenant.installation_id == installation_id).first()
+            if not tenant and sender_github_id:
+                sender_user = db.query(User).filter(User.github_id == sender_github_id).first()
+                if sender_user and sender_user.tenant_id:
+                    user_tenant = db.query(Tenant).filter(Tenant.id == sender_user.tenant_id).first()
+                    if user_tenant and not user_tenant.installation_id:
+                        user_tenant.installation_id = installation_id
+                        user_tenant.github_account_login = (
+                            user_tenant.github_account_login or account_login or None
+                        )
+                        user_tenant.github_account_type = (
+                            user_tenant.github_account_type or account_type or None
+                        )
+                        if user_tenant.status == "pending":
+                            user_tenant.status = "active"
+                        db.commit()
+                        db.refresh(user_tenant)
+                        tenant = user_tenant
+                        logger.info(
+                            "Linked installation %s to existing tenant %s (user %s)",
+                            installation_id, tenant.id, sender_login,
+                        )
             if not tenant:
                 tenant_name = f"github_{account_login}" if account_login else f"installation_{installation_id}"
                 tenant = db.query(Tenant).filter(Tenant.name == tenant_name).first()
@@ -10237,9 +10298,55 @@ async def auth_complete(request: Request, body: AuthCompleteRequest, db: Session
         account_login = f"installation_{body.installation_id}"
         account_type = "Unknown"
 
+    # firepan-bv21: if the caller is a logged-in OAuth user, prefer attaching
+    # the installation to THEIR tenant. This catches the case where webhook
+    # ordering or a Webhook delivery failure left tenant 78 (org) orphaned
+    # while tenant 77 (user) had no installation_id. Belt-and-suspenders to
+    # the sender-based webhook bridge above.
+    jwt_user_tenant: Tenant | None = None
+    try:
+        from server.auth_routes import get_token_from_header
+        from server.auth_utils import get_current_user_from_token
+        token = get_token_from_header(request)
+        if token:
+            payload = get_current_user_from_token(token)
+            jwt_tenant_id = payload.get("tenant_id")
+            if jwt_tenant_id:
+                jwt_user_tenant = db.query(Tenant).filter(Tenant.id == jwt_tenant_id).first()
+    except Exception:
+        # No JWT or invalid token — fall through to webhook-style resolution.
+        jwt_user_tenant = None
+
     # Find or create Tenant (webhook may have already created it)
     # Check by installation_id first, then by account name (handles reinstalls with new installation_id)
     tenant = db.query(Tenant).filter_by(installation_id=body.installation_id).first()
+
+    # firepan-bv21: if the JWT user's tenant exists and has no install yet,
+    # bridge here even if the webhook already minted a separate orphan tenant.
+    # Mark the orphan as merged so it doesn't accumulate state.
+    if jwt_user_tenant and not jwt_user_tenant.installation_id:
+        orphan = tenant if tenant and tenant.id != jwt_user_tenant.id else None
+        jwt_user_tenant.installation_id = body.installation_id
+        if account_login and not account_login.startswith("installation_"):
+            jwt_user_tenant.github_account_login = (
+                jwt_user_tenant.github_account_login or account_login
+            )
+            jwt_user_tenant.github_account_type = (
+                jwt_user_tenant.github_account_type or account_type
+            )
+        if jwt_user_tenant.status == "pending":
+            jwt_user_tenant.status = "active"
+        if orphan:
+            # Strip installation_id from the orphan so future queries route to
+            # the JWT user's tenant. Leave status untouched — changing it can
+            # cascade to billing/tier_enforcement; clearing the install is
+            # sufficient to make this row inert for new scans.
+            orphan.installation_id = None
+            logger.info(
+                "Bridged installation %s from orphan tenant %s to user tenant %s via JWT",
+                body.installation_id, orphan.id, jwt_user_tenant.id,
+            )
+        tenant = jwt_user_tenant
 
     if not tenant and account_login and not account_login.startswith("installation_"):
         # Check if tenant exists by name (reinstall case - new installation_id for same account)

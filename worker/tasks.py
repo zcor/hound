@@ -382,6 +382,15 @@ def execute_audit_task(
                     raise RuntimeError(
                         f"REPO_BRANCH_NOT_FOUND: Branch '{branch}' not found in repository"
                     )
+                # firepan-bv21: classify the "private repo, no auth" failure
+                # explicitly so the dashboard refunds credit + shows the
+                # scope-upgrade prompt instead of a raw git error. The API
+                # layer pre-flight already catches this in the dashboard path
+                # but webhook-triggered scans + PR scans can still land here.
+                if "terminal prompts disabled" in stderr or "could not read Username" in stderr:
+                    raise RuntimeError(
+                        "REPO_AUTH_REQUIRED: Private repository requires GitHub App installation or repo-scoped OAuth"
+                    )
                 raise RuntimeError(f"Git clone failed: {stderr}")
         else:
             repo_path = Path(repo_url).expanduser().resolve()
@@ -2767,6 +2776,11 @@ def build_graphs_task(
                 if branch and "Remote branch" in stderr and "not found in upstream origin" in stderr:
                     raise RuntimeError(
                         f"REPO_BRANCH_NOT_FOUND: Branch '{branch}' not found in repository"
+                    )
+                # firepan-bv21: see above — classify unauthenticated private clone
+                if "terminal prompts disabled" in stderr or "could not read Username" in stderr:
+                    raise RuntimeError(
+                        "REPO_AUTH_REQUIRED: Private repository requires GitHub App installation or repo-scoped OAuth"
                     )
                 raise RuntimeError(f"Git clone failed: {stderr}")
         else:

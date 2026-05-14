@@ -532,6 +532,83 @@ def test_github_webhook_installation_event(client):
     assert data["tenant_id"] is not None
 
 
+def test_github_webhook_installation_bridges_existing_user(client, test_db, github_user, sample_tenant):
+    """firepan-bv21: when the installer (sender) already has a User row, the
+    install should attach to THEIR existing tenant, not mint a parallel orphan.
+
+    Reproduces the mezher-profi / GneralyFulldestroyer split on 2026-05-14
+    where webhook minted tenant 78 for the org while the user sat on tenant
+    77 with no installation_id.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    # Precondition: user exists, tenant has no install yet.
+    assert sample_tenant.installation_id is None
+
+    payload = {
+        "action": "created",
+        "installation": {
+            "id": 999111,
+            "account": {"login": "some-org", "type": "Organization"},
+        },
+        "sender": {
+            "id": github_user.github_id,
+            "login": github_user.github_login,
+        },
+    }
+    with patch("server.api.notify_app_installed", new_callable=AsyncMock):
+        response = client.post(
+            "/webhooks/github",
+            json=payload,
+            headers={"X-GitHub-Event": "installation"},
+        )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["tenant_id"] == sample_tenant.id, (
+        "install should have been attached to the sender's existing tenant"
+    )
+
+    test_db.refresh(sample_tenant)
+    assert sample_tenant.installation_id == 999111
+
+    # No orphan tenant should have been minted.
+    from database.models import Tenant as TenantModel
+    orphans = test_db.query(TenantModel).filter(TenantModel.name == "github_some-org").all()
+    assert orphans == [], f"expected no orphan tenant, found: {orphans}"
+
+
+def test_github_webhook_installation_no_user_creates_orphan(client, test_db):
+    """firepan-bv21: when sender doesn't match any User (waitlist flow,
+    pre-OAuth signups), the original orphan-tenant path still works.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    payload = {
+        "action": "created",
+        "installation": {
+            "id": 999222,
+            "account": {"login": "lone-wolf-org", "type": "Organization"},
+        },
+        "sender": {"id": 88888888, "login": "unknown-user"},
+    }
+    with patch("server.api.notify_app_installed", new_callable=AsyncMock):
+        response = client.post(
+            "/webhooks/github",
+            json=payload,
+            headers={"X-GitHub-Event": "installation"},
+        )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["tenant_id"] is not None
+
+    from database.models import Tenant as TenantModel
+    tenant = test_db.query(TenantModel).filter(
+        TenantModel.installation_id == 999222
+    ).first()
+    assert tenant is not None
+    assert tenant.github_account_login == "lone-wolf-org"
+
+
 def test_github_webhook_pr_event_skipped(client):
     """Test GitHub webhook skips non-actionable PR events."""
     payload = {

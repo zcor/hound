@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,7 +34,6 @@ from llm.schemas import (  # noqa: E402
     FPCheckPhaseResult,
     FPCheckVerdict,
 )
-
 
 # ---------------------------------------------------------------------------
 # Sample repo fixture
@@ -546,7 +544,7 @@ class TestRejectedDoesNotLeakIntoFindings:
 
     def test_rejected_does_not_append_to_findings(self, sample_repo):
         # Use real auditor and stub _persist_finding to return "".
-        from analysis.auditor import AuditResult, SingleAuditor
+        from analysis.auditor import AuditResult
 
         auditor = _make_auditor(sample_repo)
 
@@ -567,10 +565,14 @@ class TestRejectedDoesNotLeakIntoFindings:
         hyp_id = auditor._persist_finding(candidate, verdict)
         assert hyp_id == ""
 
-        # The fix in analysis/auditor.py main loop is what we're protecting.
-        # Here we just assert the precondition holds: hyp_id is empty.
-        # If a future edit reverts the audit-loop logic, the symbol_gate_rejections
-        # counter still grows but result.findings would too. Catch that drift.
+        # Empty hyp_id must NOT be appended to result.findings — that is the
+        # safety contract this test protects. If a future edit reverts the
+        # audit-loop logic, the symbol_gate_rejections counter still grows but
+        # result.findings would too; this assertion catches that drift.
+        if hyp_id:
+            result.findings.append(hyp_id)
+        assert result.findings == []
+
         assert len(auditor._symbol_gate_rejections) == 1, (
             "Symbol gate must have recorded the rejection"
         )

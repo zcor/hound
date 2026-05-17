@@ -28,6 +28,13 @@ ignore = [
   "E203",  # whitespace before ':' (black compatibility)
 ]
 
+[lint.per-file-ignores]
+# test_auditor.py is intentionally skipped at module level
+# (pytest.skip(allow_module_level=True), firepan-vff) pending a rewrite for
+# the CLI-only contract. Its imports deliberately sit after the skip call so
+# the dead module doesn't import removed UnifiedLLMClient fallback paths.
+"tests/test_auditor.py" = ["E402"]
+
 [lint.isort]
 known-first-party = ["hound"]
 combine-as-imports = true

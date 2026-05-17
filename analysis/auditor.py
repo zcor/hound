@@ -619,10 +619,10 @@ class SingleAuditor:
 
     def _fp_check_safe(
         self,
-        fp_check: "FPCheckPipeline",
-        candidate: "CandidateFinding",
+        fp_check: FPCheckPipeline,
+        candidate: CandidateFinding,
         source_context: str,
-    ) -> "FPCheckVerdict":
+    ) -> FPCheckVerdict:
         """Run strict fp-check; convert a CLI failure into an 'uncertain' verdict.
 
         firepan-vff: a timeout / transient CLI error during fp-check on one
@@ -868,8 +868,7 @@ class SingleAuditor:
                 return []
             if err in self._FATAL_CLI_ERRORS:
                 raise RuntimeError(
-                    "candidate extraction CLI fatal error for %s: %s"
-                    % (chunk.chunk_id, err)
+                    f"candidate extraction CLI fatal error for {chunk.chunk_id}: {err}"
                 )
             # Other errors (HTTP 4xx/5xx, malformed JSON, "<unknown>"):
             # treat as a chunk failure, not an audit failure — skip and continue.
@@ -1001,8 +1000,7 @@ class SingleAuditor:
             err = cov_result.raw_json.get("error", "<unknown>")
             if err in self._FATAL_CLI_ERRORS:
                 raise RuntimeError(
-                    "coverage declaration CLI fatal error for %s: %s"
-                    % (chunk.chunk_id, err)
+                    f"coverage declaration CLI fatal error for {chunk.chunk_id}: {err}"
                 )
             logger.warning(
                 "Coverage declaration CLI error for %s (%s) — no declaration",

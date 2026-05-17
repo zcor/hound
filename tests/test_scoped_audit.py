@@ -828,3 +828,20 @@ class TestWorkerZeroHit:
             AuditSession.session_id == scan_id
         ).first()
         assert sess_after is not None
+
+
+class TestDeepAuditModeDefault:
+    """firepan-8l1: paid scan_type=deep must default to Claude SingleAuditor.
+    The DeepSeek 'sweep' pipeline had a 0/13 TP rate (yieldnest scan 77
+    postmortem). A silent revert to default='sweep' re-exposes every paying
+    customer to that failure mode, so guard the default structurally."""
+
+    def test_audit_start_request_defaults_to_auditor(self):
+        from server.api import AuditStartRequest
+
+        assert AuditStartRequest.model_fields["mode"].default == "auditor"
+
+    def test_agent_api_request_defaults_to_auditor(self):
+        from server.agent_routes import AgentAuditRequest
+
+        assert AgentAuditRequest.model_fields["mode"].default == "auditor"

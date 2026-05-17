@@ -372,8 +372,7 @@ class FPCheckPipeline:
             if not (self.repo_root and ClaudeSession.available()):
                 raise RuntimeError(
                     "fp-check CLI required (strict=True) but unavailable: "
-                    "repo_root=%s claude=%s"
-                    % (self.repo_root, shutil.which("claude"))
+                    f"repo_root={self.repo_root} claude={shutil.which('claude')}"
                 )
             return self._run_cli(candidate, source_context, _strict=True)
         if self.repo_root and ClaudeSession.available():
@@ -483,8 +482,8 @@ class FPCheckPipeline:
         if result.is_error:
             if _strict:
                 raise RuntimeError(
-                    "fp-check CLI failed for '%s' (strict mode): %s"
-                    % (candidate.title, result.raw_json.get("error", "<unknown>"))
+                    f"fp-check CLI failed for '{candidate.title}' (strict mode): "
+                    f"{result.raw_json.get('error', '<unknown>')}"
                 )
             logger.warning(
                 "Claude CLI fp-check failed for '%s' — falling back to per-phase LLM",

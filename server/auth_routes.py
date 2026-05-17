@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 from database.models import OAuthAuditLog, Project, ScanExecution, Tenant, User
 from server.auth_utils import create_access_token, get_current_user_from_token, reject_preview_writes
+from server.team_bootstrap import attach_admin_if_empty
 from server.token_crypto import encrypt_token
 
 logger = logging.getLogger(__name__)
@@ -466,6 +467,9 @@ async def github_callback(
                 gh_email = (github_user.get("email") or user.email or "").strip()
                 if gh_email:
                     tenant_obj.contact_email = gh_email
+            # First-user-wins bootstrap (firepan-5o8): if the tenant team has no
+            # members, attach this user as admin. Idempotent no-op otherwise.
+            attach_admin_if_empty(db, tenant_obj, user.id)
             db.commit()
             if is_new_user and tenant_obj.contact_email:
                 from integrations.lifecycle_emails import EmailCode, safe_dispatch
@@ -606,6 +610,9 @@ async def google_callback(
                 tenant_obj = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
                 if tenant_obj is not None:
                     tenant_obj.last_activity_at = datetime.now(timezone.utc)
+                    # First-user-wins bootstrap (firepan-5o8): idempotent no-op
+                    # if already a team member.
+                    attach_admin_if_empty(db, tenant_obj, user.id)
         except Exception:
             logger.exception("last_activity_at bump failed (google login) for tenant=%s", user.tenant_id)
         db.commit()
@@ -691,6 +698,9 @@ async def google_callback(
         tenant_obj = db.query(Tenant).filter(Tenant.id == user.tenant_id).first()
         if tenant_obj is not None:
             tenant_obj.last_activity_at = datetime.now(timezone.utc)
+            # First-user-wins bootstrap (firepan-5o8): attach this user as admin
+            # if the tenant team has no members yet. Idempotent no-op otherwise.
+            attach_admin_if_empty(db, tenant_obj, user.id)
             db.commit()
             from integrations.lifecycle_emails import EmailCode, safe_dispatch
             await safe_dispatch(

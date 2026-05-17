@@ -492,6 +492,33 @@ async def get_current_user(request: Request, db: Session = Depends(get_db)) -> U
 
 
 # =============================================================================
+# TEAM ADMIN GATE — require admin role on the caller's tenant team
+# =============================================================================
+
+def require_team_admin(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TeamMember:
+    """Require the caller to be an admin of their tenant-wide team.
+
+    Returns the TeamMember row for downstream use (e.g., to know the caller's
+    team_id without re-querying). 404 if the tenant has no team (pre-backfill
+    edge case); 403 if the caller is not an admin.
+    """
+    tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
+    if not tenant or not tenant.team_id:
+        raise HTTPException(status_code=404, detail="Tenant team not found")
+    member = (
+        db.query(TeamMember)
+        .filter(TeamMember.team_id == tenant.team_id, TeamMember.user_id == current_user.id)
+        .first()
+    )
+    if not member or member.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return member
+
+
+# =============================================================================
 # GITHUB CAPABILITY GATE — require linked GitHub for scan operations
 # =============================================================================
 
@@ -6472,6 +6499,101 @@ async def delete_repository(
 # Team Endpoints - Team-based access control
 # ============================================================================
 
+async def _sync_repo_collaborators(
+    db: Session,
+    project: "Project",
+    actor: "User",
+    github_token: str,
+) -> dict:
+    """Fetch GitHub collaborators for `project` and upsert into its per-repo Team.
+
+    Used by both /repositories/{id}/sync-team (single-repo, admin-triggered)
+    and /team/sync-from-github (tenant-wide fan-out).
+
+    Returns {team_id, team_name, github_repo_name, members_count, members[]}
+    on success. Raises HTTPException on auth/access errors so the single-repo
+    endpoint can surface them; the tenant-wide endpoint catches and records
+    them per-repo.
+
+    Flushes but does NOT commit — the caller decides transaction boundaries.
+    """
+    from server.services.github_service import GitHubService, parse_github_url
+
+    try:
+        owner, repo_name = parse_github_url(project.git_url or "")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    github = GitHubService(github_token)
+    try:
+        user_has_access = await github.check_user_access(owner, repo_name, actor.github_login)
+        if not user_has_access:
+            raise HTTPException(
+                status_code=403,
+                detail=f"You don't have access to {owner}/{repo_name}",
+            )
+        repo_data = await github.get_repo_details(owner, repo_name)
+        collaborators = await github.get_repo_collaborators(owner, repo_name)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GitHub API error: {str(e)}")
+
+    # Create or update per-repo Team
+    team = db.query(Team).filter_by(github_repo_id=repo_data["id"]).first()
+    if not team:
+        team = Team(
+            name=f"{owner}/{repo_name} Team",
+            github_repo_id=repo_data["id"],
+            github_repo_name=f"{owner}/{repo_name}",
+            last_synced_at=datetime.now(timezone.utc),
+        )
+        db.add(team)
+        db.flush()
+    else:
+        team.last_synced_at = datetime.now(timezone.utc)
+
+    if project.team_id != team.id:
+        project.team_id = team.id
+
+    existing_user_ids = {
+        m.user_id for m in db.query(TeamMember).filter_by(team_id=team.id).all()
+    }
+
+    synced_members = []
+    for collab in collaborators:
+        github_login = collab["login"]
+        user = db.query(User).filter_by(github_login=github_login).first()
+        if not user:
+            # Create stub user; they'll hydrate on first login
+            user = User(
+                github_id=collab["id"],
+                github_login=github_login,
+                avatar_url=collab.get("avatar_url"),
+                tenant_id=actor.tenant_id,
+            )
+            db.add(user)
+            db.flush()
+
+        if user.id not in existing_user_ids:
+            role = "admin" if collab.get("permissions", {}).get("admin") else "member"
+            db.add(TeamMember(team_id=team.id, user_id=user.id, role=role))
+
+        synced_members.append({
+            "github_login": github_login,
+            "avatar_url": collab.get("avatar_url"),
+            "role": "admin" if collab.get("permissions", {}).get("admin") else "member",
+        })
+
+    return {
+        "team_id": team.id,
+        "team_name": team.name,
+        "github_repo_name": team.github_repo_name,
+        "members_count": len(synced_members),
+        "members": synced_members,
+    }
+
+
 @app.post("/repositories/{repo_id}/sync-team", tags=["teams"])
 async def sync_team_from_github(
     repo_id: int,
@@ -6482,28 +6604,24 @@ async def sync_team_from_github(
 ):
     """
     Sync team members from GitHub repository collaborators.
-    
+
     - Fetches all collaborators from GitHub API
-    - Creates or updates Team record
+    - Creates or updates per-repo Team record
     - Adds/updates TeamMember records for each collaborator
     - Links repository to team
-    
+
     Returns team info with member list.
     """
-    from server.services.github_service import GitHubService, parse_github_url
-    
-    # Get repository
     repo = db.query(Project).filter_by(id=repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
-    
-    # Verify user has access (must have GitHub token)
+
     if not current_user.github_token_encrypted:
         raise HTTPException(
-            status_code=401, 
-            detail="GitHub access token not found. Please re-authenticate."
+            status_code=401,
+            detail="GitHub access token not found. Please re-authenticate.",
         )
-    
+
     try:
         _gh_token = decrypt_token(current_user.github_token_encrypted)
     except ValueError:
@@ -6511,101 +6629,10 @@ async def sync_team_from_github(
             status_code=401,
             detail="GitHub token expired. Please reconnect your GitHub account.",
         )
-    
-    # Parse owner/repo from URL
-    try:
-        owner, repo_name = parse_github_url(repo.git_url or "")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    
-    # Fetch GitHub data
-    github = GitHubService(_gh_token)
-    
-    try:
-        # Verify user has access to repo
-        user_has_access = await github.check_user_access(owner, repo_name, current_user.github_login)
-        if not user_has_access:
-            raise HTTPException(
-                status_code=403,
-                detail="You don't have access to this repository"
-            )
-        
-        repo_data = await github.get_repo_details(owner, repo_name)
-        collaborators = await github.get_repo_collaborators(owner, repo_name)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"GitHub API error: {str(e)}")
-    
-    # Create or update team
-    team = db.query(Team).filter_by(github_repo_id=repo_data["id"]).first()
-    
-    if not team:
-        team = Team(
-            name=f"{owner}/{repo_name} Team",
-            github_repo_id=repo_data["id"],
-            github_repo_name=f"{owner}/{repo_name}",
-            last_synced_at=datetime.now(timezone.utc)
-        )
-        db.add(team)
-        db.flush()
-    else:
-        # Update sync timestamp
-        team.last_synced_at = datetime.now(timezone.utc)
-    
-    # Link repo to team
-    if repo.team_id != team.id:
-        repo.team_id = team.id
-    
-    # Get existing members
-    existing_members = db.query(TeamMember).filter_by(team_id=team.id).all()
-    existing_user_ids = {m.user_id for m in existing_members}
-    
-    synced_members = []
-    
-    # Sync team members
-    for collab in collaborators:
-        github_login = collab["login"]
-        
-        # Find or create user
-        user = db.query(User).filter_by(github_login=github_login).first()
-        
-        if not user:
-            # Create stub user (they'll complete profile on first login)
-            user = User(
-                github_id=collab["id"],
-                github_login=github_login,
-                avatar_url=collab.get("avatar_url"),
-                tenant_id=current_user.tenant_id  # Share tenant with repo owner
-            )
-            db.add(user)
-            db.flush()
-        
-        # Add to team if not already a member
-        if user.id not in existing_user_ids:
-            role = "admin" if collab.get("permissions", {}).get("admin") else "member"
-            team_member = TeamMember(
-                team_id=team.id,
-                user_id=user.id,
-                role=role
-            )
-            db.add(team_member)
-        
-        synced_members.append({
-            "github_login": github_login,
-            "avatar_url": collab.get("avatar_url"),
-            "role": "admin" if collab.get("permissions", {}).get("admin") else "member"
-        })
-    
+
+    result = await _sync_repo_collaborators(db, repo, current_user, _gh_token)
     db.commit()
-    
-    return {
-        "team_id": team.id,
-        "team_name": team.name,
-        "github_repo_name": team.github_repo_name,
-        "members_count": len(synced_members),
-        "members": synced_members
-    }
+    return result
 
 
 @app.get("/teams/{team_id}/members", tags=["teams"])
@@ -6654,6 +6681,293 @@ async def get_team_members(
             for m in members
         ]
     }
+
+
+# ============================================================================
+# Tenant-wide team endpoints (firepan-5o8)
+#
+# Distinct from the per-repo /teams/{team_id}/members endpoint above.
+# The dashboard's Settings > Team page uses these; per-repo team cards still
+# use the per-repo endpoint and its response shape.
+# ============================================================================
+
+
+class _TenantTeamMemberDTO(BaseModel):
+    id: int
+    user_id: int
+    display_name: str
+    primary_provider: str  # "github" | "google"
+    github_login: str | None = None
+    github_avatar_url: str | None = None
+    google_name: str | None = None
+    google_avatar_url: str | None = None
+    email: str | None = None
+    role: str  # "admin" | "member" | "viewer"
+    joined_at: str  # ISO 8601
+
+
+class _TenantTeamResponse(BaseModel):
+    team: dict  # {id, name}
+    members: list[_TenantTeamMemberDTO]
+    viewer_role: str  # role of the caller; drives UI gating
+
+
+class _UpdateMemberRoleRequest(BaseModel):
+    role: str  # "admin" | "member" | "viewer"
+
+
+def _member_to_dto(m: TeamMember) -> dict:
+    """Serialise a TeamMember row to the tenant-team DTO shape.
+
+    Tolerates Google-only users (no github_login). Picks avatar from the
+    user's primary_provider first, then falls back to the other provider.
+    """
+    u = m.user
+    gh_avatar = u.avatar_url  # historically the GitHub avatar
+    return {
+        "id": m.id,
+        "user_id": u.id,
+        "display_name": u.display_name,
+        "primary_provider": u.primary_provider,
+        "github_login": u.github_login,
+        "github_avatar_url": gh_avatar if u.has_github else None,
+        "google_name": u.google_name,
+        "google_avatar_url": u.google_avatar_url,
+        "email": u.email or u.google_email,
+        "role": m.role,
+        "joined_at": m.joined_at.isoformat(),
+    }
+
+
+@app.get("/team", tags=["teams"])
+async def get_my_team(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the caller's tenant-wide team + members + viewer's role."""
+    tenant = db.query(Tenant).filter(Tenant.id == current_user.tenant_id).first()
+    if not tenant or not tenant.team_id:
+        raise HTTPException(status_code=404, detail="Tenant team not found")
+
+    team = db.query(Team).filter(Team.id == tenant.team_id).first()
+    members = db.query(TeamMember).filter(TeamMember.team_id == tenant.team_id).all()
+    viewer = next((m for m in members if m.user_id == current_user.id), None)
+    if not viewer:
+        # Caller is in the tenant but not yet a team member. Surface as member
+        # with empty perms; admin gating will fail gracefully downstream.
+        viewer_role = "member"
+    else:
+        viewer_role = viewer.role
+
+    return {
+        "team": {"id": team.id, "name": team.name},
+        "members": [_member_to_dto(m) for m in members],
+        "viewer_role": viewer_role,
+    }
+
+
+@app.post("/team/sync-from-github", tags=["teams"])
+async def tenant_sync_from_github(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    admin_member: TeamMember = Depends(require_team_admin),
+    _: None = Depends(reject_preview_writes),
+):
+    """Refresh per-repo collaborators across all connected repos, then merge
+    unique users into the tenant team as role="member" (never admin).
+
+    Phase 1: for each Project in the tenant, call _sync_repo_collaborators.
+    Per-repo errors are captured and continue — one bad repo doesn't abort.
+
+    Phase 2: collect the union of distinct user_ids across all per-repo Teams,
+    then for each user: skip if their User.tenant_id differs (report in
+    cross_tenant_conflicts), no-op if already a tenant-team member, else
+    insert TeamMember with role="member".
+    """
+    if not current_user.github_token_encrypted:
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub access token not found. Please re-authenticate.",
+        )
+
+    try:
+        _gh_token = decrypt_token(current_user.github_token_encrypted)
+    except ValueError:
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub token expired. Please reconnect your GitHub account.",
+        )
+
+    tenant_id = current_user.tenant_id
+    projects = (
+        db.query(Project)
+        .filter(Project.tenant_id == tenant_id)
+        .filter(Project.git_url.isnot(None))
+        .all()
+    )
+
+    # Phase 1: refresh each repo's per-repo team
+    repo_syncs = []
+    for project in projects:
+        try:
+            result = await _sync_repo_collaborators(db, project, current_user, _gh_token)
+            repo_syncs.append({
+                "repo_name": result["github_repo_name"],
+                "synced_count": result["members_count"],
+                "error": None,
+            })
+        except HTTPException as e:
+            repo_syncs.append({
+                "repo_name": project.name or project.git_url or f"project-{project.id}",
+                "synced_count": 0,
+                "error": f"{e.status_code}: {e.detail}",
+            })
+        except Exception as e:
+            logger.exception("Tenant sync: unexpected error for project=%s", project.id)
+            repo_syncs.append({
+                "repo_name": project.name or project.git_url or f"project-{project.id}",
+                "synced_count": 0,
+                "error": f"unexpected: {str(e)[:200]}",
+            })
+
+    db.flush()  # Ensure phase 1 writes are visible to phase 2 queries
+
+    # Phase 2: merge unique users into the tenant team
+    per_repo_team_ids = [
+        p.team_id for p in projects if p.team_id is not None
+    ]
+    tenant_team_id = admin_member.team_id
+
+    already_members = {
+        m.user_id for m in db.query(TeamMember).filter(TeamMember.team_id == tenant_team_id).all()
+    }
+
+    candidate_user_ids = set()
+    if per_repo_team_ids:
+        rows = db.query(TeamMember.user_id).filter(TeamMember.team_id.in_(per_repo_team_ids)).all()
+        candidate_user_ids = {r[0] for r in rows}
+
+    added_count = 0
+    skipped_already_member = 0
+    cross_tenant_conflicts = []
+
+    for uid in candidate_user_ids:
+        if uid in already_members:
+            skipped_already_member += 1
+            continue
+        user = db.query(User).filter(User.id == uid).first()
+        if not user:
+            continue
+        if user.tenant_id != tenant_id:
+            cross_tenant_conflicts.append({
+                "github_login": user.github_login,
+                "display_name": user.display_name,
+                "current_tenant_id": user.tenant_id,
+            })
+            continue
+        db.add(TeamMember(team_id=tenant_team_id, user_id=uid, role="member"))
+        added_count += 1
+
+    db.commit()
+
+    return {
+        "repo_syncs": repo_syncs,
+        "added_count": added_count,
+        "skipped_already_member": skipped_already_member,
+        "cross_tenant_conflicts": cross_tenant_conflicts,
+    }
+
+
+_VALID_ROLES = {"admin", "member", "viewer"}
+
+
+@app.patch("/team/members/{member_id}", tags=["teams"])
+async def update_tenant_team_member_role(
+    member_id: int,
+    body: _UpdateMemberRoleRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    admin_member: TeamMember = Depends(require_team_admin),
+    _: None = Depends(reject_preview_writes),
+):
+    """Change a tenant-team member's role. Admin-only.
+
+    Rejects:
+    - 400: invalid role value
+    - 404: member_id not in caller's tenant team
+    - 409: self-role change (admins can't demote themselves)
+    - 409: demoting the last admin
+    """
+    if body.role not in _VALID_ROLES:
+        raise HTTPException(status_code=400, detail=f"role must be one of {_VALID_ROLES}")
+
+    target = (
+        db.query(TeamMember)
+        .filter(TeamMember.id == member_id, TeamMember.team_id == admin_member.team_id)
+        .first()
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="Team member not found")
+
+    if target.user_id == current_user.id:
+        raise HTTPException(status_code=409, detail="Cannot change your own role")
+
+    if target.role == "admin" and body.role != "admin":
+        admin_count = (
+            db.query(TeamMember)
+            .filter(TeamMember.team_id == admin_member.team_id, TeamMember.role == "admin")
+            .count()
+        )
+        if admin_count <= 1:
+            raise HTTPException(status_code=409, detail="Cannot demote the last admin")
+
+    target.role = body.role
+    db.commit()
+    db.refresh(target)
+    return _member_to_dto(target)
+
+
+@app.delete("/team/members/{member_id}", tags=["teams"])
+async def remove_tenant_team_member(
+    member_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    admin_member: TeamMember = Depends(require_team_admin),
+    _: None = Depends(reject_preview_writes),
+):
+    """Remove a member from the tenant team. Admin-only.
+
+    Only deletes the TeamMember row. User.tenant_id is untouched (the user
+    stays in the tenant, they just no longer appear on the team page).
+
+    Rejects:
+    - 404: member_id not in caller's tenant team
+    - 409: self-removal
+    - 409: removing the last admin
+    """
+    target = (
+        db.query(TeamMember)
+        .filter(TeamMember.id == member_id, TeamMember.team_id == admin_member.team_id)
+        .first()
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="Team member not found")
+
+    if target.user_id == current_user.id:
+        raise HTTPException(status_code=409, detail="Cannot remove yourself")
+
+    if target.role == "admin":
+        admin_count = (
+            db.query(TeamMember)
+            .filter(TeamMember.team_id == admin_member.team_id, TeamMember.role == "admin")
+            .count()
+        )
+        if admin_count <= 1:
+            raise HTTPException(status_code=409, detail="Cannot remove the last admin")
+
+    db.delete(target)
+    db.commit()
+    return Response(status_code=204)
 
 
 @app.get("/github/status", response_model=GitHubStatusResponse, tags=["github"])

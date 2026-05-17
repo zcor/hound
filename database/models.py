@@ -23,6 +23,7 @@ from sqlalchemy import (
     TypeDecorator,
     UniqueConstraint,
     create_engine,
+    event,
     func,
     text,
 )
@@ -110,10 +111,15 @@ class Tenant(Base):
     last_email_sent_at = Column(DateTime, nullable=True)  # throttling for follow-up rules
     email_unsubscribed = Column(Boolean, nullable=False, default=False)
 
+    # Tenant-wide team (v1 team management): one Team per Tenant, auto-created via
+    # @event.listens_for(Tenant, "after_insert") below. Backfill in ensure_schema().
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=True, index=True)
+
     # Relationships
     projects = relationship("Project", back_populates="tenant", cascade="all, delete-orphan")
     scan_executions = relationship("ScanExecution", back_populates="tenant", cascade="all, delete-orphan")
     users = relationship("User", back_populates="tenant", cascade="all, delete-orphan")
+    team = relationship("Team", foreign_keys=[team_id], post_update=True)
 
     def __repr__(self):
         return f"<Tenant(id={self.id}, name='{self.name}', plan='{self.plan}')>"
@@ -245,9 +251,11 @@ class Team(Base):
     __tablename__ = "teams"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(255), nullable=False)  # e.g., "acme-org/api-backend Team"
-    github_repo_id = Column(BigInteger, unique=True, nullable=False, index=True)  # GitHub's repo ID
-    github_repo_name = Column(String(512), nullable=False)  # "acme-org/api-backend"
+    name = Column(String(255), nullable=False)  # e.g., "acme-org/api-backend Team" or "<tenant> Team"
+    # Both nullable: per-repo teams set them; tenant-wide teams leave them NULL.
+    # Postgres allows multiple NULLs under a unique constraint.
+    github_repo_id = Column(BigInteger, unique=True, nullable=True, index=True)  # GitHub's repo ID
+    github_repo_name = Column(String(512), nullable=True)  # "acme-org/api-backend"
     last_synced_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime(timezone=True), nullable=True, onupdate=lambda: datetime.now(timezone.utc))
@@ -284,6 +292,39 @@ class TeamMember(Base):
     
     def __repr__(self):
         return f"<TeamMember(id={self.id}, team_id={self.team_id}, user_id={self.user_id}, role='{self.role}')>"
+
+
+@event.listens_for(Tenant, "after_insert")
+def _create_tenant_team(mapper, connection, target):
+    """Every new Tenant gets an empty Team row.
+
+    Admin membership is attached later by OAuth signup or at first-user login
+    via server/team_bootstrap.py::attach_admin_if_empty().
+
+    Raw connection.execute is the documented pattern for ORM events: nested
+    ORM inserts inside the handler don't participate in the outer unit-of-work
+    correctly.
+
+    Caveat: this writes target.team_id via SQL, which does NOT hydrate the
+    in-memory ORM attribute. Callers who need the team_id right after insert
+    must db.refresh(tenant) or re-query. attach_admin_if_empty() handles this.
+    """
+    if target.team_id is not None:
+        return  # caller set it explicitly, respect that
+    team_name = f"{target.name} Team" if target.name else f"Tenant {target.id} Team"
+    result = connection.execute(
+        Team.__table__.insert().values(
+            name=team_name,
+            github_repo_id=None,
+            github_repo_name=None,
+        )
+    )
+    team_id = result.inserted_primary_key[0]
+    connection.execute(
+        Tenant.__table__.update()
+        .where(Tenant.id == target.id)
+        .values(team_id=team_id)
+    )
 
 
 class Project(Base):
@@ -916,6 +957,53 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_email_sent_at TIMESTAMP WITH TIME ZONE"))
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS email_unsubscribed BOOLEAN NOT NULL DEFAULT FALSE"))
             # sent_emails table (create_all() handles new table creation; no ALTERs needed here unless columns change later)
+
+            # Team management v1 (firepan-5o8): tenant-wide team
+            # Relax per-repo columns so tenant teams can have them NULL
+            conn.execute(text("ALTER TABLE teams ALTER COLUMN github_repo_id DROP NOT NULL"))
+            conn.execute(text("ALTER TABLE teams ALTER COLUMN github_repo_name DROP NOT NULL"))
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS team_id INTEGER REFERENCES teams(id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_tenants_team_id ON tenants(team_id)"))
+
+            # Backfill: every Tenant with team_id IS NULL gets a Team row, and
+            # if the tenant has any users the earliest-joined one becomes admin.
+            # Idempotent via the team_id IS NULL guard.
+            rows = conn.execute(text(
+                "SELECT id, name FROM tenants WHERE team_id IS NULL"
+            )).fetchall()
+            for tenant_id, tenant_name in rows:
+                team_name = (
+                    f"{tenant_name} Team" if tenant_name
+                    else f"Tenant {tenant_id} Team"
+                )
+                team_row = conn.execute(
+                    text(
+                        "INSERT INTO teams (name, github_repo_id, github_repo_name, created_at) "
+                        "VALUES (:n, NULL, NULL, NOW()) RETURNING id"
+                    ),
+                    {"n": team_name},
+                ).fetchone()
+                new_team_id = team_row[0]
+                conn.execute(
+                    text("UPDATE tenants SET team_id = :tid WHERE id = :t"),
+                    {"tid": new_team_id, "t": tenant_id},
+                )
+                first_user = conn.execute(
+                    text(
+                        "SELECT id FROM users WHERE tenant_id = :t "
+                        "ORDER BY created_at ASC LIMIT 1"
+                    ),
+                    {"t": tenant_id},
+                ).fetchone()
+                if first_user:
+                    conn.execute(
+                        text(
+                            "INSERT INTO team_members (team_id, user_id, role, joined_at) "
+                            "VALUES (:team, :user, 'admin', NOW()) "
+                            "ON CONFLICT (team_id, user_id) DO NOTHING"
+                        ),
+                        {"team": new_team_id, "user": first_user[0]},
+                    )
 
 
 def init_database(engine):

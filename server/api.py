@@ -109,7 +109,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///hound.db")
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 # GitHub App configuration
-GITHUB_APP_SLUG = os.environ.get("GITHUB_APP_SLUG", "firepan")
+GITHUB_APP_SLUG = os.environ.get("GITHUB_APP_SLUG", "firepan-ai")
 
 # Rate limiter for auth endpoints
 limiter = Limiter(key_func=get_remote_address)
@@ -4490,6 +4490,45 @@ async def handle_github_webhook(request: Request, db: Session = Depends(get_db))
                         # Race condition: another request created it first
                         tenant = db.query(Tenant).filter(Tenant.installation_id == installation_id).first()
 
+            # firepan-l57m: heal already-connected projects. A repo connected
+            # via the dashboard BEFORE the App was installed has
+            # installation_id=NULL; without this the next scan can't resolve an
+            # installation token (RAAC needed a manual UPDATE). Backfill the
+            # tenant's NULL-installation projects — but CONSTRAINED BY GITHUB
+            # OWNER (full_name "account_login/..."), not tenant alone:
+            # Tenant.installation_id is unique 1:1 (models.py:83), yet a
+            # tenant's Project rows are not owner-scoped, so an unconstrained
+            # backfill could stamp the wrong install onto repos from another
+            # owner. Owner-match prevents that cross-contamination.
+            if tenant is not None and account_login:
+                try:
+                    healed = (
+                        db.query(Project)
+                        .filter(
+                            Project.tenant_id == tenant.id,
+                            Project.installation_id.is_(None),
+                            Project.full_name.ilike(f"{account_login}/%"),
+                        )
+                        .update(
+                            {"installation_id": installation_id},
+                            synchronize_session=False,
+                        )
+                    )
+                    if healed:
+                        db.commit()
+                        logger.info(
+                            "Backfilled installation %s onto %d existing %s/* "
+                            "project(s) for tenant %s (firepan-l57m)",
+                            installation_id, healed, account_login, tenant.id,
+                        )
+                except Exception:
+                    db.rollback()
+                    logger.exception(
+                        "Project installation_id backfill failed for tenant=%s "
+                        "installation=%s",
+                        tenant.id if tenant else None, installation_id,
+                    )
+
             # Send notification (fire-and-forget)
             try:
                 await notify_app_installed(
@@ -5971,6 +6010,28 @@ async def _get_current_user_with_token(
     return user
 
 
+def _try_resolve_user_no_token(request: Request, db: Session) -> User | None:
+    """Resolve the User from the JWT WITHOUT requiring a valid GitHub token.
+
+    firepan-l57m review F1: an authenticated user with a missing/expired
+    GitHub token is the exact silent-bad-path population. _get_current_user_
+    with_token() 401s for them (it requires github_token_encrypted), so we
+    couldn't run the private-repo gate against them. This resolves just the
+    User row so the gate can see github_token_encrypted/has_repo_scope and
+    hard-fail with a guided 403. Returns None only if there is genuinely no
+    valid session user (truly anonymous).
+    """
+    from server.auth_routes import get_token_from_header
+    from server.auth_utils import get_current_user_from_token
+
+    try:
+        token = get_token_from_header(request)
+        payload = get_current_user_from_token(token)
+        return db.query(User).filter(User.id == payload["user_id"]).first()
+    except Exception:
+        return None
+
+
 def _check_private_repo_access(project: Project, user: User):
     """Raise 403 if private repo lacks both installation token and repo-scoped OAuth.
 
@@ -5991,6 +6052,146 @@ def _check_private_repo_access(project: Project, user: User):
             "error": "insufficient_github_scope",
             "message": "Private repo scanning requires additional GitHub permissions or GitHub App installation",
         })
+
+
+async def _resolve_repo_privacy(
+    git_url: str,
+    user: User | None,
+    tenant: Tenant | None,
+    client_is_private: bool,
+) -> bool:
+    """Resolve a repo's true private/public status server-side (firepan-l57m).
+
+    The manual-add path historically omitted `is_private`, so the backend
+    defaulted it to False and the private-repo access gate became a no-op —
+    silently connecting unscannable private repos. This resolves the truth from
+    GitHub instead of trusting the client.
+
+    FAIL-SAFE policy (revised after review of PR #64 — findings F1/F2/F3):
+    the old code returned the permissive client hint whenever it could NOT
+    positively determine privacy (no/expired token, 401, unexpected error),
+    which reopened the original silent-bad-path: an authenticated user with an
+    expired GitHub token could manual-add a private repo as `is_private=False`,
+    skip the gate, and persist it. We now fail SAFE — when we cannot prove the
+    repo is public-and-scannable, resolve to private so the access gate
+    hard-fails (or so the worker uses an installation token).
+
+      - 200 + `.private`                 -> that boolean (authoritative).
+      - GitHub auth failure (401/403)
+        OR httpx 401 not mapped by
+        github_service                   -> private (gate hard-fails / install
+                                            token resolves it).
+      - 404 AND tenant has App install   -> VERIFY with the install token (the
+                                            token that would actually scan it).
+                                            Visible -> its `.private`. Still
+                                            404 -> genuine typo, raise 404
+                                            (no junk row — review F3 hardened).
+      - 404 AND no App install           -> raise 404
+                                            `repo_not_found_or_inaccessible`
+                                            (caller must NOT persist; covers
+                                            typoed manual URLs — review F3).
+      - no user context AT ALL           -> only here do we trust the hint:
+                                            picker / installation paths carry
+                                            their own auth; pure no-user with
+                                            no install is not a real manual-add.
+      - unexpected/transient error       -> private (fail safe), not the hint.
+
+    Returns the resolved `is_private`. Raises HTTPException(404) for the
+    not-found-without-install case so the caller rejects before persistence.
+    """
+    import httpx
+
+    from server.services.github_service import GitHubService, parse_github_url
+
+    tenant_has_install = bool(tenant and tenant.installation_id)
+
+    if user is None:
+        # No authenticated user object at all. Picker / installation-backed
+        # paths carry their own auth and pass a real is_private; trust the
+        # hint here (this is NOT the manual-add-with-expired-token case —
+        # that user IS present, just token-less, handled below as private).
+        return bool(client_is_private)
+
+    if not user.github_token_encrypted:
+        # Authenticated user but no usable GitHub token (expired/revoked).
+        # This is exactly the silent-bad-path from review F1. Fail SAFE:
+        # treat as private so the access gate hard-fails with a guided 403
+        # (unless an App install will resolve it, which the gate also checks).
+        return True
+
+    try:
+        owner, repo = parse_github_url(git_url)
+    except ValueError:
+        # URL shape validated upstream; if we somehow can't parse, fail safe.
+        return True
+
+    try:
+        token = decrypt_token(user.github_token_encrypted)
+        details = await GitHubService(token).get_repo_details(owner, repo)
+        return bool(details.get("private", True))  # absent -> assume private
+    except HTTPException as e:
+        if e.status_code == 404:
+            def _reject_not_found() -> None:
+                raise HTTPException(
+                    status_code=404,
+                    detail={
+                        "error": "repo_not_found_or_inaccessible",
+                        "message": (
+                            "Repository not found, or not accessible with "
+                            "your GitHub account. Check the URL, or install "
+                            "the FirePan GitHub App on the owning "
+                            "organization for private repos."
+                        ),
+                    },
+                )
+
+            if not tenant_has_install:
+                _reject_not_found()
+
+            # Tenant has an App install. The OAuth token's 404 may just mean
+            # "this token can't see a private repo the install token can."
+            # VERIFY with the install token (the token that would actually
+            # scan it) so a genuine typo cannot land a junk project row
+            # (review F3 — makes "no junk row on typo" literally true).
+            try:
+                from integrations.github_auth import get_installation_token
+
+                inst_token = get_installation_token(tenant.installation_id)
+                inst_details = await GitHubService(
+                    inst_token
+                ).get_repo_details(owner, repo)
+                # Install token CAN see it -> real repo. Its .private is
+                # authoritative; the gate passes via installation_id.
+                return bool(inst_details.get("private", True))
+            except HTTPException as ie:
+                if ie.status_code == 404:
+                    # Neither OAuth nor install token can see it -> genuine
+                    # typo / nonexistent. Reject; do NOT persist a junk row.
+                    _reject_not_found()
+                # Install token exists but 401/403 on this repo -> repo is
+                # real but out of the install's scope -> private, gate decides.
+                return True
+            except Exception:
+                # Install-token mint/probe failed transiently. Fail safe:
+                # private (gate / worker re-resolve), not a junk public row.
+                logger.warning(
+                    "Install-token verify failed for %s; failing safe (private)",
+                    git_url,
+                )
+                return True
+        # 401/403 (or anything else github_service mapped): repo exists but
+        # this token can't read it -> private; let the gate hard-fail.
+        return True
+    except httpx.HTTPStatusError:
+        # github_service only maps 404/403 to HTTPException; a 401 reaches
+        # here via raise_for_status (review F2). Fail safe -> private.
+        return True
+    except Exception:
+        logger.warning(
+            "Privacy resolution failed for %s; failing safe (private)",
+            git_url,
+        )
+        return True
 
 
 @app.get("/github/repos", response_model=GitHubRepoListResponse, tags=["github"])
@@ -6286,6 +6487,27 @@ async def create_repository(
         raise HTTPException(status_code=409, detail="Repository already added")
 
     tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+
+    # firepan-l57m: resolve the acting user + true repo privacy BEFORE
+    # persisting, so an inaccessible private repo (or a 404 typo) never
+    # creates a junk project row and never returns a fake "success".
+    #
+    # Review F1: resolve the User object INDEPENDENT of token validity. The
+    # silent-bad-path population is precisely the authenticated user whose
+    # GitHub token is missing/expired — _get_current_user_with_token() 401s
+    # for them, so keying the gate off "did we get an acting_user" let them
+    # skip it. We need the User row (token or not) so the gate can evaluate
+    # has_repo_scope / github_token_encrypted and hard-fail correctly.
+    acting_user: User | None = None
+    try:
+        acting_user = await _get_current_user_with_token(request, db)
+    except HTTPException:
+        acting_user = _try_resolve_user_no_token(request, db)
+
+    resolved_is_private = await _resolve_repo_privacy(
+        body.git_url, acting_user, tenant, body.is_private
+    )  # raises 404 repo_not_found_or_inaccessible -> caller never persists
+
     now = datetime.now(timezone.utc)
     project = Project(
         tenant_id=tenant_id,
@@ -6296,11 +6518,29 @@ async def create_repository(
         installation_id=body.installation_id or (tenant.installation_id if tenant else None),
         default_branch=body.default_branch,
         description=body.description,
-        is_private=body.is_private,
+        is_private=resolved_is_private,
         status="active",
         created_at=now,
         last_accessed=now,
     )
+
+    # Hard-fail BEFORE persistence if this is a private repo we cannot scan.
+    # Returns 403 insufficient_github_scope, which the current dashboard
+    # already surfaces as an error — no silent failure, no junk row.
+    # (firepan-l57m bleed-stop.)
+    #
+    # Review F1: the gate runs whenever the repo resolved private and there
+    # is no installation coverage — NOT only "if we have a user". A private
+    # repo with no acting user and no install is unscannable and must be
+    # rejected, never persisted as a fake success.
+    if project.is_private and not project.installation_id:
+        if acting_user is None:
+            raise HTTPException(403, detail={
+                "error": "insufficient_github_scope",
+                "message": "Private repo scanning requires GitHub authentication or the FirePan GitHub App.",
+            })
+        _check_private_repo_access(project, acting_user)
+
     db.add(project)
     db.commit()
     db.refresh(project)
@@ -6332,18 +6572,16 @@ async def create_repository(
     initial_execution_id = None
     if project.git_url:
         try:
-            github_user_id = None
-            current_user_for_scan = None
-            if not project.installation_id:
-                try:
-                    current_user_for_scan = await _get_current_user_with_token(request, db)
-                    github_user_id = current_user_for_scan.id
-                except HTTPException:
-                    pass
-
-            # Private repo access check — before tier enforcement so no credits consumed
-            if current_user_for_scan:
-                _check_private_repo_access(project, current_user_for_scan)
+            # firepan-l57m: privacy resolution + the private-repo access gate
+            # already ran (and hard-failed with 403) BEFORE persistence above.
+            # Reuse the resolved acting user; this block is now genuinely
+            # fire-and-forget (tier limits / enqueue only) — the bare except
+            # below no longer hides an access failure.
+            github_user_id = (
+                acting_user.id
+                if (acting_user is not None and not project.installation_id)
+                else None
+            )
 
             # Tier enforcement: check plan limits before auto-scanning
             from server.tier_enforcement import _check_sync

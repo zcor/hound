@@ -203,6 +203,23 @@ async def agent_start_audit(
             detail=f"Worker module not available: {exc}. Is Celery configured?",
         )
 
+    # firepan-sewd: gate the Claude SingleAuditor (mode=auditor) for the agent
+    # funnel too. x402 pay-per-call is not a Stripe subscription, so by policy
+    # an agent gets 'sweep' unless its tenant is genuinely-paid or allowlisted.
+    # Keeps Claude spend controlled symmetrically with the SaaS path.
+    effective_mode = body.mode
+    if effective_mode == "auditor":
+        from database.models import Tenant
+        from server.tier_enforcement import claude_audit_allowed
+        _t = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+        if _t is None or not claude_audit_allowed(_t):
+            logger.info(
+                "claude_audit gate: agent tenant=%s not entitled, "
+                "downgrading mode auditor->sweep (firepan-sewd)",
+                tenant_id,
+            )
+            effective_mode = "sweep"
+
     # --- create session ---
     session_id = f"agent_{uuid.uuid4().hex[:12]}_{int(datetime.now().timestamp())}"
 
@@ -227,7 +244,7 @@ async def agent_start_audit(
         repo_name=body.repo_url.rstrip("/").rsplit("/", 1)[-1],
         status="queued",
         started_at=datetime.now(timezone.utc),
-        scan_config={"scan_type": "deep", "mode": body.mode, "source": "agent_api"},
+        scan_config={"scan_type": "deep", "mode": effective_mode, "source": "agent_api"},
     )
     db.add(scan_exec)
     db.commit()
@@ -252,7 +269,7 @@ async def agent_start_audit(
         investigation_prompt=body.investigation_prompt,
         installation_id=body.installation_id,
         time_limit_minutes=body.time_limit_minutes,
-        mode=body.mode,
+        mode=effective_mode,  # firepan-sewd: gated
         plan_n=body.plan_n,
     )
     logger.info("Worker task %s dispatched for agent audit %s", task.id, session_id)

@@ -831,10 +831,14 @@ class TestWorkerZeroHit:
 
 
 class TestDeepAuditModeDefault:
-    """firepan-8l1: paid scan_type=deep must default to Claude SingleAuditor.
-    The DeepSeek 'sweep' pipeline had a 0/13 TP rate (yieldnest scan 77
-    postmortem). A silent revert to default='sweep' re-exposes every paying
-    customer to that failure mode, so guard the default structurally."""
+    """firepan-8l1 + firepan-sewd: the request-model nominal default stays
+    'auditor' (Claude SingleAuditor), but the EFFECTIVE pipeline is gated at
+    the dispatch chokepoint by claude_audit_allowed(): only genuinely-Stripe-
+    paid tenants or explicitly-allowlisted tenants reach Claude; everyone else
+    (incl. auto-trial) is downgraded to DeepSeek 'sweep'. The request-model
+    default is intentionally still 'auditor' so the gate, not the schema, is
+    the single policy authority — these two asserts guard against a silent
+    schema-level revert; the gate tests below guard the policy itself."""
 
     def test_audit_start_request_defaults_to_auditor(self):
         from server.api import AuditStartRequest
@@ -845,3 +849,54 @@ class TestDeepAuditModeDefault:
         from server.agent_routes import AgentAuditRequest
 
         assert AgentAuditRequest.model_fields["mode"].default == "auditor"
+
+
+class TestClaudeAuditEntitlementGate:
+    """firepan-sewd: claude_audit_allowed() — Claude deep-audit entitlement.
+    Policy: genuinely-Stripe-paid (NOT auto-trial) OR explicit allowlist flag.
+    Guards against the expensive-Claude-for-everyone regression."""
+
+    def _tenant(self, **kw):
+        # Lightweight stand-in: claude_audit_allowed() only reads attributes
+        # (getattr), so a plain object is a cleaner unit boundary than the
+        # SQLAlchemy-instrumented ORM class (whose __new__ skips init state).
+        from types import SimpleNamespace
+
+        defaults = dict(
+            stripe_subscription_id=None,
+            plan="free",
+            trial_ends_at=None,
+            trial_plan=None,
+            claude_audit_enabled=False,
+        )
+        defaults.update(kw)
+        return SimpleNamespace(**defaults)
+
+    def test_free_tenant_denied(self):
+        from server.tier_enforcement import claude_audit_allowed
+
+        assert claude_audit_allowed(self._tenant()) is False
+
+    def test_auto_trial_tenant_denied(self):
+        # The auto-14-day-starter-trial must NOT grant Claude (no grandfathering).
+        from datetime import datetime, timedelta, timezone
+
+        from server.tier_enforcement import claude_audit_allowed
+
+        t = self._tenant(
+            trial_plan="starter",
+            trial_ends_at=datetime.now(timezone.utc) + timedelta(days=10),
+        )
+        assert claude_audit_allowed(t) is False
+
+    def test_genuinely_stripe_paid_allowed(self):
+        from server.tier_enforcement import claude_audit_allowed
+
+        t = self._tenant(stripe_subscription_id="sub_real", plan="professional")
+        assert claude_audit_allowed(t) is True
+
+    def test_explicit_allowlist_flag_allowed(self):
+        # The RAAC mechanism: free/unpaid tenant explicitly provisioned.
+        from server.tier_enforcement import claude_audit_allowed
+
+        assert claude_audit_allowed(self._tenant(claude_audit_enabled=True)) is True

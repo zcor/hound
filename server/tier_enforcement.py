@@ -55,6 +55,31 @@ def has_paid_subscription(tenant: Tenant) -> bool:
     if tenant.stripe_subscription_id and tenant.plan not in (None, "free"):
         return True
     return is_trial_active(tenant)
+
+
+def is_genuinely_paid(tenant: Tenant) -> bool:
+    """True ONLY for a real Stripe-paid subscription — NOT auto-trials.
+
+    Distinct from has_paid_subscription(), which counts active trials. The
+    auto-14-day-starter-trial granted on every signup makes has_paid_subscription
+    True for ~every fresh tenant; this excludes that so trial users do NOT get
+    the (expensive) Claude SingleAuditor pipeline. See firepan-sewd.
+    """
+    return bool(tenant.stripe_subscription_id) and tenant.plan not in (None, "free")
+
+
+def claude_audit_allowed(tenant: Tenant) -> bool:
+    """Entitlement gate for the Claude SingleAuditor (mode=auditor) pipeline.
+
+    Policy (firepan-sewd, Gerrit 2026-05-19): Claude deep audits are gated to
+    genuinely-Stripe-paid tenants OR an explicit per-tenant allowlist flag.
+    Auto-trial tenants are NOT grandfathered in. Everyone else is downgraded
+    to the DeepSeek 'sweep' pipeline at the dispatch chokepoint. The admin
+    force-run path bypasses this entirely (explicit-provision mechanism).
+    """
+    if getattr(tenant, "claude_audit_enabled", False):
+        return True
+    return is_genuinely_paid(tenant)
 def _load_plans() -> dict:
     """Load plan config from stripe_plans.json."""
     config_path = Path(__file__).parent.parent / "config" / "stripe_plans.json"

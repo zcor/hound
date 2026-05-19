@@ -3208,8 +3208,24 @@ async def start_audit(
                 )
             _check_private_repo_access(project, audit_user)
 
-    from server.tier_enforcement import has_paid_subscription
+    from server.tier_enforcement import claude_audit_allowed, has_paid_subscription
     has_saas_sub = has_paid_subscription(tenant)
+
+    # firepan-sewd: Claude SingleAuditor (mode=auditor) is gated to genuinely
+    # Stripe-paid tenants or an explicit per-tenant allowlist flag. Auto-trial
+    # tenants are NOT grandfathered in. Any other tenant requesting auditor is
+    # downgraded to the DeepSeek 'sweep' pipeline here, at the single dispatch
+    # chokepoint (request-model default stays 'auditor'; policy enforced with
+    # the tenant in hand). Admin force-run is a separate handler and bypasses
+    # this by design (explicit-provision mechanism).
+    effective_mode = request_body.mode
+    if effective_mode == "auditor" and not claude_audit_allowed(tenant):
+        logger.info(
+            "claude_audit gate: tenant=%s not entitled, downgrading mode "
+            "auditor->sweep (firepan-sewd)",
+            tenant_id,
+        )
+        effective_mode = "sweep"
 
     gate = PaymentGate(enabled=False, status="disabled")
 
@@ -3314,7 +3330,7 @@ async def start_audit(
 
         scan_config_dict: dict = {
             "scan_type": "deep",
-            "mode": request_body.mode,
+            "mode": effective_mode,  # firepan-sewd: gated (auditor->sweep if not entitled)
             "branch": resolved_audit_branch,
         }
         if scoped_target_files:
@@ -3366,7 +3382,7 @@ async def start_audit(
         pr_number=request_body.pr_number,
         repo_full_name=request_body.repo_full_name,
         time_limit_minutes=request_body.time_limit_minutes,
-        mode=request_body.mode,
+        mode=effective_mode,  # firepan-sewd: gated
         plan_n=request_body.plan_n,
         branch=resolved_audit_branch,
         target_files=scoped_target_files,
@@ -3381,7 +3397,7 @@ async def start_audit(
             session_id=session_id,
             tenant_id=tenant.id,
             project_name=project.name if project else None,
-            mode=request_body.mode,
+            mode=effective_mode,  # firepan-sewd: gated
         )
     except Exception:
         pass  # non-critical

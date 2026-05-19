@@ -98,6 +98,11 @@ class Tenant(Base):
     scan_credits = Column(Integer, nullable=False, default=0)  # Credit tranche top-ups
     trial_ends_at = Column(DateTime, nullable=True)
     trial_plan = Column(String(50), nullable=True)
+    # firepan-sewd: explicit per-tenant entitlement for the Claude SingleAuditor
+    # (mode=auditor) pipeline. Default False — only genuinely-Stripe-paid tenants
+    # (NOT auto-trials) or tenants with this flag set get Claude deep audits;
+    # everyone else is downgraded to DeepSeek 'sweep'. See claude_audit_allowed().
+    claude_audit_enabled = Column(Boolean, nullable=False, default=False)
 
     # Email verification gate
     email_verified = Column(Boolean, nullable=False, default=False)
@@ -956,6 +961,8 @@ def ensure_schema(engine):
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMP WITH TIME ZONE"))
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_email_sent_at TIMESTAMP WITH TIME ZONE"))
             conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS email_unsubscribed BOOLEAN NOT NULL DEFAULT FALSE"))
+            # firepan-sewd: per-tenant Claude SingleAuditor entitlement flag
+            conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS claude_audit_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
             # sent_emails table (create_all() handles new table creation; no ALTERs needed here unless columns change later)
 
             # Team management v1 (firepan-5o8): tenant-wide team

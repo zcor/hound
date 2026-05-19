@@ -221,7 +221,7 @@ def execute_audit_task(
     pr_number: int | None = None,
     repo_full_name: str | None = None,
     time_limit_minutes: int = 120,
-    mode: str = "auditor",  # firepan-8l1: default flipped from "sweep" (DeepSeek, 0/13 TP) to Claude SingleAuditor
+    mode: str = "sweep",  # firepan-sewd: worker default REVERTED 8l1's auditor->sweep. Callers pass mode explicitly (api/agent gate it; admin force-run sets auditor explicitly). A bare/redelivered task must NOT silently run expensive Claude — defense-in-depth, not the routing decision.
     plan_n: int = 5,
     branch: str | None = None,
     target_files: list[str] | None = None,

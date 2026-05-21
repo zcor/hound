@@ -289,6 +289,8 @@ async def notify_deep_audit_started(
     tenant_id: int | None = None,
     project_name: str | None = None,
     mode: str | None = None,
+    requested_mode: str | None = None,
+    mode_downgrade_reason: str | None = None,
 ) -> bool:
     """
     Send notification when a deep audit is started/queued.
@@ -298,7 +300,13 @@ async def notify_deep_audit_started(
         session_id: Audit session ID
         tenant_id: Tenant ID that initiated the audit
         project_name: Human-readable project name (optional)
-        mode: Audit mode (e.g., "sweep", "targeted")
+        mode: Effective audit mode that will actually run (e.g., "sweep", "auditor")
+        requested_mode: Mode requested by the caller before gate enforcement.
+            When this differs from ``mode``, a visible downgrade warning is rendered.
+        mode_downgrade_reason: If set, identifies why the requested mode was
+            downgraded (e.g. ``"claude_audit_not_entitled"`` for the
+            firepan-sewd gate). Surfaced into the notification so operators
+            see at a glance that the run is not the requested pipeline.
 
     Returns:
         True if notification was sent successfully
@@ -318,6 +326,17 @@ async def notify_deep_audit_started(
 
     if mode:
         message_parts.append(f"⚙️ <b>Mode:</b> {_escape_html(mode)}")
+
+    # firepan-sewd observability: render a visible warning when the dispatch
+    # gate downgraded the requested mode. Without this, operators see only
+    # the (downgraded) effective mode and can't tell from the notification
+    # that the run isn't the pipeline the user asked for.
+    if requested_mode and mode and requested_mode != mode:
+        reason = mode_downgrade_reason or "gate_downgrade"
+        message_parts.append(
+            f"⚠️ <b>Mode downgraded:</b> {_escape_html(requested_mode)} → "
+            f"{_escape_html(mode)} ({_escape_html(reason)})"
+        )
 
     if tenant_id is not None:
         message_parts.append(f"🆔 <b>Tenant ID:</b> {tenant_id}")

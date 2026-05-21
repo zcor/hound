@@ -3117,11 +3117,31 @@ class AuditStartRequest(BaseModel):
 
 class AuditStartResponse(BaseModel):
     """Response model after starting an audit."""
-    
+
     session_id: str = Field(..., description="Unique session ID for tracking")
     status: str = Field(default="queued", description="Current status")
     message: str = Field(..., description="Human-readable status message")
     websocket_url: str = Field(..., description="WebSocket URL for live progress")
+    # firepan-sewd observability: surface the gate's mode decision so callers
+    # can tell when their requested mode was silently downgraded (e.g.
+    # auditor -> sweep for non-entitled tenants). All three are optional —
+    # they're None on the early "already_processed" path where the gate
+    # doesn't run, and otherwise reflect the request/gate outcome.
+    requested_mode: str | None = Field(
+        default=None,
+        description="Mode requested by the caller (pre-gate)",
+    )
+    effective_mode: str | None = Field(
+        default=None,
+        description="Mode that will actually run after gate enforcement",
+    )
+    mode_downgrade_reason: str | None = Field(
+        default=None,
+        description=(
+            "If set, identifies why effective_mode differs from requested_mode "
+            "(e.g. 'claude_audit_not_entitled' for the firepan-sewd gate)."
+        ),
+    )
 
 
 class AuditStatusResponse(BaseModel):
@@ -3219,6 +3239,7 @@ async def start_audit(
     # the tenant in hand). Admin force-run is a separate handler and bypasses
     # this by design (explicit-provision mechanism).
     effective_mode = request_body.mode
+    mode_downgrade_reason: str | None = None
     if effective_mode == "auditor" and not claude_audit_allowed(tenant):
         logger.info(
             "claude_audit gate: tenant=%s not entitled, downgrading mode "
@@ -3226,6 +3247,7 @@ async def start_audit(
             tenant_id,
         )
         effective_mode = "sweep"
+        mode_downgrade_reason = "claude_audit_not_entitled"
 
     gate = PaymentGate(enabled=False, status="disabled")
 
@@ -3398,6 +3420,8 @@ async def start_audit(
             tenant_id=tenant.id,
             project_name=project.name if project else None,
             mode=effective_mode,  # firepan-sewd: gated
+            requested_mode=request_body.mode,
+            mode_downgrade_reason=mode_downgrade_reason,
         )
     except Exception:
         pass  # non-critical
@@ -3407,6 +3431,9 @@ async def start_audit(
         status="queued",
         message=f"Audit queued successfully. Task ID: {task.id}",
         websocket_url=f"/ws/sessions/{session_id}",
+        requested_mode=request_body.mode,
+        effective_mode=effective_mode,
+        mode_downgrade_reason=mode_downgrade_reason,
     )
 
 

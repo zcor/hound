@@ -171,6 +171,60 @@ _TRUST_PATTERNS = [
     r"\brequires?\s+owner\s+(access|privilege|action)",
     r"\b(only|requires?)\s+the\s+owner\b",
     r"\bset(?:s|table)?\s+by\s+(?:the\s+)?owner\b",
+    # firepan-rule4 strategy-via-owner pattern — strategy contract is set by
+    # onlyOwner so "malicious strategy" still requires owner action. The v4
+    # RAAC audit's #3 (Strategy Balance Tracking) slipped past the trust rule
+    # because the evidence said "strategy contract can …" without mentioning
+    # onlyOwner; this catches that framing.
+    r"\b(malicious|rogue|compromised)\s+strategy\s+(contract|address)\b",
+    r"\bstrategy\s+contract\s+(can|could)\s+(manipulate|drain|transfer)\b",
+    # firepan-rule4 function-name patterns — direct mention of an
+    # onlyOwner/onlyStrategy-gated function is sufficient evidence of an
+    # admin-trust surface. Any finding that says "the transferToStrategy
+    # function does X" is implicitly about a function that requires the
+    # strategy address, which is owner-set. v4's Strategy Balance Tracking
+    # finding said exactly this and the curator missed it.
+    r"\btransferToStrategy\b",
+    r"\bnotifyStrategyProfit\b",
+    r"\bupdateStrategy\b",
+    r"\bupdatePriceOracle\b",
+    r"\bupdateRateProvider\b",
+    r"\bupdateBaseTokenCap\b",
+    r"\bupdateEMASampleInterval\b",
+]
+
+
+# Rule 4 — fail-safe revert / unreachable-degenerate-state patterns. When a
+# finding describes a math revert on a degenerate input (divide by zero,
+# overflow on extreme value, etc.) without proving the degenerate state is
+# reachable from a public entry point, the most likely truth is that an
+# upstream guard short-circuits before the bad arithmetic line. Examples
+# from RAAC v4 post-mortem:
+#   - "div-by-zero when baseSupply==0" → Treasury.mint branches before calling
+#     the math; the divisor is never zero on the reachable path
+#   - "div-by-zero when NAV==0" → the math sits inside `if (_baseVal > _fVal)`
+#     which proves the divisor is non-zero on that branch, AND the deployed
+#     oracle reverts on degenerate readings, making the bad state unreachable
+#     at runtime regardless
+# These look like real bugs in isolation. They are not vulnerabilities. The
+# curator conservatively flags this class for human review by floor-dropping
+# severity two levels (Critical → Medium, High → Low, Medium → Informational).
+_FAIL_SAFE_PATTERNS = [
+    # explicit divide-by-zero phrasing
+    r"\bdivision\s+by\s+zero\b",
+    r"\bdiv(?:ide|ides|iding)?\s+by\s+zero\b",
+    r"\bdiv(?:ides|iding)?\s+by\s+[a-z_]+\s+(?:when|if)\b.{0,40}\bzero\b",
+    r"\b(?:zero|empty)\s+(?:supply|balance|value|nav)\s+(?:causes?|triggers?|allows?)\s+(?:dos|revert|panic|underflow|overflow)\b",
+    # "X is zero" framing
+    r"\bwhen\s+[a-z_]+\s+(?:is|==|equals|equal\s+to)\s+zero\b",
+    r"\b(?:nav|supply|balance|value|amount|price)\s+(?:values?\s+)?(?:are|is)\s+zero\b",
+    # generic DoS-via-revert phrasing
+    r"\b(?:dos|denial[-\s]of[-\s]service)\s+(?:via|when|through)\s+(?:zero|empty|extreme|max|overflow|underflow)\b",
+    # overflow/underflow on extreme value
+    r"\b(?:arithmetic\s+)?overflow\s+(?:via|when)\s+extreme\s+(?:value|input)\b",
+    r"\bunderflow\s+(?:via|when|due\s+to)\b",
+    # explicit "reverts on" framings
+    r"\breverts?\s+(?:on|when)\s+(?:zero|empty|degenerate)\b",
 ]
 
 
@@ -257,7 +311,46 @@ def curate_one(hypothesis: dict[str, Any], ctx: AuditContext) -> CurationResult:
                    f"role is in trusted_roles per audit_context",
         )
 
+    # Rule 4 — fail-safe revert / unreachable-degenerate-state. When a finding
+    # describes a revert on a degenerate input (zero divisor, max overflow,
+    # empty supply, etc.) the auditor often hasn't proved the bad state is
+    # reachable from a public entry point. The most common truth is that an
+    # upstream guard short-circuits before the bad math runs — see RAAC v4
+    # post-mortem for three examples. Conservative response: floor-drop two
+    # severity levels and require the verifier (mode='verify') or a human
+    # reviewer to prove reachability before this can ship at original severity.
+    if _fail_safe_revert_match(_flatten_evidence(hypothesis)):
+        # Two-level floor: Critical → Medium, High → Low, Medium → Informational
+        floor_map = {
+            "critical": "medium",
+            "high": "low",
+            "medium": "informational",
+            "low": "informational",
+        }
+        new_sev = floor_map.get(orig_sev, orig_sev)
+        if _SEV_RANK.get(new_sev, 5) < _SEV_RANK.get(orig_sev, 5):
+            return CurationResult(
+                hid, orig_sev, new_sev, label="potential_fail_safe",
+                reason=(
+                    "auditor flagged a revert-on-degenerate-input without "
+                    "proving the degenerate state is reachable from a public "
+                    "entry point. Reachability must be demonstrated (caller "
+                    "trace OR Phase-4 bump pass) before this can ship at "
+                    f"{orig_sev.upper()}. See firepan-rule4."
+                ),
+            )
+
     return CurationResult(hid, orig_sev, orig_sev)
+
+
+def _fail_safe_revert_match(evidence_text: str) -> bool:
+    """Return True if the finding's text matches a fail-safe-revert pattern."""
+    if not evidence_text:
+        return False
+    for pat in _FAIL_SAFE_PATTERNS:
+        if re.search(pat, evidence_text, re.IGNORECASE):
+            return True
+    return False
 
 
 def curate_all(

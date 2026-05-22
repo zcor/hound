@@ -62,6 +62,11 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # firepan-vff: Claude Code subscription token. When set, the `claude` CLI
+      # invoked by SingleAuditor reads this instead of ANTHROPIC_API_KEY, so
+      # auditor runs bill against the Claude Max subscription (not API). Mint
+      # via `claude setup-token` on a host with an active Max login.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       XAI_API_KEY: ${XAI_API_KEY:-}
@@ -142,6 +147,11 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # firepan-vff: Claude Code subscription token. When set, the `claude` CLI
+      # invoked by SingleAuditor reads this instead of ANTHROPIC_API_KEY, so
+      # auditor runs bill against the Claude Max subscription (not API). Mint
+      # via `claude setup-token` on a host with an active Max login.
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       XAI_API_KEY: ${XAI_API_KEY:-}

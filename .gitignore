@@ -28,3 +28,4 @@ frontend/.next
 frontend/out
 frontend/.env*.local
 
+hypotheses/

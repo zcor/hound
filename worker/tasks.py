@@ -198,6 +198,14 @@ class AuditTask(Task):
                     session.status = status
                     if status in ("completed", "in_review"):
                         session.end_time = datetime.now(timezone.utc)
+                    # firepan-bug-sweep: propagate matching extra_fields to
+                    # AuditSession too. Previously only ScanExecution got
+                    # extra_fields applied via setattr — so anything stored on
+                    # AuditSession columns (e.g. `coverage` for chunk-progress
+                    # records) was silently lost on the way out.
+                    for key, value in extra_fields.items():
+                        if hasattr(session, key):
+                            setattr(session, key, value)
 
                 db.commit()
             finally:
@@ -393,15 +401,42 @@ def execute_audit_task(
                     )
                 raise RuntimeError(f"Git clone failed: {stderr}")
         else:
-            repo_path = Path(repo_url).expanduser().resolve()
+            # firepan-bug-sweep: strip a `file://` scheme before Path(). Without
+            # this, Path("file:///audits/foo") is interpreted as a relative
+            # path starting with "file:" and the exists() check trivially fails.
+            local_path_str = repo_url
+            if local_path_str.startswith("file://"):
+                local_path_str = local_path_str[len("file://"):]
+                if not local_path_str.startswith("/"):
+                    local_path_str = "/" + local_path_str
+            repo_path = Path(local_path_str).expanduser().resolve()
             if not repo_path.exists():
                 raise FileNotFoundError(f"Repository path not found: {repo_url}")
-        
+
         # Step 2: Create project structure
         publisher.publish_thought("Setting up project structure...", iteration=0)
-        
-        project_dir = Path(temp_dir or repo_path.parent) / f".hound_project_{scan_id}"
-        project_dir.mkdir(parents=True, exist_ok=True)
+
+        # firepan-bug-sweep: tolerate read-only source mounts. The default
+        # location is `repo_path.parent / .hound_project_<scan_id>` so artifacts
+        # live next to the source — but for a bind-mounted local-audit source
+        # (DATA box: /audits/<repo>, sometimes mounted :ro) that fails with
+        # `OSError: Read-only file system`. Fall back to a writable scratch
+        # directory under tempfile.gettempdir() in that case.
+        project_parent = Path(temp_dir or repo_path.parent)
+        project_dir = project_parent / f".hound_project_{scan_id}"
+        try:
+            project_dir.mkdir(parents=True, exist_ok=True)
+        except (OSError, PermissionError) as e:
+            import tempfile as _tempfile
+            fallback_root = Path(_tempfile.gettempdir()) / "hound_scratch"
+            fallback_root.mkdir(parents=True, exist_ok=True)
+            project_dir = fallback_root / f".hound_project_{scan_id}"
+            project_dir.mkdir(parents=True, exist_ok=True)
+            publisher.publish_thought(
+                f"Read-only source mount detected ({e}); using scratch dir "
+                f"{project_dir}",
+                iteration=0,
+            )
         
         graphs_dir = project_dir / "graphs"
         manifest_dir = project_dir / "manifest"
@@ -669,7 +704,24 @@ def execute_audit_task(
             # human curation pass; this is the automated equivalent.
             try:
                 from analysis.audit_curator import AuditContext, curate_all, apply_curation
-                audit_ctx_dict = (scan_config_dict or {}).get("audit_context")
+                # Re-fetch scan_config from the DB — the dispatch-time dict isn't
+                # in this scope, and audit_context is the source of truth there.
+                _audit_ctx_dict = None
+                try:
+                    from database.models import (
+                        ScanExecution as _SE,
+                        create_db_engine as _cde,
+                        create_db_session as _cds,
+                    )
+                    _e = _cde(os.environ.get("DATABASE_URL", "sqlite:///hound.db"))
+                    _d = _cds(_e)
+                    _se = _d.query(_SE).filter(_SE.execution_id == scan_id).first()
+                    if _se and _se.scan_config and isinstance(_se.scan_config, dict):
+                        _audit_ctx_dict = _se.scan_config.get("audit_context")
+                    _d.close()
+                except Exception as _fetch_err:
+                    print(f"[curator] could not fetch scan_config: {_fetch_err}")
+                audit_ctx_dict = _audit_ctx_dict
                 if audit_ctx_dict:
                     ctx = AuditContext.from_dict(audit_ctx_dict)
                     curation_results = curate_all(all_hypotheses, ctx)
@@ -694,10 +746,63 @@ def execute_audit_task(
                         f"trusted_roles={len(ctx.trusted_roles)})",
                         iteration=total_iterations,
                     )
+                    # firepan-bug-sweep: record curator state on AuditSession so
+                    # /audits/{session_id}/status can show the audit is curated
+                    # (and consumers can decide whether to block export until
+                    # this is true for engagements that ship under audit_context).
+                    try:
+                        from database.models import (
+                            AuditSession as _AS,
+                            create_db_engine as _cde2,
+                            create_db_session as _cds2,
+                        )
+                        _e2 = _cde2(os.environ.get("DATABASE_URL", "sqlite:///hound.db"))
+                        _d2 = _cds2(_e2)
+                        _sess = _d2.query(_AS).filter(_AS.session_id == scan_id).first()
+                        if _sess:
+                            meta = dict(_sess.session_metadata or {})
+                            meta["curator"] = {
+                                "applied": True,
+                                "applied_at": datetime.now(timezone.utc).isoformat(),
+                                "summary": summary,
+                                "context_size": {
+                                    "scope_files": len(ctx.scope_files),
+                                    "dead_code_paths": len(ctx.dead_code_paths),
+                                    "trusted_roles": len(ctx.trusted_roles),
+                                },
+                            }
+                            _sess.session_metadata = meta
+                            _d2.commit()
+                        _d2.close()
+                    except Exception as _state_err:
+                        print(f"[curator] could not record state: {_state_err}")
             except Exception as e:  # noqa: BLE001
                 # Curation is best-effort. Failure must NOT block report delivery
-                # — log and continue with raw findings.
+                # — log and continue with raw findings. Record the failure on
+                # the session so /audits/{id}/status surfaces curator_applied=false
+                # and the dashboard can warn before client-export.
                 print(f"[curator] non-fatal failure: {e}")
+                try:
+                    from database.models import (
+                        AuditSession as _AS,
+                        create_db_engine as _cde3,
+                        create_db_session as _cds3,
+                    )
+                    _e3 = _cde3(os.environ.get("DATABASE_URL", "sqlite:///hound.db"))
+                    _d3 = _cds3(_e3)
+                    _sess = _d3.query(_AS).filter(_AS.session_id == scan_id).first()
+                    if _sess:
+                        meta = dict(_sess.session_metadata or {})
+                        meta["curator"] = {
+                            "applied": False,
+                            "error": f"{type(e).__name__}: {e}",
+                            "attempted_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        _sess.session_metadata = meta
+                        _d3.commit()
+                    _d3.close()
+                except Exception:
+                    pass
 
             # Persist on-disk HypothesisStore JSON under a stable path so eval
             # can read auditor-only properties (numeric_gap_measurement et al)
@@ -990,12 +1095,28 @@ def execute_audit_task(
             hypotheses = _semantic_dedup_hypotheses(hypotheses, audit_config)
 
         # Step D: Severity re-ranking (LLM)
-        if audit_config.get("deep_audit_severity_rerank", True) and hypotheses:
+        # firepan-bug-sweep: skip the re-rank when firepan-curator is going to
+        # run. The curator's scope / dead-code / trust-boundary rules are the
+        # authoritative source for severity in those engagements — letting the
+        # re-rank LLM bump everything to high right before the curator floors
+        # them is wasted tokens AND can silently inflate severities the curator
+        # was going to cap. When audit_context.scope_files is present, the
+        # auditor's own six-gate-review severity stands.
+        _curator_owns_severity = bool(
+            (locals().get("audit_ctx_dict") or {}).get("scope_files")
+        )
+        if audit_config.get("deep_audit_severity_rerank", True) and hypotheses and not _curator_owns_severity:
             publisher.publish_thought(
                 f"Re-ranking severity for {len(hypotheses)} findings...",
                 iteration=total_iterations,
             )
             hypotheses = _rerank_severities(hypotheses, audit_config)
+        elif _curator_owns_severity:
+            publisher.publish_thought(
+                "Severity re-rank skipped — audit_context.scope_files is set, "
+                "firepan-curator is authoritative for severity.",
+                iteration=total_iterations,
+            )
 
         # Step E: Severity fallback — if >80% uniform with >10 findings, demote low-confidence
         if len(hypotheses) > 10:
@@ -1196,6 +1317,31 @@ def execute_audit_task(
         )
         if overview:
             update_fields["deep_audit_overview"] = overview
+
+        # firepan-bug-sweep: persist chunk-coverage so /audits/{id}/status can
+        # surface chunks_processed / chunks_total and the report writer can
+        # render a "67% coverage" badge when the budget hit before every
+        # chunk ran. Without this, a partial run looks identical to a complete
+        # one on the dashboard.
+        try:
+            _coverage_record = {
+                "chunks_processed": int(locals().get("total_iterations") or 0),
+                "chunks_total": int(
+                    getattr(locals().get("audit_result"), "chunks_total", 0) or 0
+                ),
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            # Compute fraction for downstream consumers that prefer a number
+            if _coverage_record["chunks_total"] > 0:
+                _coverage_record["coverage_ratio"] = round(
+                    _coverage_record["chunks_processed"]
+                    / _coverage_record["chunks_total"],
+                    4,
+                )
+            update_fields["coverage"] = _coverage_record
+        except Exception:
+            # Coverage is observability; never block the in_review transition.
+            pass
 
         self._update_scan_status(scan_id, "in_review", **update_fields)
 
@@ -1605,7 +1751,13 @@ def _store_hypotheses_in_db(
                     status=hyp.get("status", "proposed"),
                     confidence=float(hyp.get("confidence", 0.5)),
                     severity=hyp.get("severity", "medium"),
-                    node_refs=hyp.get("node_ids", []),
+                    # firepan-bug-sweep: prefer node_refs (the auditor's
+                    # canonical key on the on-disk HypothesisStore); fall back
+                    # to node_ids for legacy producers. Old code only read
+                    # node_ids, so DB rows lost their file:line location on
+                    # every audit — that's why post-hoc curation against the
+                    # DB needed the on-disk JSON for scope-enforcement.
+                    node_refs=hyp.get("node_refs") or hyp.get("node_ids") or [],
                     evidence={"items": hyp.get("evidence", [])},
                     reported_by_model=(
                         hyp.get("reported_by_model")
@@ -3277,12 +3429,24 @@ def run_lifecycle_tick_task():
             # duplicate/pending/failed cases; the tick just avoids pointless calls.
             return existing is not None
 
+        def _as_utc(dt):
+            """firepan-bug-sweep: coerce a stamp to tz-aware UTC for arithmetic
+            against `now` (which is tz-aware). Postgres TIMESTAMP WITHOUT TIME
+            ZONE comes back naive on some driver/version combos; treat naive
+            stamps as UTC since that's what we wrote on the way in."""
+            if dt is None:
+                return None
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt
+
         dispatched = 0
         for tenant in tenants:
             # Rule 1: GETTING_STARTED — 1h after email_verified_at
             try:
-                if tenant.email_verified_at:
-                    elapsed = now - tenant.email_verified_at
+                evd = _as_utc(tenant.email_verified_at)
+                if evd:
+                    elapsed = now - evd
                     if elapsed >= timedelta(hours=1):
                         dedup = EmailCode.GETTING_STARTED.value
                         if not _already_sent_or_pending(tenant.id, EmailCode.GETTING_STARTED.value, dedup):
@@ -3298,8 +3462,9 @@ def run_lifecycle_tick_task():
 
             # Rule 2: FIRST_SCAN_CELEBRATION — 30min after first_scan_at, and only if deep audit hasn't run yet
             try:
-                if tenant.first_scan_at and not tenant.first_deep_audit_at:
-                    elapsed = now - tenant.first_scan_at
+                fsa = _as_utc(tenant.first_scan_at)
+                if fsa and not tenant.first_deep_audit_at:
+                    elapsed = now - fsa
                     if elapsed >= timedelta(minutes=30):
                         dedup = EmailCode.FIRST_SCAN_CELEBRATION.value
                         if not _already_sent_or_pending(tenant.id, EmailCode.FIRST_SCAN_CELEBRATION.value, dedup):

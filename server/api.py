@@ -9592,6 +9592,19 @@ class AdminAuditForceRunRequest(BaseModel):
         ),
         max_length=50,
     )
+    audit_context: dict | None = Field(
+        default=None,
+        description=(
+            "Per-engagement curation context (firepan-curator). Threaded through "
+            "to the worker's post-auditor curation pass via scan_config['audit_context']. "
+            "Keys: scope_files (list[str], hard-enforced — findings outside are relabeled "
+            "out_of_scope), dead_code_paths (list[{file, function}]), trusted_roles "
+            "(list[str] like ['onlyOwner', 'onlyStrategy']; trust-boundary heuristic "
+            "downgrades findings whose exploitation requires only a trusted role), "
+            "deployed_contracts (dict[name, address] — chain-of-custody only), and "
+            "out_of_scope_action ('downgrade' or 'drop')."
+        ),
+    )
 
 
 @app.post("/admin/audits/force-run", response_model=AuditStartResponse)
@@ -9707,6 +9720,10 @@ async def admin_force_run_audit(
     }
     if scoped_target_files:
         scan_config_dict["target_files"] = scoped_target_files
+    # firepan-curator: thread the curator context to the worker. The worker
+    # reads it from scan_config["audit_context"] after the auditor returns.
+    if payload.audit_context:
+        scan_config_dict["audit_context"] = payload.audit_context
 
     deep_scan = ScanExecutionModel(
         execution_id=session_id,

@@ -660,6 +660,45 @@ def execute_audit_task(
             agent = auditor  # firepan-apn: provides get_symbol_gate_stats()
             symbol_gate_provider = auditor
 
+            # firepan-curator: post-auditor scope / dead-code / trust-boundary
+            # curation. Driven by `audit_context` in scan_config_dict. Without
+            # this, Claude follows cross-refs into v2 / out-of-scope helper
+            # contracts and produces high-severity findings against admin-trust
+            # surfaces and client-confirmed-dead code paths. See RAAC 2026-05-22
+            # post-mortem. The previous engagement caught this with a manual
+            # human curation pass; this is the automated equivalent.
+            try:
+                from analysis.audit_curator import AuditContext, curate_all, apply_curation
+                audit_ctx_dict = (scan_config_dict or {}).get("audit_context")
+                if audit_ctx_dict:
+                    ctx = AuditContext.from_dict(audit_ctx_dict)
+                    curation_results = curate_all(all_hypotheses, ctx)
+                    kept: list = []
+                    summary = {"out_of_scope": 0, "design_constraint": 0,
+                               "admin_trust_surface": 0, "unchanged": 0, "dropped": 0}
+                    for h, r in zip(all_hypotheses, curation_results):
+                        if r.drop:
+                            summary["dropped"] += 1
+                            continue
+                        if r.changed:
+                            apply_curation(h, r)
+                            summary[r.label or "unchanged"] = summary.get(r.label or "unchanged", 0) + 1
+                        else:
+                            summary["unchanged"] += 1
+                        kept.append(h)
+                    all_hypotheses = kept
+                    publisher.publish_thought(
+                        f"Audit curator applied: {summary} "
+                        f"(scope={len(ctx.scope_files)} files, "
+                        f"dead_code={len(ctx.dead_code_paths)}, "
+                        f"trusted_roles={len(ctx.trusted_roles)})",
+                        iteration=total_iterations,
+                    )
+            except Exception as e:  # noqa: BLE001
+                # Curation is best-effort. Failure must NOT block report delivery
+                # — log and continue with raw findings.
+                print(f"[curator] non-fatal failure: {e}")
+
             # Persist on-disk HypothesisStore JSON under a stable path so eval
             # can read auditor-only properties (numeric_gap_measurement et al)
             # that don't survive DB persist. Soft-fails when the volume isn't

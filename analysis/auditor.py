@@ -948,7 +948,18 @@ class SingleAuditor:
                 result.num_turns,
             )
             return candidates
-        except Exception:
+        except Exception as batch_exc:
+            # firepan-bug-sweep: surface why batch validation failed (previously
+            # swallowed). RAAC chunk_002 lost three real findings to this drop;
+            # the reason needs to be visible so we can either widen the schema
+            # or repair candidates in post.
+            logger.warning(
+                "Batch validation failed for %s (%s: %s); falling back to "
+                "per-candidate parse",
+                chunk.chunk_id,
+                type(batch_exc).__name__,
+                batch_exc,
+            )
             # Try parsing individual candidates from a list
             raw_candidates = data.get("candidates", [])
             if not raw_candidates:
@@ -957,8 +968,22 @@ class SingleAuditor:
             for raw in raw_candidates[:max_candidates]:
                 try:
                     candidates.append(CandidateFinding.model_validate(raw))
-                except Exception:
-                    logger.warning("Skipping malformed candidate: %s", str(raw)[:200])
+                except Exception as cand_exc:
+                    # firepan-bug-sweep: log the validation error AND the full
+                    # raw payload (was truncated to 200 chars, hiding which
+                    # field actually failed schema). 4KB cap is generous enough
+                    # to show the entire candidate without flooding logs.
+                    import json as _json
+                    try:
+                        raw_json = _json.dumps(raw, default=str)[:4000]
+                    except Exception:
+                        raw_json = str(raw)[:4000]
+                    logger.warning(
+                        "Skipping malformed candidate (%s: %s) — raw payload: %s",
+                        type(cand_exc).__name__,
+                        cand_exc,
+                        raw_json,
+                    )
             return candidates
 
     def _declare_coverage(

@@ -3142,11 +3142,23 @@ class AuditStartResponse(BaseModel):
             "(e.g. 'claude_audit_not_entitled' for the firepan-sewd gate)."
         ),
     )
+    # firepan-bug-sweep: coverage ratchet. The worker records chunks_processed
+    # / chunks_total when the audit completes (or partially completes). Surfaced
+    # here only for /audits/{session_id}/status responses; on the initial
+    # /audits/start dispatch both are None because the audit has not run yet.
+    coverage_chunks_processed: int | None = Field(
+        default=None,
+        description="Chunks processed by the auditor. None until the audit terminates.",
+    )
+    coverage_chunks_total: int | None = Field(
+        default=None,
+        description="Total chunks the auditor planned. None until the audit terminates.",
+    )
 
 
 class AuditStatusResponse(BaseModel):
     """Response model for audit status check."""
-    
+
     session_id: str
     status: str
     progress: dict[str, Any] | None = None
@@ -3154,6 +3166,21 @@ class AuditStatusResponse(BaseModel):
     error_message: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+    # firepan-bug-sweep: coverage ratchet. Populated by the worker when an audit
+    # terminates (in_review / completed / failed). `None` while the audit is
+    # still running; once present, callers SHOULD show a partial-run banner
+    # when coverage_ratio < 1.0 so a budget-truncated run isn't mistaken for
+    # full coverage.
+    coverage_chunks_processed: int | None = None
+    coverage_chunks_total: int | None = None
+    coverage_ratio: float | None = None
+    # firepan-bug-sweep: curator state. When audit_context.scope_files was set
+    # on dispatch, the worker runs the post-auditor curator. This flag tells
+    # callers whether it completed; consumers shipping reports under
+    # audit_context SHOULD refuse to export when curator_applied is False.
+    curator_applied: bool | None = None
+    curator_summary: dict[str, int] | None = None
+    curator_error: str | None = None
 
 
 # ============================================================================
@@ -3474,6 +3501,29 @@ async def get_audit_status(
     if scan_exec and scan_exec.error_message:
         error_message = scan_exec.error_message
 
+    # firepan-bug-sweep: surface coverage ratchet. Worker writes
+    # AuditSession.coverage = {"chunks_processed": X, "chunks_total": Y,
+    # "coverage_ratio": Z, ...} when the audit terminates. None during run.
+    cov = session.coverage or {}
+    cov_processed = cov.get("chunks_processed") if isinstance(cov, dict) else None
+    cov_total = cov.get("chunks_total") if isinstance(cov, dict) else None
+    cov_ratio = cov.get("coverage_ratio") if isinstance(cov, dict) else None
+
+    # firepan-bug-sweep: surface curator state from session_metadata. Set by
+    # worker/tasks.py after the curator runs (or fails). Three states:
+    #   - None: no audit_context was provided on dispatch (no curator expected)
+    #   - True: curator applied successfully; summary contains category counts
+    #   - False: audit_context provided but curator failed; error in curator_error
+    meta = session.session_metadata or {}
+    cstate = meta.get("curator") if isinstance(meta, dict) else None
+    curator_applied = None
+    curator_summary = None
+    curator_error = None
+    if isinstance(cstate, dict):
+        curator_applied = cstate.get("applied")
+        curator_summary = cstate.get("summary")
+        curator_error = cstate.get("error")
+
     return AuditStatusResponse(
         session_id=session.session_id,
         status=session.status,
@@ -3482,6 +3532,12 @@ async def get_audit_status(
         error_message=error_message,
         started_at=session.start_time,
         completed_at=session.end_time,
+        coverage_chunks_processed=cov_processed,
+        coverage_chunks_total=cov_total,
+        coverage_ratio=cov_ratio,
+        curator_applied=curator_applied,
+        curator_summary=curator_summary,
+        curator_error=curator_error,
     )
 
 
@@ -9592,6 +9648,19 @@ class AdminAuditForceRunRequest(BaseModel):
         ),
         max_length=50,
     )
+    audit_context: dict | None = Field(
+        default=None,
+        description=(
+            "Per-engagement curation context (firepan-curator). Threaded through "
+            "to the worker's post-auditor curation pass via scan_config['audit_context']. "
+            "Keys: scope_files (list[str], hard-enforced — findings outside are relabeled "
+            "out_of_scope), dead_code_paths (list[{file, function}]), trusted_roles "
+            "(list[str] like ['onlyOwner', 'onlyStrategy']; trust-boundary heuristic "
+            "downgrades findings whose exploitation requires only a trusted role), "
+            "deployed_contracts (dict[name, address] — chain-of-custody only), and "
+            "out_of_scope_action ('downgrade' or 'drop')."
+        ),
+    )
 
 
 @app.post("/admin/audits/force-run", response_model=AuditStartResponse)
@@ -9707,6 +9776,10 @@ async def admin_force_run_audit(
     }
     if scoped_target_files:
         scan_config_dict["target_files"] = scoped_target_files
+    # firepan-curator: thread the curator context to the worker. The worker
+    # reads it from scan_config["audit_context"] after the auditor returns.
+    if payload.audit_context:
+        scan_config_dict["audit_context"] = payload.audit_context
 
     deep_scan = ScanExecutionModel(
         execution_id=session_id,

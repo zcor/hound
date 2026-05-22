@@ -9637,7 +9637,29 @@ class AdminAuditForceRunRequest(BaseModel):
     max_iterations: int = Field(default=30, ge=1, le=200)
     investigation_prompt: str | None = None
     time_limit_minutes: int = Field(default=120, ge=1, le=600)
-    mode: Literal["sweep", "intuition", "auditor"] = Field(default="auditor", description="Audit mode: 'auditor' (default — Claude SingleAuditor, firepan-8l1), 'sweep' (legacy DeepSeek, opt-in), or 'intuition'")
+    mode: Literal["sweep", "intuition", "auditor", "verify"] = Field(default="auditor", description="Audit mode: 'auditor' (default — Claude SingleAuditor, firepan-8l1), 'sweep' (legacy DeepSeek, opt-in), 'intuition', or 'verify' (firepan-bump-verify — runs the Bump Sheet phases against a finding from a prior auditor run)")
+    # firepan-bump-verify: when mode='verify', the worker pulls these
+    # parameters out of scan_config_dict["bump_verify"] and runs phases 1-4
+    # against the named finding. All optional fields default such that
+    # dry-run (scaffold-only) mode works without external RPC.
+    verify_finding_id: str | None = Field(
+        default=None,
+        description=(
+            "Hypothesis ID (e.g. hyp_abc123) of the finding to verify. "
+            "Required when mode='verify'."
+        ),
+    )
+    verify_rpc_url: str | None = Field(
+        default=None,
+        description=(
+            "Archive RPC URL for fork-based verification. When None, the "
+            "verifier runs in dry-run mode and emits scaffolded artifacts."
+        ),
+    )
+    verify_fork_block: int | None = Field(
+        default=None,
+        description="Block height to fork at. None ⇒ dry-run scaffold only.",
+    )
     plan_n: int = Field(default=5, ge=1, le=20)
     audit_branch: str | None = Field(default=None, max_length=255)
     target_files: list[str] | None = Field(
@@ -9780,6 +9802,21 @@ async def admin_force_run_audit(
     # reads it from scan_config["audit_context"] after the auditor returns.
     if payload.audit_context:
         scan_config_dict["audit_context"] = payload.audit_context
+
+    # firepan-bump-verify: when mode='verify', thread the bump-verifier
+    # parameters through. The worker reads them from scan_config["bump_verify"]
+    # and instantiates analysis.bump_verifier.BumpVerifier accordingly.
+    if payload.mode == "verify":
+        if not payload.verify_finding_id:
+            raise HTTPException(
+                status_code=422,
+                detail="verify_finding_id required when mode='verify'",
+            )
+        scan_config_dict["bump_verify"] = {
+            "finding_id": payload.verify_finding_id,
+            "rpc_url": payload.verify_rpc_url,
+            "fork_block": payload.verify_fork_block,
+        }
 
     deep_scan = ScanExecutionModel(
         execution_id=session_id,

@@ -658,6 +658,127 @@ def execute_audit_task(
         all_hypotheses: list = []
         total_iterations = 0
 
+        # firepan-bump-verify: mode='verify' runs the Bump Sheet phases against
+        # a finding from a prior auditor run. It DOES NOT discover new bugs —
+        # it reproduces / verifies / prosecutes an existing one. Scope is a
+        # single hypothesis_id pulled from scan_config['bump_verify'].
+        if mode == "verify":
+            from analysis.bump_verifier import (
+                BumpVerifier, VerifierConfig, FindingInput,
+            )
+            # Re-fetch scan_config to get bump_verify params
+            bv_params = {}
+            try:
+                from database.models import (
+                    ScanExecution as _SEv,
+                    Hypothesis as _Hyp,
+                    create_db_engine as _cdev,
+                    create_db_session as _cdsv,
+                )
+                _ev = _cdev(os.environ.get("DATABASE_URL", "sqlite:///hound.db"))
+                _dv = _cdsv(_ev)
+                _sev = _dv.query(_SEv).filter(_SEv.execution_id == scan_id).first()
+                if _sev and _sev.scan_config and isinstance(_sev.scan_config, dict):
+                    bv_params = _sev.scan_config.get("bump_verify") or {}
+                hyp_row = None
+                if bv_params.get("finding_id"):
+                    hyp_row = (
+                        _dv.query(_Hyp)
+                        .filter(_Hyp.hypothesis_id == bv_params["finding_id"])
+                        .first()
+                    )
+                _dv.close()
+            except Exception as _fetch_err:
+                print(f"[bump-verify] DB fetch failed: {_fetch_err}")
+                hyp_row = None
+            if not hyp_row:
+                publisher.publish_thought(
+                    f"verify mode: finding_id {bv_params.get('finding_id')!r} "
+                    f"not found; aborting",
+                    iteration=0,
+                )
+                self._update_scan_status(scan_id, "failed",
+                                         error_message="verify finding_id not found")
+                return {"status": "failed", "scan_id": scan_id,
+                        "error": "verify finding_id not found"}
+            # Map DB row → FindingInput
+            nrefs = hyp_row.node_refs or []
+            loc_file = ""
+            loc_line: int | None = None
+            if nrefs and isinstance(nrefs[0], str):
+                loc_file = nrefs[0].split(":", 1)[0]
+                m = re.match(r".+:(\d+)", nrefs[0])
+                if m:
+                    loc_line = int(m.group(1))
+            finding_input = FindingInput(
+                hypothesis_id=hyp_row.hypothesis_id,
+                title=hyp_row.title or "",
+                description=hyp_row.description or "",
+                severity=hyp_row.severity or "medium",
+                location_file=loc_file,
+                location_line=loc_line,
+                vulnerability_type=hyp_row.vulnerability_type or "",
+                evidence=(
+                    hyp_row.evidence.get("items", [])
+                    if isinstance(hyp_row.evidence, dict)
+                    else []
+                ),
+            )
+            verify_work_dir = project_dir / "verify" / finding_input.hypothesis_id
+            cfg = VerifierConfig(
+                rpc_url=bv_params.get("rpc_url"),
+                fork_block=bv_params.get("fork_block"),
+                foundry_root=repo_path,
+                work_dir=verify_work_dir,
+                dry_run=not bool(bv_params.get("rpc_url")
+                                 and bv_params.get("fork_block")),
+            )
+            publisher.publish_thought(
+                f"Starting bump-verify for {finding_input.hypothesis_id} "
+                f"(dry_run={cfg.dry_run})",
+                iteration=0,
+            )
+            verifier = BumpVerifier(finding_input, cfg)
+            verify_summary = verifier.run()
+            publisher.publish_thought(
+                f"Bump-verify finished: verdict={verify_summary.verdict} "
+                f"({verify_summary.verdict_reason})",
+                iteration=len(verify_summary.phases),
+            )
+            # Persist summary onto AuditSession.session_metadata
+            try:
+                from database.models import (
+                    AuditSession as _ASv,
+                    create_db_engine as _cdev2,
+                    create_db_session as _cdsv2,
+                )
+                _ev2 = _cdev2(os.environ.get("DATABASE_URL", "sqlite:///hound.db"))
+                _dv2 = _cdsv2(_ev2)
+                _sessv = _dv2.query(_ASv).filter(_ASv.session_id == scan_id).first()
+                if _sessv:
+                    meta = dict(_sessv.session_metadata or {})
+                    meta["bump_verify"] = {
+                        "finding_id": finding_input.hypothesis_id,
+                        "verdict": verify_summary.verdict,
+                        "verdict_reason": verify_summary.verdict_reason,
+                        "dry_run": verify_summary.dry_run,
+                        "phases": [
+                            {"phase": p.phase, "status": p.status, "notes": p.notes}
+                            for p in verify_summary.phases
+                        ],
+                        "work_dir": verify_summary.work_dir,
+                        "artifacts_at": verify_summary.work_dir,
+                    }
+                    _sessv.session_metadata = meta
+                    _dv2.commit()
+                _dv2.close()
+            except Exception as _persist_err:
+                print(f"[bump-verify] could not persist summary: {_persist_err}")
+            self._update_scan_status(scan_id, "in_review",
+                                     findings=[verify_summary.__dict__])
+            return {"status": "in_review", "scan_id": scan_id,
+                    "verdict": verify_summary.verdict}
+
         if mode == "auditor":
             from analysis.auditor import SingleAuditor
             from analysis.concurrent_knowledge import (

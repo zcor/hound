@@ -3033,6 +3033,13 @@ class SessionResponse(BaseModel):
     token_usage: dict[str, Any] | None
     coverage: dict[str, Any] | None
     investigations_count: int = 0
+    # firepan-y22: surface curator + bump-verify state on the project-sessions
+    # listing so the dashboard can render coverage banners + curator warnings
+    # without a separate /audits/{id}/status round trip per session.
+    curator_applied: bool | None = None
+    curator_summary: dict[str, int] | None = None
+    coverage_ratio: float | None = None
+    bump_verify_verdict: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -5037,6 +5044,26 @@ async def list_project_sessions(
     for session in sessions:
         investigations_count = len(session.investigations or [])
 
+        # firepan-y22: extract curator + bump-verify state from session_metadata
+        # for dashboard rendering. None when the engagement didn't use the
+        # curator (no audit_context.scope_files) or the verify mode.
+        meta = session.session_metadata or {}
+        cur = meta.get("curator") if isinstance(meta, dict) else None
+        bv = meta.get("bump_verify") if isinstance(meta, dict) else None
+        curator_applied = (
+            cur.get("applied") if isinstance(cur, dict) else None
+        )
+        curator_summary = (
+            cur.get("summary") if isinstance(cur, dict) else None
+        )
+        cov = session.coverage or {}
+        coverage_ratio = (
+            cov.get("coverage_ratio") if isinstance(cov, dict) else None
+        )
+        bump_verify_verdict = (
+            bv.get("verdict") if isinstance(bv, dict) else None
+        )
+
         response.append(
             SessionResponse(
                 id=session.id,
@@ -5048,6 +5075,10 @@ async def list_project_sessions(
                 token_usage=session.token_usage,
                 coverage=session.coverage,
                 investigations_count=investigations_count,
+                curator_applied=curator_applied,
+                curator_summary=curator_summary,
+                coverage_ratio=coverage_ratio,
+                bump_verify_verdict=bump_verify_verdict,
             )
         )
 

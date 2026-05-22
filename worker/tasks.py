@@ -195,8 +195,34 @@ class AuditTask(Task):
 
                 session = db.query(AuditSession).filter_by(session_id=scan_id).first()
                 if session:
-                    session.status = status
-                    if status in ("completed", "in_review"):
+                    # firepan-5zc curation gate: when transitioning to
+                    # 'completed' on a session whose scan_config requested
+                    # audit_context.scope_files (i.e. firepan-curator was
+                    # supposed to run), refuse the transition if the curator
+                    # did not actually apply. Demote to 'awaiting_curation' so
+                    # the dashboard surfaces the problem instead of silently
+                    # shipping un-curated findings. The reviewer (or a re-run
+                    # with the curator wired) is then responsible for resolving.
+                    requested_status = status
+                    if requested_status == "completed" and scan is not None:
+                        sc = scan.scan_config or {}
+                        audit_ctx = sc.get("audit_context") if isinstance(sc, dict) else None
+                        wants_curator = bool(
+                            isinstance(audit_ctx, dict) and audit_ctx.get("scope_files")
+                        )
+                        meta = session.session_metadata or {}
+                        cur_state = meta.get("curator") if isinstance(meta, dict) else None
+                        curator_applied = bool(
+                            isinstance(cur_state, dict) and cur_state.get("applied") is True
+                        )
+                        if wants_curator and not curator_applied:
+                            requested_status = "awaiting_curation"
+                            # Update scan_execution.status to the same value so
+                            # the two rows stay aligned.
+                            if scan and hasattr(scan, "status"):
+                                scan.status = "awaiting_curation"
+                    session.status = requested_status
+                    if requested_status in ("completed", "in_review", "awaiting_curation"):
                         session.end_time = datetime.now(timezone.utc)
                     # firepan-bug-sweep: propagate matching extra_fields to
                     # AuditSession too. Previously only ScanExecution got

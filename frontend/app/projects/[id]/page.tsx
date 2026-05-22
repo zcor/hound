@@ -98,17 +98,62 @@ export default function ProjectSessionsPage() {
                       {session.session_id}
                     </td>
                     <td className="whitespace-nowrap px-6 py-4">
-                      <span
-                        className={`inline-flex rounded-full px-2 text-xs font-semibold leading-5 ${
-                          session.status === 'completed'
-                            ? 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400'
-                            : session.status === 'active'
-                            ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400'
-                            : 'bg-zinc-100 text-zinc-800 dark:bg-zinc-900/20 dark:text-zinc-400'
-                        }`}
-                      >
-                        {session.status}
-                      </span>
+                      <div className="flex flex-col gap-1">
+                        {/* primary status pill */}
+                        <span
+                          className={`inline-flex rounded-full px-2 text-xs font-semibold leading-5 ${
+                            session.status === 'completed'
+                              ? 'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400'
+                              : session.status === 'active'
+                              ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400'
+                              : session.status === 'awaiting_curation'
+                              ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/20 dark:text-amber-400'
+                              : 'bg-zinc-100 text-zinc-800 dark:bg-zinc-900/20 dark:text-zinc-400'
+                          }`}
+                        >
+                          {session.status}
+                        </span>
+                        {/* firepan-y22: coverage badge — show "Partial — 67%" when
+                            coverage_ratio < 1.0; hide when null (engagement didn't
+                            track) or 1.0 (clean) */}
+                        {typeof session.coverage_ratio === 'number' && session.coverage_ratio < 1.0 && (
+                          <span
+                            className="inline-flex rounded-full bg-orange-100 px-2 text-xs font-semibold leading-5 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400"
+                            title="Audit terminated before all chunks were processed. Findings are based on a partial run."
+                          >
+                            Partial — {Math.round(session.coverage_ratio * 100)}%
+                          </span>
+                        )}
+                        {/* firepan-y22: curator warning — fire when audit_context
+                            was provided but curator did not apply. Loud color
+                            because shipping un-curated findings on a scoped
+                            engagement misrepresents what was audited. */}
+                        {session.curator_applied === false && (
+                          <span
+                            className="inline-flex rounded-full bg-red-100 px-2 text-xs font-semibold leading-5 text-red-800 dark:bg-red-900/20 dark:text-red-400"
+                            title="audit_context.scope_files was provided on dispatch but the firepan-curator did not run. Findings may include out-of-scope items and severity-inflated entries."
+                          >
+                            ⚠ uncurated
+                          </span>
+                        )}
+                        {/* firepan-y22: bump-verify verdict — only show when the
+                            verifier ran (mode='verify'). 'verified' / 'verified_fragile'
+                            / 'unverified' / 'disproved' */}
+                        {session.bump_verify_verdict && (
+                          <span
+                            className={`inline-flex rounded-full px-2 text-xs font-semibold leading-5 ${
+                              session.bump_verify_verdict === 'verified'
+                                ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-400'
+                                : session.bump_verify_verdict === 'verified_fragile'
+                                ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400'
+                                : 'bg-zinc-100 text-zinc-700 dark:bg-zinc-900/20 dark:text-zinc-400'
+                            }`}
+                            title={`firepan-bump-verify verdict: ${session.bump_verify_verdict}`}
+                          >
+                            verify: {session.bump_verify_verdict}
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="whitespace-nowrap px-6 py-4 text-sm text-zinc-500 dark:text-zinc-400">
                       {new Date(session.start_time).toLocaleString()}

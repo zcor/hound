@@ -76,6 +76,13 @@ export interface Session {
   token_usage: Record<string, any> | null;
   coverage: Record<string, any> | null;
   investigations_count: number;
+  // firepan-y22: curator + bump-verify state surfaced on /projects/{id}/sessions
+  // so the dashboard can render coverage / curator-applied / verify-verdict
+  // banners inline. Null when the engagement didn't use the curator or verify mode.
+  curator_applied: boolean | null;
+  curator_summary: Record<string, number> | null;
+  coverage_ratio: number | null;
+  bump_verify_verdict: string | null;
 }
 
 export interface Finding {

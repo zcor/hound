@@ -3040,6 +3040,10 @@ class SessionResponse(BaseModel):
     curator_summary: dict[str, int] | None = None
     coverage_ratio: float | None = None
     bump_verify_verdict: str | None = None
+    # firepan-a1 — MVE loop accounting surfaced for dashboard rendering.
+    bump_verify_cost_usd: float | None = None
+    bump_verify_iterations_used: int | None = None
+    bump_verify_impact_usd: float | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -5063,6 +5067,15 @@ async def list_project_sessions(
         bump_verify_verdict = (
             bv.get("verdict") if isinstance(bv, dict) else None
         )
+        bump_verify_cost_usd = (
+            bv.get("cost_usd") if isinstance(bv, dict) else None
+        )
+        bump_verify_iterations_used = (
+            bv.get("iterations_used") if isinstance(bv, dict) else None
+        )
+        bump_verify_impact_usd = (
+            bv.get("impact_usd") if isinstance(bv, dict) else None
+        )
 
         response.append(
             SessionResponse(
@@ -5079,6 +5092,9 @@ async def list_project_sessions(
                 curator_summary=curator_summary,
                 coverage_ratio=coverage_ratio,
                 bump_verify_verdict=bump_verify_verdict,
+                bump_verify_cost_usd=bump_verify_cost_usd,
+                bump_verify_iterations_used=bump_verify_iterations_used,
+                bump_verify_impact_usd=bump_verify_impact_usd,
             )
         )
 
@@ -9691,6 +9707,25 @@ class AdminAuditForceRunRequest(BaseModel):
         default=None,
         description="Block height to fork at. None ⇒ dry-run scaffold only.",
     )
+    # firepan-a1 — execution-feedback loop controls (Gervais & Zhou 2025).
+    # Defaults match the paper's empirical sweet spot (5 iterations) and our
+    # session-agreed cost ceiling ($15 / finding — allows Opus 4.7 the full loop).
+    verify_max_iterations: int | None = Field(
+        default=5, ge=0, le=20,
+        description=(
+            "Max Claude-driven MVE generation iterations per verify run. "
+            "0 disables the loop (today's scaffold-only behavior). A1's "
+            "empirical sweet spot is 5; diminishing returns past that."
+        ),
+    )
+    verify_max_cost_usd: float | None = Field(
+        default=15.0, ge=0.0, le=500.0,
+        description=(
+            "Hard ceiling on Claude API + RPC compute spend per verify run. "
+            "When the cumulative cost crosses this, the iteration loop exits "
+            "with verdict='mve_aborted_cost'."
+        ),
+    )
     plan_n: int = Field(default=5, ge=1, le=20)
     audit_branch: str | None = Field(default=None, max_length=255)
     target_files: list[str] | None = Field(
@@ -9847,6 +9882,8 @@ async def admin_force_run_audit(
             "finding_id": payload.verify_finding_id,
             "rpc_url": payload.verify_rpc_url,
             "fork_block": payload.verify_fork_block,
+            "max_iterations": payload.verify_max_iterations,
+            "max_cost_usd": payload.verify_max_cost_usd,
         }
 
     deep_scan = ScanExecutionModel(

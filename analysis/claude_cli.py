@@ -356,9 +356,16 @@ class ClaudeSession:
         if output_json:
             try:
                 data = json.loads(stdout)
+                # firepan-a1 cost-parsing fix: the Claude CLI emits the
+                # post-session spend under "total_cost_usd", not "cost_usd"
+                # (verified against v5/v6/v7 worker log captures). The prior
+                # key returned 0.0 unconditionally, which is why the cost
+                # ceiling we built for mode=verify in PR #69 never tripped.
+                # Accept either key so older CLI builds still work.
                 return ClaudeResult(
                     text=data.get("result", ""),
-                    cost_usd=data.get("cost_usd", 0.0),
+                    cost_usd=float(data.get("total_cost_usd")
+                                   or data.get("cost_usd") or 0.0),
                     num_turns=data.get("num_turns", 0),
                     duration_ms=data.get("duration_ms", 0),
                     session_id=data.get("session_id", ""),

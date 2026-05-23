@@ -83,6 +83,10 @@ export interface Session {
   curator_summary: Record<string, number> | null;
   coverage_ratio: number | null;
   bump_verify_verdict: string | null;
+  // firepan-a1 — Bump-verify A1 cherry-pick state surfaced for dashboard.
+  bump_verify_cost_usd: number | null;
+  bump_verify_iterations_used: number | null;
+  bump_verify_impact_usd: number | null;
 }
 
 export interface Finding {

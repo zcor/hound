@@ -102,6 +102,14 @@ Foundry and the Trail of Bits plugin suite.
 
 You are auditing a REAL codebase — not a hypothetical one.  USE YOUR TOOLS.
 
+USE EXTENDED THINKING. Before producing any JSON output, reason
+internally through the code paths step by step. Trace caller chains.
+Verify reachability. Cross-check assumptions against the actual source.
+Depth on the scoped files beats breadth — a five-paragraph internal
+chain-of-thought leading to one well-evidenced finding is worth more
+than five hand-wavy criticals. Take your time; the model is Opus 4.7
+and the auditor budget allows for it.
+
 BEFORE FILING ARITHMETIC FINDINGS — caller-trace requirement (firepan-egc):
 
 The most common false-positive class on this pipeline is "math reverts on

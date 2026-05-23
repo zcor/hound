@@ -1,6 +1,6 @@
 # `mode=verify` — Bump Sheet Integration Design
 
-**Status:** Draft (PR #69 lands Phases 1-4 scaffolding; this doc covers the full target architecture)
+**Status:** Phases 1-4 live (PR #69). Phase 3 MVE generator + Phase 5 impact bounding + cost gate live (PR #73 — A1 cherry-pick from Gervais & Zhou 2025). This doc covers both the landed implementation and remaining follow-ups.
 **Owner:** Firepan / Assune
 **Source methodology:** *The Bump Sheet — Chain-Agnostic Exploit Verification Playbook for Smart Contract Audits*, Gemach DAO Security v1.0
 **Compatibility:** Stacked on PR #66 (silent-downgrade observability), PR #67 (bug sweep), PR #69 (this PR)

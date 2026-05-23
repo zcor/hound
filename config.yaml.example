@@ -46,7 +46,10 @@ models:
   # Single-auditor pipeline (mode=auditor): strong reasoning model + fp-check gates
   auditor:
     provider: anthropic
-    model: claude-sonnet-4-20250514
+    # firepan-v7: Opus 4.7 with extended-thinking auto-engaged for the
+    # final RAAC validation sweep. Best available reasoning model. Cost
+    # ~5-10x Sonnet 4 but this is the deliverable-bearing pass.
+    model: claude-opus-4-7
     max_context: 200000
     temperature: 0.1
   # Optional: Math reasoning (requires REI API)

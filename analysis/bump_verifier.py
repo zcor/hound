@@ -178,11 +178,13 @@ pragma solidity ^0.8.20;
 ///   Collateral: 0x7a7f847fb60b0000e24cce07298dc73df8b8e56a
 
 library RAAC {
-    address constant ORACLE = 0x0236497082F693525DCA8717787B0F601aD62cE6;
-    address constant MARKET = 0x4e8eF157762F0b8a7Ad0d9FF45f86B203a0658Cc;
-    address constant TREASURY = 0x51c4348AF0C6066A2FD31bD968Bc0c039fe27342;
-    address constant FTOKEN = 0xC0C17dD08263c16F6b64e772fb9B723Bf1344Ddf;
-    address constant COLLATERAL = 0x7A7f847FB60b0000E24CCE07298DC73df8B8e56a;
+    // EIP-55 checksummed via `cast --to-checksum-address` — anything else
+    // makes Solidity 0.8.20 throw "invalid address checksum" (error 9429).
+    address constant ORACLE = 0x0236497082f693525Dca8717787b0F601Ad62Ce6;
+    address constant MARKET = 0x4E8ef157762F0B8a7aD0d9fF45f86B203A0658CC;
+    address constant TREASURY = 0x51C4348Af0C6066a2fd31Bd968Bc0c039fe27342;
+    address constant FTOKEN = 0xC0c17dD08263C16f6b64E772fB9B723Bf1344DdF;
+    address constant COLLATERAL = 0x7A7f847fb60b0000E24cCe07298dC73dF8b8e56A;
 }
 
 interface IFxRWAOracle {
@@ -751,8 +753,23 @@ contract {contract_name} is Test {{
             trace = (out or "") + "\n" + (err or "")
             last_trace = trace[-4000:]  # tail for next iteration
             trace_file.write_text(trace)
-            rec.forge_compiled = "Compiler run" in trace or "Compiling" in trace or rc == 0
-            rec.forge_test_ran = rc in (0, 1)  # 1 = test ran but failed
+            # firepan-r0o — tighter compile-success detection. "Compiling N
+            # files" is printed even when compile then errors out, so the
+            # prior heuristic over-reported success. Look for the actual
+            # success line OR a clean rc, AND verify no compile error fence.
+            compile_success_marker = "Compiler run successful" in trace
+            compile_failure_marker = (
+                "Error (" in trace
+                or "ParserError" in trace
+                or "DeclarationError" in trace
+                or "TypeError" in trace
+            )
+            rec.forge_compiled = (
+                compile_success_marker or (rc == 0 and not compile_failure_marker)
+            )
+            # forge_test_ran is True only if compile passed AND forge actually
+            # invoked the test (not just printed compile errors).
+            rec.forge_test_ran = rec.forge_compiled and rc in (0, 1)
             rec.attacker_delta_wei = _extract_attacker_delta(trace)
             rec.revert_reason = _extract_revert_reason(trace)
             rec.trace_excerpt = trace[-1500:]

@@ -809,8 +809,15 @@ def execute_audit_task(
                 _dv2.close()
             except Exception as _persist_err:
                 print(f"[bump-verify] could not persist summary: {_persist_err}")
-            self._update_scan_status(scan_id, "in_review",
-                                     findings=[verify_summary.__dict__])
+            # firepan-a1 fix — verify_summary.__dict__ would leave PhaseResult /
+            # IterationRecord dataclass instances un-serialized, which the
+            # JSONB column can't accept. asdict() recurses into nested
+            # dataclasses + dicts and converts everything to JSON-safe types.
+            import dataclasses as _dc_for_verify
+            self._update_scan_status(
+                scan_id, "in_review",
+                findings=[_dc_for_verify.asdict(verify_summary)],
+            )
             return {"status": "in_review", "scan_id": scan_id,
                     "verdict": verify_summary.verdict}
 

@@ -33,6 +33,73 @@ from .celery_app import celery_app  # noqa: E402
 from .redis_publisher import RedisPublisher  # noqa: E402
 
 
+def _run_slither_for_corroboration(
+    repo_path: "Path | str",
+    scope_files: list[str],
+) -> list[dict]:
+    """firepan-pr77 — run Slither across the audit's in-scope files and
+    return a normalized list of hits for curator Rule 5b corroboration.
+
+    Best-effort. Slither has many failure modes (compile, version,
+    dependency resolution); none of them should block the curator. On
+    any failure, return an empty list so Rule 5b just doesn't fire.
+    """
+    from pathlib import Path as _Path
+    import json as _json
+    import subprocess as _sp
+
+    hits: list[dict] = []
+    repo = _Path(repo_path)
+    if not repo.exists() or not scope_files:
+        return hits
+    # Slither each in-scope file individually — same pattern Pashov's
+    # solidity-auditor skill recommends. Avoids project-wide compile
+    # failures contaminating the run.
+    for rel in scope_files:
+        target = repo / rel
+        if not target.exists():
+            continue
+        try:
+            proc = _sp.run(
+                ["slither", str(target), "--json", "-"],
+                capture_output=True, text=True, timeout=90, cwd=str(repo),
+            )
+        except (FileNotFoundError, _sp.TimeoutExpired):
+            continue
+        # Slither writes JSON to stdout when --json - is used; rc can be
+        # nonzero even on successful detection (hits = failure exit).
+        stdout = proc.stdout or ""
+        if not stdout.strip():
+            continue
+        try:
+            data = _json.loads(stdout)
+        except _json.JSONDecodeError:
+            continue
+        results = (data.get("results") or {}).get("detectors") or []
+        for det in results:
+            check = det.get("check") or ""
+            impact = det.get("impact") or ""
+            # Skip noisy 'Informational' or 'Optimization' hits — they
+            # don't add corroboration signal.
+            if impact in ("Informational", "Optimization", "low"):
+                continue
+            for elt in det.get("elements") or []:
+                sm = (elt.get("source_mapping") or {})
+                filename = sm.get("filename_relative") or sm.get("filename_short") or ""
+                if not filename:
+                    continue
+                lines = sm.get("lines") or []
+                hits.append({
+                    "file": filename,
+                    "lines": lines if isinstance(lines, list) else [],
+                    "check": check,
+                    "impact": impact,
+                })
+                # One element per detector is enough for corroboration.
+                break
+    return hits
+
+
 def resolve_scan_github_token(
     db_session_factory,
     tenant_id: int,
@@ -841,6 +908,33 @@ def execute_audit_task(
                 iteration=0,
             )
 
+            # firepan-pr77 — load the project's Buffer-of-Thought and thread
+            # its context brief into the investigation_prompt so the next
+            # auditor pass inherits prior scope decisions, trust model,
+            # observed patterns, and resolved-finding verdicts. LLM-SmartAudit
+            # (IEEE TSE Oct 2025) ablation showed −8.2% F1 when BoT removed.
+            try:
+                from analysis.bot import BufferOfThought as _BoT
+                _bot_pre = _BoT(project_dir)
+                _brief = _bot_pre.context_brief()
+                if _brief and investigation_prompt:
+                    investigation_prompt = (
+                        investigation_prompt
+                        + "\n\n## Buffer-of-Thought — prior knowledge "
+                          "(firepan-pr77)\n\n"
+                        + _brief
+                        + "\n\nUse this as ground truth for scope / trust / "
+                          "previously-resolved findings. Do not re-discover "
+                          "facts already established here."
+                    )
+                    publisher.publish_thought(
+                        f"firepan-pr77 — BoT loaded ({len(_brief)} chars) "
+                        f"into investigation_prompt",
+                        iteration=0,
+                    )
+            except Exception as _bot_err:  # noqa: BLE001
+                print(f"[bot] could not load BoT: {_bot_err}")
+
             auditor = SingleAuditor(
                 config=config,
                 graphs_dir=graphs_dir,
@@ -886,11 +980,36 @@ def execute_audit_task(
                     print(f"[curator] could not fetch scan_config: {_fetch_err}")
                 audit_ctx_dict = _audit_ctx_dict
                 if audit_ctx_dict:
+                    # firepan-pr77 — run Slither on the in-scope files BEFORE
+                    # curation so Rule 5b can corroborate findings against
+                    # deterministic static-analysis hits. Best-effort: if
+                    # slither fails (compile/version issues), proceed without
+                    # corroboration data.
+                    slither_hits = _run_slither_for_corroboration(
+                        repo_path, audit_ctx_dict.get("scope_files") or [],
+                    )
+                    if slither_hits:
+                        audit_ctx_dict = {
+                            **audit_ctx_dict,
+                            "slither_hits": slither_hits,
+                        }
+                        publisher.publish_thought(
+                            f"firepan-pr77 — Slither emitted {len(slither_hits)} "
+                            f"hits across {len(audit_ctx_dict.get('scope_files') or [])} "
+                            f"in-scope files; threading into curator Rule 5b",
+                            iteration=total_iterations,
+                        )
                     ctx = AuditContext.from_dict(audit_ctx_dict)
                     curation_results = curate_all(all_hypotheses, ctx)
                     kept: list = []
                     summary = {"out_of_scope": 0, "design_constraint": 0,
-                               "admin_trust_surface": 0, "unchanged": 0, "dropped": 0}
+                               "admin_trust_surface": 0,
+                               "admin_trust_high_impact": 0,
+                               "potential_fail_safe": 0,
+                               "slither_corroborated": 0,
+                               "unconfirmed_by_static": 0,
+                               "subsumed_by_denser_evidence": 0,
+                               "unchanged": 0, "dropped": 0}
                     for h, r in zip(all_hypotheses, curation_results):
                         if r.drop:
                             summary["dropped"] += 1
@@ -966,6 +1085,73 @@ def execute_audit_task(
                     _d3.close()
                 except Exception:
                     pass
+
+            # firepan-pr77 — write the curator/audit outcomes into the
+            # project's Buffer-of-Thought file (LLM-SmartAudit BoT pattern).
+            # The next audit session against this project will read this
+            # state into the investigation_prompt as "prior knowledge".
+            try:
+                from analysis.bot import BufferOfThought, AuditSessionRecord
+                bot = BufferOfThought(project_dir)
+                bot.record_session(AuditSessionRecord(
+                    session_id=scan_id,
+                    started_at=datetime.now(timezone.utc).isoformat(),
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    mode=mode,
+                    model="claude-opus-4-7",
+                    coverage_ratio=(
+                        getattr(audit_result, "chunks_processed", 0) /
+                        max(getattr(audit_result, "chunks_total", 1), 1)
+                    ),
+                    summary={"raw": len(all_hypotheses)},
+                ))
+                if audit_ctx_dict and audit_ctx_dict.get("scope_files"):
+                    bot.set_scope_decisions(
+                        in_scope=list(audit_ctx_dict["scope_files"]),
+                        out_of_scope={
+                            "dead_code": "per audit_context.dead_code_paths",
+                        },
+                    )
+                if audit_ctx_dict and audit_ctx_dict.get("trusted_roles"):
+                    bot.set_trust_model({
+                        r: "per audit_context.trusted_roles"
+                        for r in audit_ctx_dict["trusted_roles"]
+                    })
+                # Record per-finding curator verdicts
+                for h, r in zip(all_hypotheses, curation_results):
+                    label = r.label or "in_scope"
+                    if r.changed and label:
+                        bot.record_verdict(
+                            hypothesis_id=str(h.get("id") or h.get("hypothesis_id") or ""),
+                            title=str(h.get("title") or ""),
+                            location=(h.get("node_refs") or [""])[0],
+                            session_id=scan_id,
+                            method=f"curator:{label}",
+                            verdict=r.new_severity,
+                            evidence=(r.reason or "")[:300],
+                        )
+                # Pattern observations from the curator summary
+                if summary.get("potential_fail_safe", 0):
+                    bot.increment_pattern(
+                        "fail_safe_revert",
+                        confirmed_by="curator:Rule_4",
+                        session_id=scan_id,
+                    )
+                if summary.get("admin_trust_high_impact", 0):
+                    bot.increment_pattern(
+                        "admin_trust_high_impact",
+                        confirmed_by="curator:Rule_5a",
+                        session_id=scan_id,
+                    )
+                if summary.get("slither_corroborated", 0):
+                    bot.increment_pattern(
+                        "slither_corroborated_finding",
+                        confirmed_by="curator:Rule_5b",
+                        session_id=scan_id,
+                    )
+            except Exception as _bot_err:  # noqa: BLE001
+                # BoT corruption must never block an audit.
+                print(f"[bot] could not persist BoT: {_bot_err}")
 
             # Persist on-disk HypothesisStore JSON under a stable path so eval
             # can read auditor-only properties (numeric_gap_measurement et al)

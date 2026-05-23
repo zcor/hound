@@ -55,16 +55,21 @@ RUN curl -L https://foundry.paradigm.xyz | bash || true \
  && (cp /root/.foundry/bin/cast /usr/local/bin/ 2>/dev/null || true) \
  && (cp /root/.foundry/bin/anvil /usr/local/bin/ 2>/dev/null || true)
 
-# firepan-a1 — solc-select for the verify-mode MVE generation loop. Without
-# a real solc binary on PATH, every forge test invocation fails at
-# compile-time before the EVM runs, which silently broke the live-API
-# smoke for mode=verify (see PR #73 + assune-m35 post-mortem). Install
-# the two Solidity versions in active use: 0.7.6 (RAAC v1 contracts +
-# concentrator/zap downstream) and 0.8.20 (forge-std + verify-mode scaffold).
+# firepan-a1 — solc binaries for the verify-mode MVE generation loop.
+# Forge uses its own ~/.svm cache (NOT solc-select's path), so we install
+# via solc-select but then copy the binaries into the forge-expected
+# location. Without this, every forge test invocation in the worker
+# (which runs as user `hound`) failed at compile-time before the EVM ran.
+# Verified live: forge's svm dir is /home/hound/.svm/<VERSION>/solc-<VERSION>.
 RUN pip install --no-cache-dir solc-select \
  && solc-select install 0.7.6 0.8.20 \
  && solc-select use 0.8.20 \
- && ln -sf /root/.solc-select/artifacts/solc-0.8.20/solc-0.8.20 /usr/local/bin/solc
+ && ln -sf /root/.solc-select/artifacts/solc-0.8.20/solc-0.8.20 /usr/local/bin/solc \
+ && mkdir -p /home/hound/.svm/0.8.20 /home/hound/.svm/0.7.6 \
+ && cp /root/.solc-select/artifacts/solc-0.8.20/solc-0.8.20 /home/hound/.svm/0.8.20/solc-0.8.20 \
+ && cp /root/.solc-select/artifacts/solc-0.7.6/solc-0.7.6 /home/hound/.svm/0.7.6/solc-0.7.6 \
+ && chmod +x /home/hound/.svm/0.8.20/solc-0.8.20 /home/hound/.svm/0.7.6/solc-0.7.6 \
+ && chown -R hound:hound /home/hound/.svm
 
 # Claude Code CLI as root → ends up on /usr/local/bin, available to USER hound.
 RUN npm install -g @anthropic-ai/claude-code

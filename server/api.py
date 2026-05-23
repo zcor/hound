@@ -9726,6 +9726,60 @@ class AdminAuditForceRunRequest(BaseModel):
             "with verdict='mve_aborted_cost'."
         ),
     )
+    # firepan-pr78 (EVMbench cherry-picks)
+    verify_mechanism_hint: str | None = Field(
+        default=None, max_length=2000,
+        description=(
+            "Optional mechanism hint threaded into the MVE prompt. EVMbench "
+            "showed hints lift Exploit success 60%→78% on GPT-5.2. E.g. "
+            "'look at reentrancy in withdraw()' or 'the bug is in maxMintable "
+            "when state.baseNav is zero'."
+        ),
+    )
+    verify_extra_success_tokens: list[str] | None = Field(
+        default=None,
+        description=(
+            "Multi-axis success criterion (EVMbench-style). When attacker "
+            "delta on any of these token addresses > 0, the exploit is "
+            "verified even if ETH delta is 0."
+        ),
+    )
+    verify_success_events: list[str] | None = Field(
+        default=None,
+        description=(
+            "Event names that count as exploit success when emitted by the "
+            "attacker contract. E.g. ['Transfer', 'PriceManipulated']."
+        ),
+    )
+    verify_veto_cheat_codes: bool | None = Field(
+        default=False,
+        description=(
+            "EVMbench-style realism gate. When True, the MVE prompt forbids "
+            "vm.prank of protected addresses, vm.warp, vm.roll, and "
+            "vm.impersonateAccount. Restricts the attacker to legitimate "
+            "transactions only."
+        ),
+    )
+    verify_data_provenance: str | None = Field(
+        default="novel",
+        description=(
+            "Disclosure of training-data exposure: 'novel' (model hasn't seen "
+            "the codebase), 'published' (open-source repo Claude may know), "
+            "'contest' (Code4rena/Sherlock dataset, contamination risk)."
+        ),
+    )
+    verify_require_human_review: bool | None = Field(
+        default=True,
+        description=(
+            "Re-EVMbench recommendation: when an mve_verified verdict has "
+            "impact_usd above the threshold (default $5M), session moves "
+            "to 'awaiting_human_review' instead of 'in_review'."
+        ),
+    )
+    verify_human_review_impact_threshold_usd: float | None = Field(
+        default=5_000_000.0, ge=0.0,
+        description="USD threshold above which mve_verified findings require human sign-off.",
+    )
     plan_n: int = Field(default=5, ge=1, le=20)
     audit_branch: str | None = Field(default=None, max_length=255)
     target_files: list[str] | None = Field(
@@ -9884,6 +9938,20 @@ async def admin_force_run_audit(
             "fork_block": payload.verify_fork_block,
             "max_iterations": payload.verify_max_iterations,
             "max_cost_usd": payload.verify_max_cost_usd,
+            # firepan-pr78 (EVMbench cherry-picks) — Tier 1+2+3
+            "mechanism_hint": payload.verify_mechanism_hint or "",
+            "extra_success_tokens": payload.verify_extra_success_tokens or [],
+            "success_events": payload.verify_success_events or [],
+            "veto_cheat_codes": bool(payload.verify_veto_cheat_codes),
+            "data_provenance": payload.verify_data_provenance or "novel",
+            "require_human_review": (
+                payload.verify_require_human_review
+                if payload.verify_require_human_review is not None
+                else True
+            ),
+            "human_review_impact_threshold_usd": (
+                payload.verify_human_review_impact_threshold_usd or 5_000_000.0
+            ),
         }
 
     deep_scan = ScanExecutionModel(

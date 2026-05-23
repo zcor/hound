@@ -818,8 +818,10 @@ def execute_audit_task(
                 ),
             )
             verify_work_dir = project_dir / "verify" / finding_input.hypothesis_id
-            # firepan-a1 thread the iteration cap + cost ceiling through.
-            # Defaults match the paper-recommended 5 iterations + $15 budget.
+            # firepan-a1 + firepan-pr78 — thread the full verify config
+            # through. PR #78 adds EVMbench cherry-picks: mechanism hint,
+            # multi-axis success criterion, veto cheat-code restriction,
+            # data provenance, human-review gate.
             cfg = VerifierConfig(
                 rpc_url=bv_params.get("rpc_url"),
                 fork_block=bv_params.get("fork_block"),
@@ -829,6 +831,21 @@ def execute_audit_task(
                                  and bv_params.get("fork_block")),
                 max_iterations=int(bv_params.get("max_iterations") or 5),
                 max_cost_usd=float(bv_params.get("max_cost_usd") or 15.0),
+                # firepan-pr78 EVMbench Tier 1
+                mechanism_hint=str(bv_params.get("mechanism_hint") or ""),
+                extra_success_tokens=list(
+                    bv_params.get("extra_success_tokens") or []),
+                success_events=list(bv_params.get("success_events") or []),
+                # firepan-pr78 EVMbench Tier 2
+                veto_cheat_codes=bool(bv_params.get("veto_cheat_codes")),
+                data_provenance=str(
+                    bv_params.get("data_provenance") or "novel"),
+                # firepan-pr78 EVMbench Tier 3
+                require_human_review=bool(
+                    bv_params.get("require_human_review", True)),
+                human_review_impact_threshold_usd=float(
+                    bv_params.get("human_review_impact_threshold_usd")
+                    or 5_000_000.0),
             )
             publisher.publish_thought(
                 f"Starting bump-verify for {finding_input.hypothesis_id} "
@@ -881,8 +898,26 @@ def execute_audit_task(
             # JSONB column can't accept. asdict() recurses into nested
             # dataclasses + dicts and converts everything to JSON-safe types.
             import dataclasses as _dc_for_verify
+            # firepan-pr78 (EVMbench Tier 3) — mandatory human-review gate.
+            # When mve_verified AND impact exceeds threshold, demote status to
+            # 'awaiting_human_review' so the dashboard surfaces the need for
+            # human sign-off (per Re-EVMbench: human-in-loop > full automation
+            # for high-impact verified findings).
+            target_status = "in_review"
+            if (cfg.require_human_review
+                    and verify_summary.verdict == "mve_verified"
+                    and (verify_summary.impact_usd or 0.0)
+                    > cfg.human_review_impact_threshold_usd):
+                target_status = "awaiting_human_review"
+                publisher.publish_thought(
+                    f"firepan-pr78 — verdict=mve_verified with "
+                    f"impact=${verify_summary.impact_usd:,.0f} exceeds "
+                    f"${cfg.human_review_impact_threshold_usd:,.0f} "
+                    f"threshold; status=awaiting_human_review",
+                    iteration=verify_summary.iterations_used,
+                )
             self._update_scan_status(
-                scan_id, "in_review",
+                scan_id, target_status,
                 findings=[_dc_for_verify.asdict(verify_summary)],
             )
             return {"status": "in_review", "scan_id": scan_id,

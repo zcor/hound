@@ -67,6 +67,19 @@ class AuditContext:
     trusted_roles: list[str] = field(default_factory=list)
     deployed_contracts: dict[str, str] = field(default_factory=dict)
     out_of_scope_action: str = "downgrade"
+    # firepan-pr77 — Slither corroboration data + impact data for Rule 5.
+    # slither_hits is a list of {"file": "...", "lines": [N, M], "check": "..."}
+    # parsed from `slither <file> --json` output. When a curator finding's
+    # location overlaps a slither hit, we get "corroborated" evidence.
+    # finding_impacts maps hypothesis_id -> bounded USD impact (from
+    # mode=verify Phase 5). Used by Rule 5 to override Rule 3 admin-trust
+    # demotion when economic impact dominates the trust axis.
+    slither_hits: list[dict[str, Any]] = field(default_factory=list)
+    finding_impacts: dict[str, float] = field(default_factory=dict)
+    # Threshold above which Rule 5 re-promotes admin-trust findings to
+    # original severity. $1M default — admin-trust paths that can extract
+    # >$1M warrant the original severity (e.g., assune-m35 H6c $99.5M).
+    admin_trust_impact_threshold_usd: float = 1_000_000.0
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> "AuditContext":
@@ -78,6 +91,13 @@ class AuditContext:
             trusted_roles=list(d.get("trusted_roles") or []),
             deployed_contracts=dict(d.get("deployed_contracts") or {}),
             out_of_scope_action=str(d.get("out_of_scope_action") or "downgrade"),
+            # firepan-pr77 — Slither corroboration + impact-bounded overrides
+            slither_hits=list(d.get("slither_hits") or []),
+            finding_impacts=dict(d.get("finding_impacts") or {}),
+            admin_trust_impact_threshold_usd=float(
+                d.get("admin_trust_impact_threshold_usd")
+                or 1_000_000.0
+            ),
         )
 
 
@@ -305,6 +325,20 @@ def curate_one(hypothesis: dict[str, Any], ctx: AuditContext) -> CurationResult:
     # Rule 3 — admin / owner trust boundary.
     role = _trust_boundary_match(_flatten_evidence(hypothesis), ctx.trusted_roles)
     if role and _SEV_RANK.get(orig_sev, 0) > _SEV_RANK["low"]:
+        # firepan-pr77 Rule 5a — admin-trust-impact override. If the finding's
+        # bounded USD impact exceeds the engagement threshold, admin-trust
+        # demotion is overridden — the impact axis dominates the trust axis.
+        # Closes assune-m35 (reviewer feedback: H6c at $99.5M was buried as Low).
+        impact = ctx.finding_impacts.get(hid, 0.0) if ctx.finding_impacts else 0.0
+        if impact >= ctx.admin_trust_impact_threshold_usd:
+            return CurationResult(
+                hid, orig_sev, orig_sev, label="admin_trust_high_impact",
+                reason=(
+                    f"requires {role!r} BUT bounded impact ${impact:,.0f} "
+                    f">= ${ctx.admin_trust_impact_threshold_usd:,.0f} "
+                    f"threshold; severity preserved (Rule 5a)"
+                ),
+            )
         return CurationResult(
             hid, orig_sev, "low", label="admin_trust_surface",
             reason=f"exploitation requires {role!r}; "
@@ -340,7 +374,186 @@ def curate_one(hypothesis: dict[str, Any], ctx: AuditContext) -> CurationResult:
                 ),
             )
 
+    # firepan-pr77 Rule 5b — Slither corroboration. When the auditor's
+    # finding overlaps a Slither hit (same file + nearby lines + compatible
+    # vulnerability_type), mark `slither_corroborated=True` in the
+    # properties. When the auditor's finding has NO Slither overlap AND
+    # severity is High/Critical, demote one level and mark
+    # `unconfirmed_by_static` so the reviewer knows the LLM is the sole
+    # source. Conservative: never PROMOTE; only demote unconfirmed
+    # high-severity findings or annotate corroborated findings.
+    corroborated, slither_check = _slither_overlap(hypothesis, ctx.slither_hits)
+    if corroborated:
+        # Annotate but don't change severity — let other rules continue.
+        # Curator-applying caller will see the label addition and propagate.
+        prop_label = "slither_corroborated"
+        return CurationResult(
+            hid, orig_sev, orig_sev, label=prop_label,
+            reason=(
+                f"Slither corroborated this finding (`{slither_check}`); "
+                "stayed at original severity"
+            ),
+        )
+    if (not corroborated
+            and _SEV_RANK.get(orig_sev, 0) >= _SEV_RANK["high"]
+            and ctx.slither_hits):  # only demote when we ran Slither at all
+        floor = {"critical": "high", "high": "medium"}.get(orig_sev, orig_sev)
+        return CurationResult(
+            hid, orig_sev, floor, label="unconfirmed_by_static",
+            reason=(
+                f"High/Critical without Slither corroboration; demoted to "
+                f"{floor.upper()} (Rule 5b). Reviewer to verify."
+            ),
+        )
+
     return CurationResult(hid, orig_sev, orig_sev)
+
+
+# ---------------------------------------------------------------------------
+# Rule 5b helpers — Slither overlap detection
+# ---------------------------------------------------------------------------
+
+
+def _slither_overlap(
+    hypothesis: dict[str, Any],
+    slither_hits: list[dict[str, Any]],
+) -> tuple[bool, str]:
+    """Return (matched, slither_check_name). True when the finding's file +
+    line range overlaps with a Slither hit, AND the slither check's
+    vulnerability type is compatible with the finding's vulnerability_type.
+    Tolerant — we'd rather over-corroborate than under-corroborate."""
+    if not slither_hits:
+        return (False, "")
+    loc_file = _location_file(hypothesis) or ""
+    if not loc_file:
+        return (False, "")
+    nrefs = hypothesis.get("node_refs") or []
+    if not nrefs:
+        return (False, "")
+    # Extract a line number range from the first node_ref (format: "path:N" or
+    # "path:N-M"). Be forgiving with malformed inputs.
+    line_start: int | None = None
+    line_end: int | None = None
+    if isinstance(nrefs[0], str) and ":" in nrefs[0]:
+        try:
+            tail = nrefs[0].rsplit(":", 1)[-1]
+            if "-" in tail:
+                a, b = tail.split("-", 1)
+                line_start, line_end = int(a), int(b)
+            else:
+                line_start = line_end = int(tail)
+        except (ValueError, IndexError):
+            pass
+    if line_start is None:
+        return (False, "")
+
+    vuln_type = (hypothesis.get("vulnerability_type") or "").lower()
+    title = (hypothesis.get("title") or "").lower()
+
+    for hit in slither_hits:
+        hit_file = (hit.get("file") or "").strip()
+        if not hit_file:
+            continue
+        # Match by suffix — slither paths may be absolute, finding paths
+        # repo-relative, etc.
+        if not (loc_file.endswith(hit_file) or hit_file.endswith(loc_file)):
+            continue
+        hit_lines = hit.get("lines") or []
+        if not isinstance(hit_lines, list) or not hit_lines:
+            # No line-level info — file-level match counts as overlap.
+            return (True, str(hit.get("check") or "file-overlap"))
+        # Line-range overlap with a ±5 tolerance
+        hit_min = min(hit_lines) - 5
+        hit_max = max(hit_lines) + 5
+        if not (line_end < hit_min or line_start > hit_max):
+            check = str(hit.get("check") or "line-overlap")
+            # Optional vuln_type compatibility check — if both sides
+            # declare types, they should be in the same family.
+            if vuln_type and check:
+                if not _vuln_type_compatible(vuln_type, check, title):
+                    # Geographic overlap but type mismatch — still report
+                    # as corroborated but flag the mismatch in the check
+                    # name for the reviewer.
+                    return (True, f"{check} (type mismatch w/ {vuln_type})")
+            return (True, check)
+    return (False, "")
+
+
+_SLITHER_TYPE_FAMILIES: dict[str, list[str]] = {
+    "reentrancy": ["reentrancy-eth", "reentrancy-no-eth",
+                   "reentrancy-benign", "reentrancy-events",
+                   "reentrancy-unlimited-gas"],
+    "math": ["divide-before-multiply", "incorrect-equality",
+             "weak-prng", "uninitialized-local"],
+    "access-control": ["arbitrary-send", "controlled-array-length",
+                       "controlled-delegatecall", "suicidal"],
+    "oracle": ["timestamp", "block-other-parameters"],
+    "dos": ["calls-loop", "costly-loop", "low-level-calls"],
+    "uninitialized": ["uninitialized-state", "uninitialized-storage",
+                      "uninitialized-local"],
+}
+
+
+def _vuln_type_compatible(vuln_type: str, slither_check: str, title: str) -> bool:
+    """Return True if the slither check is in a family compatible with the
+    auditor's vulnerability_type / title. Tolerant by design."""
+    if not slither_check:
+        return True
+    check_lower = slither_check.lower()
+    # Find which family the slither check belongs to
+    family = None
+    for fam, members in _SLITHER_TYPE_FAMILIES.items():
+        if check_lower in members or fam in check_lower:
+            family = fam
+            break
+    if not family:
+        # Unknown slither check — accept (don't penalize for our incomplete map)
+        return True
+    text = (vuln_type + " " + title).lower()
+    if family in text:
+        return True
+    # Family aliases for the auditor's terminology
+    aliases = {
+        "math": ["overflow", "underflow", "division", "div-by-zero",
+                 "arithmetic", "precision"],
+        "access-control": ["authorization", "permission", "missing-check",
+                           "missing-modifier", "owner"],
+        "reentrancy": ["reentrant", "external-call"],
+    }
+    for alias in aliases.get(family, []):
+        if alias in text:
+            return True
+    return False
+
+
+def _evidence_density(hypothesis: dict[str, Any]) -> int:
+    """Return a numeric density score for tie-breaking dedup. Higher = more
+    line-cite + tagged evidence + higher-confidence items. Used by
+    curate_all() when two findings collide on the same code location."""
+    items = hypothesis.get("evidence", [])
+    if isinstance(items, dict):
+        items = items.get("items", [])
+    if not isinstance(items, list):
+        return 0
+    score = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        desc = item.get("description", "") or ""
+        # Tagged evidence ([data_flow], [exploitability], [poc_construction], ...)
+        if desc.lstrip().startswith("["):
+            score += 3
+        # Specific file:line citations
+        for needle in [":", "#L", "@L"]:
+            if needle in desc:
+                score += 1
+                break
+        # Confidence
+        try:
+            score += int(float(item.get("confidence", 0.0) or 0) * 10)
+        except (ValueError, TypeError):
+            pass
+    return score
 
 
 def _fail_safe_revert_match(evidence_text: str) -> bool:
@@ -357,25 +570,76 @@ def curate_all(
     hypotheses: list[Any], ctx: AuditContext
 ) -> list[CurationResult]:
     """Curate a batch of hypotheses. Accepts either dicts or dataclass
-    instances — we marshal to dict internally."""
-    results: list[CurationResult] = []
+    instances — we marshal to dict internally. firepan-pr77: before
+    curating, resolve same-location conflicts via evidence-density."""
+    # Marshal everything to dicts first so we can compute evidence density
+    # consistently.
+    marshalled: list[dict[str, Any]] = []
     for h in hypotheses:
         if hasattr(h, "__dict__") and not isinstance(h, dict):
-            # Dataclass-or-similar — best-effort conversion. We don't import
-            # the Hypothesis class here to avoid a circular import; instead
-            # we marshal the public attributes we care about.
             d = {
                 "id": getattr(h, "id", ""),
                 "title": getattr(h, "title", ""),
                 "description": getattr(h, "description", ""),
                 "severity": getattr(h, "severity", ""),
+                "vulnerability_type": getattr(h, "vulnerability_type", ""),
                 "node_refs": getattr(h, "node_refs", []) or [],
                 "evidence": getattr(h, "evidence", []) or [],
                 "properties": getattr(h, "properties", {}) or {},
             }
         else:
             d = dict(h)
-        results.append(curate_one(d, ctx))
+        marshalled.append(d)
+
+    # firepan-pr77 evidence-density dedup. When two findings share the same
+    # location (file + nearest-line bucket), pick the one with the higher
+    # evidence-density score. The losers are NOT dropped — they're marked
+    # so the caller can still surface them as "subsumed by hyp_X". This
+    # mirrors LLM-SmartAudit's Summarization Agent role.
+    by_loc: dict[tuple[str, int], list[int]] = {}
+    for i, d in enumerate(marshalled):
+        loc = _location_file(d) or ""
+        line = 0
+        nrefs = d.get("node_refs") or []
+        if nrefs and isinstance(nrefs[0], str) and ":" in nrefs[0]:
+            try:
+                tail = nrefs[0].rsplit(":", 1)[-1]
+                line = int(tail.split("-", 1)[0])
+            except (ValueError, IndexError):
+                line = 0
+        bucket = (line // 10) * 10  # ±5-line tolerance
+        by_loc.setdefault((loc, bucket), []).append(i)
+
+    subsumed: set[int] = set()
+    for (loc, _bucket), idxs in by_loc.items():
+        if len(idxs) < 2 or not loc:
+            continue
+        # Pick the densest evidence
+        scored = sorted(
+            idxs, key=lambda i: -_evidence_density(marshalled[i])
+        )
+        keeper = scored[0]
+        for loser in scored[1:]:
+            # Annotate the loser; the actual curate_one call still runs so the
+            # caller has uniform results, but the label flags the subsumption.
+            subsumed.add(loser)
+            marshalled[loser].setdefault("properties", {})[
+                "subsumed_by"
+            ] = marshalled[keeper].get("id")
+
+    results: list[CurationResult] = []
+    for i, d in enumerate(marshalled):
+        r = curate_one(d, ctx)
+        if i in subsumed:
+            # Override label with subsumption signal — visible in curator summary
+            r = CurationResult(
+                r.hypothesis_id, r.original_severity,
+                "informational", label="subsumed_by_denser_evidence",
+                reason=(f"same-location duplicate of "
+                        f"{d['properties'].get('subsumed_by')}; "
+                        f"floored to informational"),
+            )
+        results.append(r)
     return results
 
 

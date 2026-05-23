@@ -624,6 +624,7 @@ contract {contract_name} is Test {{
         iterations: list[IterationRecord] = []
         last_trace = ""
         last_revert = ""
+        last_slither = ""  # firepan-pr77 — Slither output from prior iter
 
         # firepan-a1 — ClaudeSession takes a config dict, not kwargs. Build a
         # minimal one that points at Opus 4.7 with a tighter turn budget than
@@ -696,8 +697,10 @@ contract {contract_name} is Test {{
                 break
 
             # Build the user prompt with finding + feedback context
-            prompt = self._build_mve_prompt(contract_name, last_trace, last_revert,
-                                            iteration)
+            prompt = self._build_mve_prompt(
+                contract_name, last_trace, last_revert,
+                iteration, last_slither=last_slither,
+            )
 
             cli_result = cli.run(prompt, system_prompt=system_prompt,
                                  max_turns=10, timeout=300, output_json=True)
@@ -770,10 +773,22 @@ contract {contract_name} is Test {{
             # forge_test_ran is True only if compile passed AND forge actually
             # invoked the test (not just printed compile errors).
             rec.forge_test_ran = rec.forge_compiled and rc in (0, 1)
+
+            # firepan-pr77 — Slither on Claude's exploit (SolAgent dual-loop).
+            # Catches placebo exploits (Claude writes vm.deal+transfer to satisfy
+            # delta>0 without actually attacking the protocol). Skipped when
+            # compile failed (slither needs valid source).
+            slither_findings = ""
+            if rec.forge_compiled:
+                slither_findings = self._run_slither_on_mve(
+                    isolated_root, contract_name
+                )
             rec.attacker_delta_wei = _extract_attacker_delta(trace)
             rec.revert_reason = _extract_revert_reason(trace)
             rec.trace_excerpt = trace[-1500:]
             last_revert = rec.revert_reason
+            # firepan-pr77 — carry slither findings into next iter's prompt
+            last_slither = slither_findings
             iterations.append(rec)
             self._append_iteration_jsonl(iter_file, rec)
 
@@ -807,7 +822,8 @@ contract {contract_name} is Test {{
                 f"cost=${self.cost_so_far:.2f}")
 
     def _build_mve_prompt(self, contract_name: str, last_trace: str,
-                          last_revert: str, iteration: int) -> str:
+                          last_revert: str, iteration: int,
+                          last_slither: str = "") -> str:
         f = self.finding
         ev_lines = []
         for item in (f.evidence or [])[:5]:
@@ -825,6 +841,19 @@ contract {contract_name} is Test {{
                 f"Detected revert reason: `{last_revert or '(none)'}`\n\n"
                 f"Adjust the exploit body to handle the failure above."
             )
+            # firepan-pr77 — SolAgent dual-loop: include Slither's read on the
+            # prior iteration's exploit code. Catches "placebo" exploits where
+            # Claude wrote synthetic vm.deal manipulation that doesn't actually
+            # call the target protocol.
+            if last_slither:
+                feedback += (
+                    f"\n\n## Slither analysis of your previous exploit\n\n"
+                    f"```\n{last_slither[:1500]}\n```\n\n"
+                    f"If Slither reports your code doesn't make state-changing "
+                    f"calls to the target protocol addresses (RAAC.MARKET, "
+                    f"RAAC.TREASURY, etc.), your exploit is a placebo — "
+                    f"REWRITE it to actually invoke the deployed contracts."
+                )
 
         return (
             f"## Finding to reproduce\n\n"
@@ -854,6 +883,32 @@ contract {contract_name} is Test {{
         line = json.dumps(dataclasses.asdict(rec), default=str)
         with path.open("a") as f:
             f.write(line + "\n")
+
+    def _run_slither_on_mve(self, isolated_root: Path, contract_name: str) -> str:
+        """firepan-pr77 — run Slither on Claude's exploit. Returns a short
+        human-readable digest for inclusion in the next iter's prompt.
+
+        SolAgent (arxiv 2601.23009) showed this gives a 23-35% vulnerability
+        signal that the LLM agent uses to refine. For us the value is
+        slightly different — we're looking for SOLAGENT-STYLE
+        anti-placebo signal: 'this exploit code doesn't actually make
+        state-changing calls.'"""
+        test_file = isolated_root / "test" / "exploits" / f"{self.finding.hypothesis_id}.t.sol"
+        if not test_file.exists():
+            return ""
+        # Slither against the isolated root — same flags as audit-stage usage.
+        rc, out, err = _run(
+            ["slither", str(test_file), "--print", "human-summary",
+             "--solc", "0.8.20"],
+            cwd=isolated_root, timeout=60,
+        )
+        # Tolerate Slither failures — it shouldn't break the verify loop.
+        # The output may go to stderr; check both.
+        combined = (out or "") + "\n" + (err or "")
+        # Strip ANSI escapes that Slither emits for color
+        combined = re.sub(r"\x1b\[[0-9;]*m", "", combined)
+        # Pluck the most informative section
+        return combined[-2000:] if combined.strip() else "(no slither output)"
 
     # ------------------------------------------------------------------
     # firepan-r0o — isolated compile root (cherry-pick of A1 §IV-C

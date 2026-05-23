@@ -751,6 +751,8 @@ def execute_audit_task(
                 ),
             )
             verify_work_dir = project_dir / "verify" / finding_input.hypothesis_id
+            # firepan-a1 thread the iteration cap + cost ceiling through.
+            # Defaults match the paper-recommended 5 iterations + $15 budget.
             cfg = VerifierConfig(
                 rpc_url=bv_params.get("rpc_url"),
                 fork_block=bv_params.get("fork_block"),
@@ -758,6 +760,8 @@ def execute_audit_task(
                 work_dir=verify_work_dir,
                 dry_run=not bool(bv_params.get("rpc_url")
                                  and bv_params.get("fork_block")),
+                max_iterations=int(bv_params.get("max_iterations") or 5),
+                max_cost_usd=float(bv_params.get("max_cost_usd") or 15.0),
             )
             publisher.publish_thought(
                 f"Starting bump-verify for {finding_input.hypothesis_id} "
@@ -794,6 +798,11 @@ def execute_audit_task(
                         ],
                         "work_dir": verify_summary.work_dir,
                         "artifacts_at": verify_summary.work_dir,
+                        # firepan-a1 — surface MVE loop + impact bounding state
+                        # so the dashboard and reviewer audit can inspect them.
+                        "cost_usd": verify_summary.cost_usd,
+                        "iterations_used": verify_summary.iterations_used,
+                        "impact_usd": verify_summary.impact_usd,
                     }
                     _sessv.session_metadata = meta
                     _dv2.commit()

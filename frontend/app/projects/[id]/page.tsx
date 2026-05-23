@@ -136,21 +136,45 @@ export default function ProjectSessionsPage() {
                             ⚠ uncurated
                           </span>
                         )}
-                        {/* firepan-y22: bump-verify verdict — only show when the
-                            verifier ran (mode='verify'). 'verified' / 'verified_fragile'
-                            / 'unverified' / 'disproved' */}
+                        {/* firepan-y22 + firepan-a1: bump-verify verdict pill.
+                            Verdict vocab: 'verified' / 'verified_fragile' /
+                            'unverified' / 'disproved' (Phase 4 axes), or
+                            'mve_verified' / 'mve_unverified' / 'mve_aborted_cost'
+                            (Phase 3 A1 MVE loop). */}
                         {session.bump_verify_verdict && (
                           <span
                             className={`inline-flex rounded-full px-2 text-xs font-semibold leading-5 ${
-                              session.bump_verify_verdict === 'verified'
+                              session.bump_verify_verdict === 'verified' || session.bump_verify_verdict === 'mve_verified'
                                 ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/20 dark:text-emerald-400'
                                 : session.bump_verify_verdict === 'verified_fragile'
                                 ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400'
+                                : session.bump_verify_verdict === 'mve_aborted_cost'
+                                ? 'bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400'
                                 : 'bg-zinc-100 text-zinc-700 dark:bg-zinc-900/20 dark:text-zinc-400'
                             }`}
                             title={`firepan-bump-verify verdict: ${session.bump_verify_verdict}`}
                           >
                             verify: {session.bump_verify_verdict}
+                          </span>
+                        )}
+                        {/* firepan-a1: USD impact + cost pills when the A1
+                            MVE loop ran. impact_usd is the mid bound from
+                            Phase 5 (revenue normalizer); cost_usd is the
+                            cumulative Claude + RPC spend. */}
+                        {typeof session.bump_verify_impact_usd === 'number' && session.bump_verify_impact_usd > 0 && (
+                          <span
+                            className="inline-flex rounded-full bg-rose-100 px-2 text-xs font-semibold leading-5 text-rose-800 dark:bg-rose-900/20 dark:text-rose-400"
+                            title="Bounded USD impact of the verified exploit (A1 revenue normalizer)"
+                          >
+                            ${Math.round(session.bump_verify_impact_usd).toLocaleString()} impact
+                          </span>
+                        )}
+                        {typeof session.bump_verify_cost_usd === 'number' && session.bump_verify_cost_usd > 0 && (
+                          <span
+                            className="inline-flex rounded-full bg-zinc-100 px-2 text-xs font-medium leading-5 text-zinc-700 dark:bg-zinc-900/20 dark:text-zinc-400"
+                            title={`Verify-mode spend: $${session.bump_verify_cost_usd.toFixed(2)}${session.bump_verify_iterations_used ? ` (${session.bump_verify_iterations_used} iters)` : ''}`}
+                          >
+                            ${session.bump_verify_cost_usd.toFixed(2)}
                           </span>
                         )}
                       </div>

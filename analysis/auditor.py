@@ -135,8 +135,10 @@ finding, do the following AND include the result in the evidence:
 
 5. If you cannot show the caller-trace from a public entry point, the
    finding belongs at `severity: "informational"`, NOT High/Critical.
-   Include `"reachability_caveat": "could not trace public entry point"`
-   in the candidate so the reviewer sees your reasoning.
+   PREFIX the `reasoning` field with "(reachability-caveat: could not
+   trace public entry point) " so the reviewer can see your caveat
+   without breaking the CandidateFinding schema. Do not invent new
+   top-level fields — the JSON schema is fixed.
 
 Findings that fail this check waste reviewer time and inflate the false-
 positive rate. Don't file them. Prefer one well-reachability-proven medium
@@ -492,13 +494,26 @@ class SingleAuditor:
                             "Coverage insufficient for %s, retry %d/%d",
                             chunk.chunk_id, retry + 1, max_coverage_retries,
                         )
-                        # Re-extract with the coverage gaps as guidance
-                        gap_prompt = (
-                            f"COVERAGE GAPS from previous pass:\n"
-                            f"Unchecked: {', '.join(declaration.unchecked_surfaces)}\n"
-                            f"Expected absent findings to verify: "
-                            f"{', '.join(declaration.expected_absent_findings)}\n"
-                        )
+                        # firepan-egc-followup: when the previous CLI call errored
+                        # (e.g. max_turns or invalid JSON), declaration is None.
+                        # Don't crash — emit a generic gap prompt and let the
+                        # retry proceed with whatever surfaces guidance the
+                        # source context already gave us.
+                        if declaration is None:
+                            gap_prompt = (
+                                "COVERAGE GAPS from previous pass: previous CLI "
+                                "call errored (timeout / max_turns / invalid JSON) "
+                                "so no coverage declaration is available. Treat "
+                                "every surface in the scope guidance as unchecked "
+                                "and re-attempt extraction with depth over breadth.\n"
+                            )
+                        else:
+                            gap_prompt = (
+                                f"COVERAGE GAPS from previous pass:\n"
+                                f"Unchecked: {', '.join(declaration.unchecked_surfaces or [])}\n"
+                                f"Expected absent findings to verify: "
+                                f"{', '.join(declaration.expected_absent_findings or [])}\n"
+                            )
                         extra_candidates = self._extract_candidates(
                             chunk,
                             source_context,

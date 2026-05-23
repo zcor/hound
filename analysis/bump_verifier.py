@@ -161,6 +161,77 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_RAAC_INTERFACES_SOL = '''// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+/// firepan-r0o — ABI-only interfaces for the RAAC f(x) deployed
+/// protocol. Used by mode=verify exploits so the MVE can call into the
+/// deployed contracts via vm.createSelectFork without needing the
+/// original source tree (which mixes 0.7.6 + 0.8.20 pragmas and breaks
+/// forge's compile auto-discovery).
+///
+/// Addresses (Ethereum mainnet):
+///   Oracle:     0x0236497082f693525dca8717787b0f601ad62ce6
+///   Market:     0x4e8ef157762f0b8a7ad0d9ff45f86b203a0658cc
+///   Treasury:   0x51c4348af0c6066a2fd31bd968bc0c039fe27342
+///   FToken:     0xc0c17dd08263c16f6b64e772fb9b723bf1344ddf
+///   Collateral: 0x7a7f847fb60b0000e24cce07298dc73df8b8e56a
+
+library RAAC {
+    address constant ORACLE = 0x0236497082F693525DCA8717787B0F601aD62cE6;
+    address constant MARKET = 0x4e8eF157762F0b8a7Ad0d9FF45f86B203a0658Cc;
+    address constant TREASURY = 0x51c4348AF0C6066A2FD31bD968Bc0c039fe27342;
+    address constant FTOKEN = 0xC0C17dD08263c16F6b64e772fb9B723Bf1344Ddf;
+    address constant COLLATERAL = 0x7A7f847FB60b0000E24CCE07298DC73df8B8e56a;
+}
+
+interface IFxRWAOracle {
+    function getPrice() external view returns (bool, uint256);
+    function getReservePrice() external view returns (bool, uint256);
+}
+
+interface IFxTreasury {
+    function totalBaseToken() external view returns (uint256);
+    function strategy() external view returns (address);
+    function strategyUnderlying() external view returns (uint256);
+    function priceOracle() external view returns (address);
+    function baseToken() external view returns (address);
+    function fToken() external view returns (address);
+    function xToken() external view returns (address);
+    function mint(uint256 baseIn, address recipient, uint8 option)
+        external returns (uint256 fTokenOut, uint256 xTokenOut);
+    function redeem(uint256 fTokenIn, uint256 xTokenIn, address owner)
+        external returns (uint256 baseOut);
+    function transferToStrategy(uint256 amount) external;
+    function notifyStrategyProfit(uint256 amount) external;
+    function updateStrategy(address newStrategy) external;
+    function updatePriceOracle(address newOracle, uint8 oracleDecimals) external;
+}
+
+interface IFxMarket {
+    function mint(uint256 baseIn, address recipient, uint256 minFOut, uint256 minXOut)
+        external returns (uint256 fTokenOut, uint256 xTokenOut);
+    function mintFToken(uint256 baseIn, address recipient, uint256 minFOut)
+        external returns (uint256 fTokenOut);
+    function mintXToken(uint256 baseIn, address recipient, uint256 minXOut)
+        external returns (uint256 xTokenOut);
+    function redeem(uint256 fTokenIn, uint256 xTokenIn, address recipient,
+                    uint256 minBaseOut) external returns (uint256 baseOut);
+    function mintFTokenWithoutBaseToken(uint256 newCollateralRatio, address recipient)
+        external returns (uint256 fTokenOut);
+    function donateToken(address token, uint256 amount, bool emitEvent) external;
+}
+
+interface IERC20Min {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function totalSupply() external view returns (uint256);
+    function decimals() external view returns (uint8);
+}
+'''
+
+
 _SOLIDITY_FENCE_RE = re.compile(r"```solidity\s*\n(.*?)\n```", re.DOTALL)
 _ATTACKER_DELTA_RE = re.compile(
     r"Attacker delta wei:?\s*(-?\d+)", re.IGNORECASE,
@@ -583,6 +654,20 @@ contract {contract_name} is Test {{
             "contract must inherit `forge-std/Test.sol`, be named exactly "
             f"`{contract_name}`, expose a `setUp()` (you may keep the multi-asset "
             "funding) and a `test_Exploit()` that demonstrates attacker profit.\n\n"
+            "AVAILABLE IMPORTS: `forge-std/Test.sol` (Forge cheatcodes) and "
+            "`src/interfaces/RAAC.sol` (the deployed RAAC protocol). RAAC.sol "
+            "exports addresses + interfaces:\n"
+            "  - RAAC.ORACLE     (IFxRWAOracle)\n"
+            "  - RAAC.MARKET     (IFxMarket — mint / redeem / "
+            "mintFTokenWithoutBaseToken / donateToken)\n"
+            "  - RAAC.TREASURY   (IFxTreasury — strategy / updateStrategy / "
+            "transferToStrategy / priceOracle)\n"
+            "  - RAAC.FTOKEN, RAAC.COLLATERAL (IERC20Min)\n\n"
+            "DO NOT try to import from `contracts/` or `lib/openzeppelin-*`. "
+            "The compile root is isolated; only the imports above resolve. "
+            "Use `IFxMarket(RAAC.MARKET).mint(...)`-style calls to interact "
+            "with the deployed protocol after `vm.createSelectFork(RPC, "
+            "FORK_BLOCK)`.\n\n"
             "ITERATION DISCIPLINE: each iteration you'll receive the prior forge "
             "test trace + revert reason (if any). Adapt the exploit body based on "
             "the actual on-chain behavior you observe — DO NOT hallucinate function "
@@ -590,7 +675,11 @@ contract {contract_name} is Test {{
             "vm.deal, vm.expectRevert) liberally.\n\n"
             "SUCCESS CRITERION: at end-of-test, attacker ETH balance must be "
             "STRICTLY greater than start. Emit `log_named_decimal_int(\"Attacker "
-            "delta wei\", delta, 0);` for the loop to detect profitability."
+            "delta wei\", delta, 0);` for the loop to detect profitability. If "
+            "after 5 iterations you cannot produce attacker profit, that is "
+            "EVIDENCE the finding is a false positive — write the simplest "
+            "contract that at least compiles + runs so the verdict is "
+            "informative."
         )
 
         for iteration in range(1, self.config.max_iterations + 1):
@@ -631,12 +720,21 @@ contract {contract_name} is Test {{
                 continue
 
             rec.mve_extracted = True
-            # Overwrite the scaffold with Claude's contract
+            # firepan-r0o — write Claude's contract into the isolated compile
+            # root (NOT the original foundry_root, which mixes pragma versions
+            # across the RAAC tree and breaks compile every time). The isolated
+            # root is set up once by _ensure_isolated_compile_root() on the
+            # first iteration; subsequent iters reuse it.
+            isolated_root = self._ensure_isolated_compile_root()
+            isolated_test = isolated_root / "test" / "exploits" / f"{self.finding.hypothesis_id}.t.sol"
+            isolated_test.write_text(mve_body)
+            # Also keep the original scaffold_path in sync for reviewer audit.
             scaffold_path.write_text(mve_body)
 
-            # forge test
+            # forge test against the ISOLATED root
             cmd = [
                 "forge", "test",
+                "--root", str(isolated_root),
                 "--match-contract", contract_name,
                 "--fork-url", self.config.rpc_url,
                 "--fork-block-number", str(self.config.fork_block),
@@ -644,7 +742,7 @@ contract {contract_name} is Test {{
             ]
             env = {**os.environ, "RPC_URL": self.config.rpc_url}
             rc, out, err = _run(
-                cmd, cwd=self.config.foundry_root, timeout=180, env=env,
+                cmd, cwd=isolated_root, timeout=180, env=env,
             )
             # Approximate RPC cost: ~500 CU @ $0.0006/MCU = $0.0003 per call.
             # Plus the LLM is the dominant cost so this is mostly bookkeeping.
@@ -739,6 +837,67 @@ contract {contract_name} is Test {{
         line = json.dumps(dataclasses.asdict(rec), default=str)
         with path.open("a") as f:
             f.write(line + "\n")
+
+    # ------------------------------------------------------------------
+    # firepan-r0o — isolated compile root (cherry-pick of A1 §IV-C
+    # "Concrete Execution Environment")
+    # ------------------------------------------------------------------
+
+    def _ensure_isolated_compile_root(self) -> Path:
+        """Create (idempotent) a standalone Foundry project under work_dir
+        whose source tree contains ONLY:
+          - test/exploits/<id>.t.sol  (Claude's exploit)
+          - src/interfaces/RAAC.sol   (ABI-only interfaces for deployed contracts)
+          - lib/forge-std             (symlinked from the original repo)
+          - foundry.toml              (minimal config pinning solc 0.8.20)
+
+        This avoids the mixed-pragma RAAC source tree (^0.7.6 + =0.8.20 +
+        ^0.8.20 across contracts/voting/, contracts/zap/, ...) which
+        breaks compile every time forge tries to discover solc for files
+        we don't care about. The exploit interacts with the deployed
+        protocol via `vm.createSelectFork` + interface calls, so we don't
+        need the source.
+        """
+        root = self.work_dir / "_isolated"
+        # Already set up?
+        if (root / "foundry.toml").exists() and (root / "lib" / "forge-std").exists():
+            return root
+
+        (root / "test" / "exploits").mkdir(parents=True, exist_ok=True)
+        (root / "src" / "interfaces").mkdir(parents=True, exist_ok=True)
+        (root / "lib").mkdir(parents=True, exist_ok=True)
+
+        # Symlink forge-std from the original repo. This is cheap (no
+        # vendoring) and stays in sync if the user updates forge-std there.
+        repo_forge_std = (self.config.foundry_root or Path("/")) / "lib" / "forge-std"
+        link = root / "lib" / "forge-std"
+        if not link.exists() and repo_forge_std.exists():
+            try:
+                link.symlink_to(repo_forge_std)
+            except OSError:
+                # Symlink might fail across filesystems — fall back to copy.
+                shutil.copytree(repo_forge_std, link)
+
+        # Minimal foundry.toml — pin solc 0.8.20 so forge doesn't try to
+        # auto-discover. Verbosity per A1 (we want traces).
+        (root / "foundry.toml").write_text(
+            "[profile.default]\n"
+            "src = \"src\"\n"
+            "test = \"test\"\n"
+            "libs = [\"lib\"]\n"
+            "solc = \"0.8.20\"\n"
+            "via_ir = false\n"
+            "optimizer = false\n"
+            "verbosity = 4\n"
+            "fs_permissions = [{ access = \"read\", path = \".\"}]\n"
+        )
+
+        # ABI-only interfaces for the RAAC deployed contracts. These let the
+        # MVE call into the protocol via vm.createSelectFork without needing
+        # the original source. Addresses come from the wiki
+        # AUDIT_CONTEXT.md (deployed-contracts table).
+        (root / "src" / "interfaces" / "RAAC.sol").write_text(_RAAC_INTERFACES_SOL)
+        return root
 
     # ------------------------------------------------------------------
     # Phase 5 — Impact Bounding (A1 §IV-C revenue normalizer)

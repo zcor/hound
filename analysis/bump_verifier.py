@@ -899,18 +899,30 @@ contract {contract_name} is Test {{
             })
         self._write_bumps_md(bumps)
         self.summary.bumps_table = bumps
-        # Verdict heuristic: if at least 2 of the in-range blocks pass, it's
-        # verified; if zero pass, it's unverified; if only the target block
-        # passes, it's likely a fork artifact (flag in notes).
+        # firepan-a1 — respect a Phase 3 MVE verdict when one already exists.
+        # The first-cut code unconditionally overwrote the verdict here, which
+        # turned "mve_verified" into "verified" (mostly cosmetic) and worse
+        # turned "mve_aborted_cost" into "unverified" (information loss). Now
+        # we only set the bumping verdict when Phase 3 left the verdict at
+        # its initial "unverified" sentinel.
         passes = sum(1 for b in bumps if b["outcome"] == "passed")
-        self.summary.verdict = (
-            "verified" if passes >= 2
-            else "unverified" if passes == 0
-            else "verified_fragile"
-        )
-        self.summary.verdict_reason = (
-            f"{passes}/{len(bumps)} block bumps passed"
-        )
+        if self.summary.verdict in ("unverified", ""):
+            self.summary.verdict = (
+                "verified" if passes >= 2
+                else "unverified" if passes == 0
+                else "verified_fragile"
+            )
+            self.summary.verdict_reason = (
+                f"{passes}/{len(bumps)} block bumps passed"
+            )
+        elif self.summary.verdict == "mve_verified" and passes < 2:
+            # Phase 3 produced an MVE but Phase 4 says it's fork-fragile.
+            # Downgrade for the reviewer's benefit.
+            self.summary.verdict = "mve_verified_fragile"
+            self.summary.verdict_reason = (
+                f"{self.summary.verdict_reason}; only {passes}/{len(bumps)}"
+                f" bumps reproduced — likely a fork artifact"
+            )
         result = PhaseResult(
             phase="4_bumping",
             started_at=started,

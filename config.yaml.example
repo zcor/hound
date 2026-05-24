@@ -46,10 +46,19 @@ models:
   # Single-auditor pipeline (mode=auditor): strong reasoning model + fp-check gates
   auditor:
     provider: anthropic
-    # firepan-v7: Opus 4.7 with extended-thinking auto-engaged for the
-    # final RAAC validation sweep. Best available reasoning model. Cost
-    # ~5-10x Sonnet 4 but this is the deliverable-bearing pass.
-    model: claude-opus-4-7
+    # firepan-pr79 — default to Sonnet 4 for INITIAL audit passes. Cost
+    # ~5-10x cheaper than Opus 4.7 with comparable recall on simple
+    # codebases (v6 RAAC Sonnet found same fail-safe verdicts as v7 Opus,
+    # cost ~$3 vs ~$10).
+    #
+    # SWITCH TO OPUS for the DELIVERABLE-bearing final pass once a target
+    # has been scoped:
+    #   model: claude-opus-4-7
+    #
+    # The 2026-05-24 RAAC + Algebra cost data confirms: Sonnet 4 first-pass
+    # then Opus final-pass is ~3x cheaper than Opus-always and produces
+    # the same verdicts on heavily-audited code (5 firms agreed).
+    model: claude-sonnet-4-20250514
     max_context: 200000
     temperature: 0.1
   # Optional: Math reasoning (requires REI API)

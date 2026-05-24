@@ -70,10 +70,12 @@ class VerifierConfig:
     skip_patch_bump: bool = False  # only true when no fix is available yet
     dry_run: bool = False  # when True, all external calls become no-ops
     # firepan-a1 Phase 3 — Claude-driven MVE generation. A1 (Gervais & Zhou,
-    # 2025) found 5 iterations is the empirical sweet spot for execution-feedback
-    # loops: ~85% of recoverable success at diminishing-returns cost. Set to 0
-    # to disable MVE generation (revert to today's scaffold-only Phase 3).
-    max_iterations: int = 5
+    # 2025) found 5 iterations is the empirical sweet spot. firepan-pr79
+    # default DROPPED to 3 — Algebra cost analysis (2026-05-24) showed
+    # 5 iterations on a 1k LOC scope burns ~$0.40/finding; 3 iters
+    # captures ~70% of recoverable success at 60% of the cost. Pass 5 in
+    # the request when you need the full loop.
+    max_iterations: int = 3
     # firepan-a1 Phase 3 + 5 cost gate — hard ceiling on cumulative spend
     # (Claude API + estimated RPC cost) per verify run. Loop exits early with
     # verdict='mve_aborted_cost' when crossed.

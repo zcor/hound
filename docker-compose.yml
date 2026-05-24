@@ -31,7 +31,11 @@ services:
     # Add password protection to prevent external attacks
     command: redis-server --requirepass ${REDIS_PASSWORD:-hound_redis_secret}
     ports:
-      - "127.0.0.1:6379:6379"  # Only expose to localhost
+      # Remapped 6379 -> 6380 on host (DATA box runs a host-native redis-server
+      # on 6379 for unrelated workloads). Container-internal port stays 6379
+      # so REDIS_URL / CELERY_* references inside the compose network are
+      # unchanged.
+      - "127.0.0.1:6380:6379"
     volumes:
       - redis_data:/data
     networks:
@@ -183,6 +187,14 @@ services:
       SENDGRID_REPLY_TO: ${SENDGRID_REPLY_TO:-support@firepan.com}
       SENDGRID_TEMPLATE_ID_DEFAULT: ${SENDGRID_TEMPLATE_ID_DEFAULT:-}
       API_BASE_URL: ${API_BASE_URL:-https://api.firepan.com}
+      # firepan-pr80 — Archive RPC for mode=verify fork-based exploit tests.
+      # Without this, forge's `vm.envOr("ETH_RPC_URL", "https://eth.llamarpc.com")`
+      # falls back to the public llamarpc endpoint which 503s under load —
+      # and Claude writes synthetic tests against vanilla EVM helpers instead
+      # of the deployed protocol. Verified live on smokes 4-7: every "empirical
+      # fail-safe verdict" we produced was actually a placebo because the fork
+      # never instantiated. ETH_RPC_URL must be set in /opt/hound/.env.
+      ETH_RPC_URL: ${ETH_RPC_URL:-}
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       # IMPORTANT: mount the DIRECTORY, not the file. Docker single-file
@@ -198,6 +210,10 @@ services:
       # etc.) don't survive DB persist (no `properties` column on Hypothesis),
       # so eval / postmortem must read them from this volume.
       - ./hypotheses:/app/hypotheses
+      # Local audit sources. DATA box only. Lets us point hound at /audits/<repo>
+      # for local repos that aren't on GitHub. Writable because hound creates
+      # `.hound_project_<scan_id>/` next to the source for graphs + manifest.
+      - /home/assune/audits:/audits
     depends_on:
       db:
         condition: service_healthy

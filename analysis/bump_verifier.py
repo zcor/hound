@@ -678,10 +678,13 @@ contract {contract_name} is Test {{
     address attacker = makeAddr("attacker");
 
     function setUp() public {{
-        string memory rpc = vm.envOr("RPC_URL", string(""));
-        if (bytes(rpc).length > 0) {{
-            vm.createSelectFork(rpc, FORK_BLOCK);
-        }}
+        // firepan-pr80 — accept either RPC_URL or ETH_RPC_URL env var.
+        // bump_verifier sets BOTH on the forge subprocess env. The
+        // public llamarpc fallback 503s under load; never rely on it.
+        string memory rpc = vm.envOr("ETH_RPC_URL", vm.envOr("RPC_URL", string("")));
+        require(bytes(rpc).length > 0,
+            "No RPC URL — set ETH_RPC_URL in /opt/hound/.env and ensure docker-compose passes it through");
+        vm.createSelectFork(rpc, FORK_BLOCK);
         // firepan-a1 multi-asset initial state: 10^5 ETH per A1 paper.
         vm.deal(attacker, {self.config.initial_eth_funding} ether);
     }}
@@ -883,7 +886,18 @@ contract {contract_name} is Test {{
                 "--fork-block-number", str(self.config.fork_block),
                 "-vvvv",
             ]
-            env = {**os.environ, "RPC_URL": self.config.rpc_url}
+            # firepan-pr80 — set BOTH env var names. Claude's exploits often
+            # use `vm.envOr("ETH_RPC_URL", "https://eth.llamarpc.com")` even
+            # though our scaffold uses RPC_URL. Verified during smoke-4-to-7
+            # post-mortem: without ETH_RPC_URL set, forge falls back to the
+            # public llamarpc endpoint which 503s under load, and Claude
+            # writes synthetic tests as a workaround (no actual fork). Pass
+            # the Alchemy URL under both names to cover either case.
+            env = {
+                **os.environ,
+                "RPC_URL": self.config.rpc_url,
+                "ETH_RPC_URL": self.config.rpc_url,
+            }
             rc, out, err = _run(
                 cmd, cwd=isolated_root, timeout=180, env=env,
             )

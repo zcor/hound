@@ -1929,3 +1929,58 @@ def test_github_webhook_installation_signed(client, test_db):
         assert response_bad.status_code == 401
     finally:
         api_module.GITHUB_WEBHOOK_SECRET = original_secret
+
+
+# ---------------------------------------------------------------------------
+# firepan-dhtg: Google-only user must NOT get a 401 from /github/repos
+# ---------------------------------------------------------------------------
+# A Google-only user (no github_token_encrypted) is a valid FirePan session
+# that simply hasn't connected GitHub. The endpoint used to raise a bare 401,
+# which the frontend's blanket 401 handler misread as a dead session — it
+# wiped auth and bounced to /login on an infinite loop. The fix returns a
+# distinguishable 403 {"error": "github_not_connected"} instead.
+
+
+def test_github_repos_google_only_user_returns_403_not_401(
+    client, test_db, sample_tenant
+):
+    """Google-only user (no GitHub token) hitting /github/repos gets 403,
+    not 401 — so the frontend does not wipe the session and loop /login."""
+    google_user = User(
+        google_id="google-sub-987654",
+        google_email="googler@example.com",
+        email="googler@example.com",
+        name="Google Only",
+        tenant_id=sample_tenant.id,
+        signup_provider="google",
+        github_token_encrypted=None,  # the defining condition
+    )
+    test_db.add(google_user)
+    test_db.commit()
+    test_db.refresh(google_user)
+
+    token = create_access_token(
+        {"tenant_id": google_user.tenant_id, "user_id": google_user.id}
+    )
+    resp = client.get(
+        "/github/repos", headers={"Authorization": f"Bearer {token}"}
+    )
+
+    assert resp.status_code == 403, (
+        f"expected 403 (github_not_connected), got {resp.status_code} — "
+        "a 401 here triggers the frontend session-wipe login loop"
+    )
+    detail = resp.json()["detail"]
+    assert isinstance(detail, dict), "detail must be structured for the frontend"
+    assert detail["error"] == "github_not_connected"
+
+
+def test_github_repos_invalid_jwt_still_401(client):
+    """A genuinely invalid FirePan JWT is still a 401 — that IS a dead
+    session and the frontend should still wipe for it. The fix must not
+    swallow real auth failures into 403."""
+    resp = client.get(
+        "/github/repos",
+        headers={"Authorization": "Bearer not-a-real-token"},
+    )
+    assert resp.status_code == 401

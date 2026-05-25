@@ -6156,6 +6156,44 @@ async def _get_current_user_with_token(
     return user
 
 
+def _get_user_for_github_listing(request: Request, db: Session) -> User:
+    """Resolve the current user for a GitHub repo-listing endpoint.
+
+    firepan-dhtg: identical to _get_current_user_with_token() EXCEPT the
+    "no GitHub token" case raises 403 with a structured body instead of a
+    bare 401. A Google-only user (or one whose GitHub link lapsed) is a
+    perfectly valid FirePan session — they just have not connected GitHub.
+    The frontend's blanket 401 handler treats *any* 401 as a dead FirePan
+    session and wipes auth + redirects to /login, producing an infinite
+    login loop. 403 + {"error": "github_not_connected"} is distinguishable:
+    it mirrors the existing "insufficient_github_scope" 403 contract the
+    add-repo dialog already knows how to react to (ScopeUpgradeDialog).
+
+    A genuinely invalid/expired FirePan JWT still raises 401 — that *is* a
+    dead session and the frontend should still wipe for it.
+    """
+    from server.auth_routes import get_token_from_header
+    from server.auth_utils import get_current_user_from_token
+
+    token = get_token_from_header(request)
+    try:
+        payload = get_current_user_from_token(token)
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token. Please log in again.")
+    user = db.query(User).filter(User.id == payload["user_id"]).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    if not user.github_token_encrypted:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "github_not_connected",
+                "message": "Connect your GitHub account to list repositories.",
+            },
+        )
+    return user
+
+
 def _try_resolve_user_no_token(request: Request, db: Session) -> User | None:
     """Resolve the User from the JWT WITHOUT requiring a valid GitHub token.
 
@@ -6356,14 +6394,19 @@ async def list_github_repos(
     Uses the stored GitHub OAuth token to call the GitHub API.
     Powers the repo-picker UI where users select repos to monitor.
     """
-    user = await _get_current_user_with_token(request, db)
+    # firepan-dhtg: 403 (not 401) when GitHub is not connected, so the
+    # frontend does not misread it as a dead FirePan session and wipe auth.
+    user = _get_user_for_github_listing(request, db)
 
     try:
         github_token = decrypt_token(user.github_token_encrypted)
     except ValueError:
         raise HTTPException(
-            status_code=401,
-            detail="GitHub token expired. Please reconnect your GitHub account.",
+            status_code=403,
+            detail={
+                "error": "github_not_connected",
+                "message": "Your GitHub connection has expired. Reconnect GitHub to list repositories.",
+            },
         )
 
     # Map sort parameter to GitHub API values
@@ -6398,9 +6441,14 @@ async def list_github_repos(
                     headers=headers,
                 )
                 if resp.status_code == 401:
+                    # firepan-dhtg: GitHub rejected the stored token — this is
+                    # a GitHub-credential failure, not a dead FirePan session.
                     raise HTTPException(
-                        status_code=401,
-                        detail="GitHub token expired. Please reconnect your GitHub account.",
+                        status_code=403,
+                        detail={
+                            "error": "github_not_connected",
+                            "message": "Your GitHub connection has expired. Reconnect GitHub to list repositories.",
+                        },
                     )
                 resp.raise_for_status()
                 batch = resp.json()
@@ -6442,9 +6490,14 @@ async def list_github_repos(
                 headers=headers,
             )
             if resp.status_code == 401:
+                # firepan-dhtg: GitHub rejected the stored token — this is a
+                # GitHub-credential failure, not a dead FirePan session.
                 raise HTTPException(
-                    status_code=401,
-                    detail="GitHub token expired. Please reconnect your GitHub account.",
+                    status_code=403,
+                    detail={
+                        "error": "github_not_connected",
+                        "message": "Your GitHub connection has expired. Reconnect GitHub to list repositories.",
+                    },
                 )
             resp.raise_for_status()
             repos_page = resp.json()

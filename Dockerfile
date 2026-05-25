@@ -68,8 +68,13 @@ RUN pip install --no-cache-dir solc-select \
  && mkdir -p /home/hound/.svm/0.8.20 /home/hound/.svm/0.7.6 \
  && cp /root/.solc-select/artifacts/solc-0.8.20/solc-0.8.20 /home/hound/.svm/0.8.20/solc-0.8.20 \
  && cp /root/.solc-select/artifacts/solc-0.7.6/solc-0.7.6 /home/hound/.svm/0.7.6/solc-0.7.6 \
- && chmod +x /home/hound/.svm/0.8.20/solc-0.8.20 /home/hound/.svm/0.7.6/solc-0.7.6 \
- && chown -R hound:hound /home/hound/.svm
+ && chmod +x /home/hound/.svm/0.8.20/solc-0.8.20 /home/hound/.svm/0.7.6/solc-0.7.6
+# NOTE: the in-stanza `chown -R hound:hound /home/hound/.svm` that used to
+# live here ran BEFORE the `useradd hound` below — chown failed with
+# "invalid user: hound:hound" and broke every CI image build from
+# 2026-05-23 onward (5 consecutive Publish Docker Images runs).
+# Ownership is set by the broader `chown -R hound:hound /app /home/hound`
+# in the useradd block below, which recursively covers /home/hound/.svm.
 
 # Claude Code CLI as root → ends up on /usr/local/bin, available to USER hound.
 RUN npm install -g @anthropic-ai/claude-code

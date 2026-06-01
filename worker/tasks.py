@@ -3659,6 +3659,8 @@ def check_stripe_webhook_health_task():
     # Old shape (list-only) kept for backwards compat during rollout.
     beads_tasks: list[dict] | None = None
     beads_total: int | None = None
+    stale_tasks: list[dict] | None = None
+    stale_total: int | None = None
     # Path is under /config/state/ (directory mount), not /config/ directly.
     # See docker-compose.yml worker volumes and gotcha #62 in CLAUDE.md
     # for the single-file-bind-mount inode-pinning issue this avoids.
@@ -3677,6 +3679,8 @@ def check_stripe_webhook_health_task():
             if isinstance(data, dict):
                 beads_tasks = data.get("top") or []
                 beads_total = data.get("total")
+                stale_tasks = data.get("stale") or None
+                stale_total = data.get("stale_total")
             elif isinstance(data, list):
                 beads_tasks = data
                 beads_total = len(data)
@@ -3693,6 +3697,8 @@ def check_stripe_webhook_health_task():
         beads_tasks=beads_tasks,
         stripe_issues=stripe_issues if stripe_issues else None,
         total_open=beads_total,
+        stale_tasks=stale_tasks,
+        stale_total=stale_total,
     ))
 
 

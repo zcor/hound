@@ -536,12 +536,17 @@ async def notify_daily_digest(
     beads_tasks: list[dict] | None = None,
     stripe_issues: list[str] | None = None,
     total_open: int | None = None,
+    stale_tasks: list[dict] | None = None,
+    stale_total: int | None = None,
 ) -> bool:
     """Daily team digest: one-line Stripe health + top Beads tasks.
 
     beads_tasks: pre-curated list (already filtered to non-P4, capped at ~5).
     total_open:  total count of open+in_progress+blocked (non-P4) for the
                  "N of M" header. If None, falls back to len(beads_tasks).
+    stale_tasks: P0/P1 beads untouched 7+ days (likely priority rot).
+                 Each entry should have id/title/priority/assignee/days_untouched.
+    stale_total: total stale count (for "showing N of M" if list was capped).
     """
     stripe_icon = "\u2705" if not stripe_issues else "\u26a0\ufe0f"
     parts = [
@@ -584,6 +589,34 @@ async def notify_daily_digest(
     else:
         parts.append("")
         parts.append("\U0001f4cc <b>Top Tasks:</b> <i>bd summary unavailable</i>")
+
+    # Stale-priority alarm: P0/P1 beads untouched for 7+ days are almost
+    # always priority rot — strategy shifted, bead never demoted/closed.
+    # Surface them so the morning reader sees the drift without scanning
+    # the top-5 char-by-char (the firepan-68u failure mode 2026-05-30).
+    if stale_tasks:
+        shown_stale = len(stale_tasks)
+        total_stale = stale_total if stale_total is not None else shown_stale
+        parts.append("")
+        parts.append(
+            f"⚠️ <b>Stale P0/P1</b> "
+            f"({shown_stale} of {total_stale}, priority may be wrong):"
+        )
+        for task in stale_tasks:
+            priority = task.get("priority", "")
+            bead_id = task.get("id", "")
+            title = _escape_html(task.get("title", "untitled"))
+            assignee = task.get("assignee", "")
+            days = task.get("days_untouched", "?")
+            p_label = f"P{priority}" if priority != "" else ""
+            id_label = f" <code>{_escape_html(bead_id)}</code>" if bead_id else ""
+            assignee_label = f" • {_escape_html(assignee)}" if assignee else ""
+            parts.append(
+                f"  {p_label}{id_label} {days}d untouched — {title}{assignee_label}"
+            )
+        remaining_stale = total_stale - shown_stale
+        if remaining_stale > 0:
+            parts.append(f"  <i>... and {remaining_stale} more stale</i>")
 
     message = "\n".join(parts)
     return await send_telegram_message(message)
